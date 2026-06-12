@@ -323,6 +323,7 @@ async def run_market_scanner_loop(tg, interval_seconds: int = 300):
           f"(min_vol=${MIN_VOL_USD/1e6:.0f}M, shock={PRICE_SHOCK_1H}%/1h)")
     init_db()
     await asyncio.sleep(45)
+    quadrant_pushed_day = ""   # v21-A: 每日資金流向圖推送去重
 
     while True:
         try:
@@ -332,6 +333,24 @@ async def run_market_scanner_loop(tg, interval_seconds: int = 300):
                 _save_snapshot(now, snap)
                 past_1h = _get_past_snapshot(now, 60)
                 breadth = compute_breadth(snap, past_1h, now)
+
+                # v21-A: 每日 09:00 台北（01:00 UTC）推四象限資金流向圖
+                utc_now = time.gmtime(now)
+                day_key = time.strftime("%Y%m%d", utc_now)
+                if utc_now.tm_hour == 1 and quadrant_pushed_day != day_key:
+                    quadrant_pushed_day = day_key
+                    try:
+                        from l3_dispatcher.scanner_viz import (
+                            quadrant_summary_line, render_quadrant_chart)
+                        chart = render_quadrant_chart()
+                        if chart:
+                            cap = ("🧭 全市場資金流向圖（4h OI × 價格）\n"
+                                   + quadrant_summary_line())
+                            await tg.send_photo(chart, caption=cap[:1024],
+                                                parse_mode=None)
+                            print(f"[scanner] 🧭 quadrant chart pushed")
+                    except Exception as e:
+                        print(f"[scanner] quadrant error: {type(e).__name__}: {e}")
                 if past_1h:
                     alerts = detect_anomalies(snap, past_1h, now)
                     for a in alerts:
