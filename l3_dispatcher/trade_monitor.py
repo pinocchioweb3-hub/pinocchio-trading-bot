@@ -424,8 +424,21 @@ def _render_event_msg(ev: MonitorEvent) -> str:
 
 
 async def _push_event(tg, ev: MonitorEvent) -> None:
-    """推單一事件到 Telegram。盡量 reply 到原 FIRE 訊息。"""
-    text = _render_event_msg(ev)
+    """推單一事件到 Telegram。盡量 reply 到原 FIRE 訊息。
+    v23-4: 完全平倉時改推完整訂單卡（型態/時間線/腿狀態/出場劇本）。"""
+    if ev.trade_closed:
+        try:
+            from .trade_journal import get_trade_full, render_order_card
+            t = get_trade_full(ev.trade_id)
+            if t:
+                text = render_order_card(t)
+            else:
+                text = _render_event_msg(ev)
+        except Exception as e:
+            print(f"[trade_monitor] order card error: {e}")
+            text = _render_event_msg(ev)
+    else:
+        text = _render_event_msg(ev)
     kwargs = {"parse_mode": "HTML"}
     if ev.tg_message_id:
         kwargs["reply_to_message_id"] = ev.tg_message_id
@@ -459,13 +472,24 @@ async def run_trade_monitor_loop(tg, source, interval_seconds: int = 900,
             from .trade_journal import expire_stale_signals
             expired = expire_stale_signals(float(os.getenv("SIGNAL_EXPIRY_HOURS", "4")))
             if expired and tg is not None:
-                names = ", ".join(f"{e['symbol']} {e['direction']}" for e in expired)
-                try:
-                    await tg.send_message(
-                        f"⏰ <i>訊號過期未確認（已自動失效）：{names}</i>",
-                        parse_mode="HTML")
-                except Exception:
-                    pass
+                # v23-4: 每筆過期升級為「錯過卡」— 告知看到了什麼、紙上對照會持續追蹤
+                from .trade_journal import get_paper_outcome_by_fire
+                for e in expired:
+                    paper = get_paper_outcome_by_fire(e.get("fire_id"))
+                    if paper and paper["status"] == "closed":
+                        tail = (f"👻 紙上對照已平倉：<code>{paper['realized_r']:+.2f}R</code>"
+                                f"（你錯過了 ${paper['pnl_usd']:+,.0f}）")
+                    elif paper:
+                        tail = "👻 紙上對照持續追蹤中 — 結果出爐會回報這筆錯過了多少"
+                    else:
+                        tail = "（無紙上對照）"
+                    try:
+                        await tg.send_message(
+                            f"⏰ <b>{e['symbol']} {('做多' if e['direction'] == 'bull' else '做空')}"
+                            f" 訊號過期</b>（4h 未確認，已自動失效）\n{tail}",
+                            parse_mode="HTML")
+                    except Exception:
+                        pass
 
             events = await monitor_once(source, tg=tg, tg_fire=tg_alert, tg_us=tg_us)
             opens_count = len(get_open_trades())

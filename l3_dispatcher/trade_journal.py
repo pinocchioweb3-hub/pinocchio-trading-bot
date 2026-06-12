@@ -293,7 +293,7 @@ def expire_stale_signals(max_age_hours: float = 4.0) -> list[dict]:
     try:
         cutoff_ms = int(time.time() * 1000) - int(max_age_hours * 3600 * 1000)
         rows = conn.execute(
-            "SELECT id, symbol, direction FROM trades "
+            "SELECT id, symbol, direction, fire_id FROM trades "
             "WHERE status='signal' AND entry_at < ?",
             (cutoff_ms,),
         ).fetchall()
@@ -303,7 +303,8 @@ def expire_stale_signals(max_age_hours: float = 4.0) -> list[dict]:
                 "WHERE status='signal' AND entry_at < ?",
                 (int(time.time() * 1000), cutoff_ms),
             )
-        return [{"id": r[0], "symbol": r[1], "direction": r[2]} for r in rows]
+        return [{"id": r[0], "symbol": r[1], "direction": r[2], "fire_id": r[3]}
+                for r in rows]
     finally:
         conn.close()
 
@@ -390,6 +391,91 @@ def get_funnel_stats(since_ms: int, until_ms: int | None = None) -> dict:
                       "chase" if kind == "market_chase" else "direct")
             out[bucket][status] = out[bucket].get(status, 0) + n
         return out
+    finally:
+        conn.close()
+
+
+_KIND_ZH = {"direct_fire": "⚡ 直接進場", "wait_trigger": "⏳ 等待觸發",
+            "market_chase": "🏃 市價追單"}
+_SCENARIO_ZH = {"tp_full": "TP 全收", "tp_then_exit": "部分止盈後出場",
+                "stop": "直接止損", "timeout": "逾時出場", "mixed": "混合出場"}
+
+
+def render_order_card(t: dict) -> str:
+    """v23-4: 訂單卡 — 一筆訂單的完整脈絡（get_trade_full 的 dict 進來）。"""
+    import html as _html
+
+    def _ts(ms):
+        return time.strftime("%m/%d %H:%M", time.localtime(ms / 1000)) if ms else "—"
+
+    sym = _html.escape(t["symbol"])
+    dir_zh = "做多" if t["direction"] == "bull" else "做空"
+    kind = _KIND_ZH.get(t.get("entry_kind") or "", "⚡ 直接進場")
+    if t.get("setup") == "us_breakout":
+        kind = "🧪 美股紙上"
+    lines = [
+        f"🎫 <b>訂單卡 #{t['id']}｜{sym} {dir_zh}</b>｜{kind}",
+        "━━━━━━━━━━━━━━━━",
+    ]
+    if t.get("entry_zone_lo") and t.get("entry_zone_hi"):
+        lines.append(f"計畫：進場區 <code>${t['entry_zone_lo']:,.6g}–"
+                     f"${t['entry_zone_hi']:,.6g}</code>　"
+                     f"SL <code>${t['stop_price']:,.6g}</code>(1R)")
+    else:
+        lines.append(f"計畫：進場 <code>${t['entry_price']:,.6g}</code>　"
+                     f"SL <code>${t['stop_price']:,.6g}</code>(1R)")
+
+    # 時間線
+    tl = [f"  {_ts(t['created_at'])} 📍 訊號建立（{kind}）"]
+    if t.get("triggered_at"):
+        tl.append(f"  {_ts(t['triggered_at'])} 🔔 價格觸發轉正式訊號")
+    if t["status"] in ("open", "closed") and t.get("entry_at"):
+        fill = t.get("fill_price") or t["entry_price"]
+        tl.append(f"  {_ts(t['entry_at'])} ✅ 確認進場 @ <code>${fill:,.6g}</code>")
+    for l in t.get("legs", []):
+        icon = "🎯" if l["leg_label"].startswith("tp") else (
+            "⏰" if l["leg_label"] == "timeout" else "🛑")
+        tl.append(f"  {_ts(l['exit_at'])} {icon} {l['leg_label'].upper()} "
+                  f"平 {l['size_pct']*100:.0f}% @ <code>${l['exit_price']:,.6g}</code>"
+                  f"（{l['realized_r']:+.2f}R）")
+    lines.append("📍 <b>時間線</b>\n" + "\n".join(tl))
+
+    # 終態
+    st = t["status"]
+    if st == "closed":
+        win = (t.get("realized_r") or 0) > 0
+        scenario = _SCENARIO_ZH.get(t.get("exit_scenario") or "", "")
+        lines.append(
+            f"{'✅' if win else '❌'} <b>已平倉 {t.get('realized_r', 0):+.2f}R</b>"
+            f"（${t.get('pnl_usd', 0):+,.0f}）｜{scenario}"
+            + (f"｜持倉 {t['duration_h']}h" if t.get("duration_h") else ""))
+    elif st == "open":
+        hit = {l["leg_label"] for l in t.get("legs", [])}
+        boxes = "".join("✅" if f"tp{i}" in hit else "⬜" for i in (1, 2, 3))
+        lines.append(f"📈 <b>持倉中</b>｜腿 TP{boxes}")
+    elif st == "skipped":
+        lines.append("⏭ 你選擇略過")
+    elif st == "expired":
+        lines.append("⏰ 過期未確認（自動失效）")
+    elif st == "waiting":
+        lines.append("⏳ 等待價格回進場區（最多 6h）")
+    return "\n".join(lines)
+
+
+def get_paper_outcome_by_fire(fire_id: int) -> dict | None:
+    """v23-4: 錯過卡用 — 該訊號的紙上對照結果（JOIN fire_id）。"""
+    if not fire_id:
+        return None
+    import sqlite3 as _sq
+    conn = _sq.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT status, realized_r, pnl_usd, legs_hit FROM paper_trades "
+            "WHERE fire_id=? ORDER BY id DESC LIMIT 1", (fire_id,)).fetchone()
+        if not row:
+            return None
+        return {"status": row[0], "realized_r": row[1], "pnl_usd": row[2],
+                "legs_hit": row[3] or ""}
     finally:
         conn.close()
 
