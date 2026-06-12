@@ -70,6 +70,36 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
     setup = decision["setup_name"]
     direction = decision["direction"]
 
+    # === v22: 持倉中抑制 — 已確認開單的 symbol 不再推新訊號（使用者規格：
+    #     確認開單前重複推送 OK；一旦 open 只追蹤持倉與績效）===
+    from .trade_journal import get_open_trade
+    open_t = get_open_trade(sym)
+    if open_t is not None:
+        if open_t["direction"] == direction:
+            # 同向重複 → 靜默略過（持倉監控已在追蹤）
+            mark_failed(fire_id, f"suppressed: position open #{open_t['id']}")
+            print(f"[dispatcher] #{fire_id} {sym}/{direction} SUPPRESSED "
+                  f"(open trade #{open_t['id']} same direction)")
+        else:
+            # 反向訊號 → 不推 FIRE，改推持倉警示（出場參考價值高）
+            warn = (
+                f"↔️ <b>{sym} 持倉反向訊號警示</b>\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"你目前持有 <code>{'多單' if open_t['direction'] == 'bull' else '空單'}</code>"
+                f"（#{open_t['id']}，進場 <code>${open_t['entry_price']:,.6g}</code>），\n"
+                f"但引擎剛偵測到 <code>{sym}</code> 的"
+                f"<b>{'做空' if direction == 'bear' else '做多'}</b>條件成立。\n"
+                f"<i>動能可能反轉 — 建議檢視持倉，考慮提前止盈或收緊止損。</i>"
+            )
+            try:
+                await aux.send_message(warn, parse_mode="HTML")
+            except Exception:
+                pass
+            mark_failed(fire_id, f"converted_to_reversal_warning: open #{open_t['id']}")
+            print(f"[dispatcher] #{fire_id} {sym}/{direction} -> REVERSAL WARNING "
+                  f"(open trade #{open_t['id']} opposite direction)")
+        return True
+
     # === 風控前置檢查 ===
     blocked, reason, details = should_block(decision)
     if blocked:

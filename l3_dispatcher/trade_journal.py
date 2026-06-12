@@ -272,6 +272,28 @@ def expire_stale_signals(max_age_hours: float = 4.0) -> list[dict]:
 
 
 # ===========================================================================
+# v22: 持倉中抑制重複訊號 — 已確認開單的 symbol 不再推新 FIRE
+# ===========================================================================
+def get_open_trade(symbol: str) -> dict | None:
+    """該 symbol 是否有 status='open' 的持倉。有 → 回 {id, direction, setup,
+    entry_price}；無 → None。dispatcher 用此抑制持倉中的重複訊號。"""
+    init_db()
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT id, direction, setup, entry_price FROM trades "
+            "WHERE symbol=? AND status='open' ORDER BY entry_at DESC LIMIT 1",
+            (symbol,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "direction": row[1], "setup": row[2],
+                "entry_price": row[3]}
+    finally:
+        conn.close()
+
+
+# ===========================================================================
 # v18-D: 等待觸發狀態機（waiting → signal → open；waiting 6h 未觸 → expired）
 # ===========================================================================
 def get_waiting_trades() -> list[dict]:
