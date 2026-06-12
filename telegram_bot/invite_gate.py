@@ -26,7 +26,7 @@ DB_PATH = _db_path("invite_gate.db")
 
 LINK_TTL_S = 600           # 入群連結 10 分鐘過期
 UID_ATTEMPTS_PER_HOUR = 5  # 防爆破猜 UID
-OKX_REFERRAL_URL = "https://www.okx.com/join/36131753"   # 皮諾丘計畫邀請碼
+OKX_REFERRAL_URL = "https://www.okx.com/join/PINOCCHIOWEB3"   # 皮諾丘計畫邀請碼
 
 # 對話狀態
 ST_MENU = "menu"
