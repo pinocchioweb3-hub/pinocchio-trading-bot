@@ -1,0 +1,269 @@
+"""Risk Manager：FIRE 前風控檢查 + 熔斷機制。
+
+規則：
+- 單筆風險上限 $100 (1R)
+- 同時最多 3 筆持倉
+- BTC family (BTC/ETH/SOL) 同方向最多 2 筆（高相關）
+- 同 symbol 同方向只允許 1 筆
+- 每日 PnL -3% → 暫停新 FIRE 至隔日 UTC 00:00
+- 每週 PnL -7% → 完全暫停 + 強制人工 review
+
+API:
+    should_block(decision_dict) -> (blocked: bool, reason: str, details: dict)
+    get_risk_status() -> dict  # 即時風險狀態，給 supervisor 用
+"""
+from __future__ import annotations
+
+import datetime as dt
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from .trade_journal import (
+    get_open_trades, get_today_pnl, get_week_pnl,
+)
+
+
+# === 風控參數（可由 env 覆寫）===
+@dataclass(frozen=True)
+class RiskConfig:
+    # 帳戶層（v14: 預設改為使用者實際部署資金 $5000，與 trade_journal 統一）
+    account_balance_usd: float = float(os.getenv("ACCOUNT_BALANCE_USD", "5000"))
+    max_risk_per_trade_usd: float = float(os.getenv("RISK_PER_TRADE_USD", "100"))
+
+    # 部位層
+    max_concurrent_trades: int = int(os.getenv("MAX_CONCURRENT_TRADES", "3"))
+    max_per_family: int = int(os.getenv("MAX_PER_CORRELATED_FAMILY", "2"))
+
+    # 熔斷層
+    daily_dd_limit_pct: float = float(os.getenv("DAILY_DD_LIMIT_PCT", "-3.0"))
+    weekly_dd_limit_pct: float = float(os.getenv("WEEKLY_DD_LIMIT_PCT", "-7.0"))
+
+
+# 高相關 family 對照表
+CORRELATED_FAMILIES = {
+    "btc_family":      ("BTC", "ETH", "SOL"),       # 三大主流，相關性 0.8+
+    "alt_l1":          ("AVAX", "NEAR", "ATOM", "FTM"),
+    "alt_perp":        ("SUI", "APT", "INJ", "SEI", "TIA"),
+    "ai_token":        ("FET", "RNDR", "AGIX", "OCEAN"),
+    "meme":            ("DOGE", "SHIB", "PEPE", "WIF"),
+    "exchange_token":  ("BNB", "CRO", "OKB"),
+}
+
+
+def get_family(symbol: str) -> str | None:
+    """查 symbol 屬於哪個相關 family"""
+    for family, members in CORRELATED_FAMILIES.items():
+        if symbol in members:
+            return family
+    return None
+
+
+# ===========================================================================
+# 主檢查函式
+# ===========================================================================
+def should_block(decision: dict | Any,
+                 config: RiskConfig | None = None) -> tuple[bool, str, dict]:
+    """檢查是否要 block 這筆 FIRE。
+
+    Args:
+        decision: dict（fire_queue serialize 後的）或 TriggerDecision 物件
+        config: RiskConfig，預設讀環境變數
+
+    Returns:
+        (blocked, reason, details)
+        - blocked: True = 拒絕、False = 放行
+        - reason: 短碼（如 "daily_dd_breach"、"family_max_exceeded"）
+        - details: 含 PnL/曝險/原因說明
+    """
+    cfg = config or RiskConfig()
+
+    # 取 symbol + direction（支援 dict 或物件）
+    if isinstance(decision, dict):
+        snap = decision.get("snapshot", {})
+        symbol = snap.get("symbol", "")
+        direction = decision.get("direction", "")
+    else:
+        symbol = decision.snapshot.symbol
+        direction = decision.direction.value
+
+    details: dict[str, Any] = {
+        "symbol": symbol, "direction": direction,
+        "config": dataclass_to_dict(cfg),
+    }
+
+    # === Check 1: 每週熔斷（最高優先；先檢查避免日內反覆）===
+    week = get_week_pnl(cfg.account_balance_usd)
+    details["week_pnl"] = week
+    if week["pnl_pct_of_account"] <= cfg.weekly_dd_limit_pct:
+        return True, "weekly_dd_breach", {
+            **details,
+            "msg": f"週累計 PnL {week['pnl_pct_of_account']}% ≤ {cfg.weekly_dd_limit_pct}% → 強制暫停",
+        }
+
+    # === Check 2: 每日熔斷 ===
+    today = get_today_pnl(cfg.account_balance_usd)
+    details["today_pnl"] = today
+    if today["pnl_pct_of_account"] <= cfg.daily_dd_limit_pct:
+        return True, "daily_dd_breach", {
+            **details,
+            "msg": f"今日 PnL {today['pnl_pct_of_account']}% ≤ {cfg.daily_dd_limit_pct}% → 暫停至明日 UTC 00:00",
+        }
+
+    # === Check 2.5: 經濟數據靜默期（v16：高影響數據前30/後15分鐘暫停新訊號）===
+    try:
+        from news_feed.econ_calendar import in_blackout
+        bo, ev_name = in_blackout()
+        if bo:
+            return True, "econ_blackout", {
+                **details,
+                "msg": f"高影響經濟數據「{ev_name}」發布窗口（前30/後15分），"
+                       f"技術面在消息行情中失靈，暫停新訊號",
+            }
+    except Exception:
+        pass  # 經濟日曆故障絕不能擋住交易管線
+
+    # === Check 3: 同時最多持倉數 ===
+    opens = get_open_trades()
+    details["open_count"] = len(opens)
+    details["open_symbols"] = [o["symbol"] for o in opens]
+    if len(opens) >= cfg.max_concurrent_trades:
+        return True, "max_concurrent_exceeded", {
+            **details,
+            "msg": f"已 {len(opens)} 筆持倉，上限 {cfg.max_concurrent_trades}",
+        }
+
+    # === Check 4: 同 symbol 同方向重複 ===
+    for o in opens:
+        if o["symbol"] == symbol and (o.get("direction") or "") == direction:
+            return True, "duplicate_symbol_direction", {
+                **details,
+                "msg": f"已有 {symbol}/{direction} 持倉中（trade_id={o['id']}）",
+                "existing_trade_id": o["id"],
+            }
+
+    # === Check 5: 相關 family 上限 ===
+    family = get_family(symbol)
+    details["family"] = family
+    if family:
+        family_members = CORRELATED_FAMILIES[family]
+        in_family_open = [o for o in opens if o["symbol"] in family_members]
+        details["family_open_count"] = len(in_family_open)
+        details["family_open_symbols"] = [o["symbol"] for o in in_family_open]
+        if len(in_family_open) >= cfg.max_per_family:
+            return True, "family_max_exceeded", {
+                **details,
+                "msg": f"{family} family 已 {len(in_family_open)} 筆持倉 "
+                       f"({', '.join(o['symbol'] for o in in_family_open)})，上限 {cfg.max_per_family}",
+            }
+
+    # === 全部通過 ===
+    return False, "ok", {
+        **details,
+        "msg": f"風控通過 ({len(opens)}/{cfg.max_concurrent_trades} 持倉, "
+               f"今日 PnL {today['pnl_pct_of_account']}%, 週 {week['pnl_pct_of_account']}%)",
+    }
+
+
+def dataclass_to_dict(obj) -> dict:
+    """簡易 dataclass → dict（避免循環 import）"""
+    return {k: getattr(obj, k) for k in obj.__dataclass_fields__}
+
+
+# ===========================================================================
+# 即時風險狀態（給 supervisor / dashboard）
+# ===========================================================================
+def get_risk_status(config: RiskConfig | None = None) -> dict:
+    """回傳當前風險快照"""
+    cfg = config or RiskConfig()
+    opens = get_open_trades()
+    today = get_today_pnl(cfg.account_balance_usd)
+    week = get_week_pnl(cfg.account_balance_usd)
+
+    # 統計每 family 持倉
+    family_breakdown: dict[str, list[str]] = {}
+    for o in opens:
+        family = get_family(o["symbol"])
+        if family:
+            family_breakdown.setdefault(family, []).append(o["symbol"])
+
+    # 算總曝險（每筆 risk_usd 累加）
+    total_risk_open = sum(o.get("risk_usd") or cfg.max_risk_per_trade_usd for o in opens)
+
+    # 算當前狀態旗標
+    daily_breached = today["pnl_pct_of_account"] <= cfg.daily_dd_limit_pct
+    weekly_breached = week["pnl_pct_of_account"] <= cfg.weekly_dd_limit_pct
+
+    status = "halted_weekly" if weekly_breached else (
+             "paused_daily" if daily_breached else "active")
+
+    return {
+        "status": status,
+        "open_trades": len(opens),
+        "open_symbols": [o["symbol"] for o in opens],
+        "max_concurrent": cfg.max_concurrent_trades,
+        "total_risk_open_usd": round(total_risk_open, 2),
+        "max_risk_per_trade": cfg.max_risk_per_trade_usd,
+        "family_breakdown": family_breakdown,
+        "today_pnl_usd": today["total_pnl_usd"],
+        "today_pnl_pct": today["pnl_pct_of_account"],
+        "today_n_trades": today["n_trades_closed"],
+        "today_wins": today["n_wins"],
+        "today_losses": today["n_losses"],
+        "week_pnl_usd": week["total_pnl_usd"],
+        "week_pnl_pct": week["pnl_pct_of_account"],
+        "daily_dd_limit_pct": cfg.daily_dd_limit_pct,
+        "weekly_dd_limit_pct": cfg.weekly_dd_limit_pct,
+        "daily_breached": daily_breached,
+        "weekly_breached": weekly_breached,
+        "account_balance_usd": cfg.account_balance_usd,
+    }
+
+
+def render_risk_status(status: dict) -> str:
+    """文字化風險狀態（給 Telegram 推送）"""
+    icon = {"active": "🟢", "paused_daily": "🟡", "halted_weekly": "🔴"}.get(status["status"], "⚪")
+    lines = [
+        f"🛡 <b>風控狀態 {icon} {status['status'].upper()}</b>",
+        f"━━━━━━━━━━━━━━━━",
+        f"持倉：<code>{status['open_trades']}/{status['max_concurrent']}</code>",
+    ]
+    if status["open_symbols"]:
+        lines.append(f"標的：<code>{', '.join(status['open_symbols'])}</code>")
+        lines.append(f"曝險：<code>${status['total_risk_open_usd']:.0f}</code>")
+    if status["family_breakdown"]:
+        for fam, syms in status["family_breakdown"].items():
+            lines.append(f"  {fam}: {', '.join(syms)} ({len(syms)} 筆)")
+    lines.append(f"\n今日 PnL：<code>${status['today_pnl_usd']:+.2f}</code> "
+                 f"(<code>{status['today_pnl_pct']:+.2f}%</code>)  "
+                 f"{status['today_wins']} 勝 / {status['today_losses']} 負")
+    lines.append(f"本週 PnL：<code>${status['week_pnl_usd']:+.2f}</code> "
+                 f"(<code>{status['week_pnl_pct']:+.2f}%</code>)")
+    lines.append(f"\n熔斷閾值：日 <code>{status['daily_dd_limit_pct']}%</code> / "
+                 f"週 <code>{status['weekly_dd_limit_pct']}%</code>")
+    if status["daily_breached"]:
+        lines.append("⚠️ <b>日線熔斷觸發！</b>暫停新 FIRE 至明日 UTC 00:00")
+    if status["weekly_breached"]:
+        lines.append("🚨 <b>週線熔斷觸發！</b>完全暫停，需人工 review")
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# 自測
+# ===========================================================================
+if __name__ == "__main__":
+    # 模擬一個 FIRE decision
+    decision = {
+        "snapshot": {"symbol": "ETH"},
+        "direction": "bull",
+        "setup_name": "intraday",
+    }
+    blocked, reason, details = should_block(decision)
+    print(f"\nFIRE decision: ETH bull intraday")
+    print(f"Blocked: {blocked}  Reason: {reason}")
+    print(f"Details: {details.get('msg')}")
+
+    status = get_risk_status()
+    print(f"\n當前風險狀態:")
+    print(render_risk_status(status))

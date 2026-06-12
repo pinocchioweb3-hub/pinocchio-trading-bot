@@ -1,0 +1,156 @@
+"""分層 watchlist 管理 + 動態交易層 refresh。
+
+三層：
+    指標 (Indicator):  BTC / ETH / SOL  → 規範 regime，不交易
+    現貨 (Spot):       SUI / WLFI       → 監控不交易
+    交易 (Trading):    動態 Top 7-10    → Setup A/B 在此 FIRE
+
+refresh 策略：
+    - 啟動時：立即 refresh trading tier
+    - 每週一 00:00 UTC：完整重排
+    - 每日 00:00 UTC：補位（top 30 中跌出的踢掉）
+"""
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+from dataclasses import dataclass, field
+
+from market_intel_mcp.symbol_mapping import (
+    TIER_INDICATOR,
+    TIER_SPOT,
+    TRADING_CANDIDATES,
+    HOT_SYMBOLS,
+)
+
+
+@dataclass
+class WatchlistManager:
+    indicator: tuple[str, ...] = TIER_INDICATOR     # 固定
+    spot: tuple[str, ...] = TIER_SPOT               # 固定
+    trading: list[str] = field(default_factory=list)  # 動態
+    last_refresh: dt.datetime | None = None
+    trading_size: int = 8                            # 7-10 範圍中選 8
+    candidate_pool: tuple[str, ...] = TRADING_CANDIDATES
+
+    @property
+    def all_symbols(self) -> list[str]:
+        """全部需要 fetch snapshot 的 symbol（去重）"""
+        seen: list[str] = []
+        for s in list(self.indicator) + list(self.spot) + self.trading:
+            if s not in seen:
+                seen.append(s)
+        return seen
+
+    def fire_tier(self) -> list[str]:
+        """FIRE-scan 只跑交易層；指標+現貨不會觸發訊號"""
+        # 從 trading 中排除 spot（避免和現貨倉位衝突）
+        return [s for s in self.trading if s not in self.spot]
+
+    def is_spot(self, sym: str) -> bool:
+        return sym in self.spot
+
+    def is_indicator(self, sym: str) -> bool:
+        return sym in self.indicator
+
+    async def refresh(self, source) -> dict:
+        """委派給 source.get_strength_universe，取回排名後挑 Top N。"""
+        from market_intel_mcp.strength import compute_strength_scores
+
+        before = set(self.trading)
+        t0 = asyncio.get_event_loop().time()
+
+        # 走公開介面，不依賴 source 的私有方法
+        universe = await source.get_strength_universe(
+            limit=len(self.candidate_pool),
+            candidate_symbols=list(self.candidate_pool),
+        )
+        if isinstance(universe, dict) and universe.get("error"):
+            elapsed = asyncio.get_event_loop().time() - t0
+            return {"chosen": list(self.trading), "dropped": [], "added": [],
+                    "scored": [], "elapsed_sec": round(elapsed, 2),
+                    "ts": self.last_refresh, "error": universe.get("message")}
+
+        items = universe.get("items", [])
+
+        # 硬性過濾（低流動性、極端漲跌、過熱費率）
+        # 註：ret_7d_pct 由 mi_get_strength_universe 用 ret_24h × 5 估算
+        filtered = []
+        skipped_reasons: dict[str, int] = {"vol": 0, "ret": 0, "funding": 0}
+        for it in items:
+            vol = it.get("vol_24h_usd", 0) or 0
+            ret_24h_est = (it.get("return_7d_pct", 0) or 0) / 5  # 還原 24h 漲幅
+            funding = it.get("funding", 0) or 0
+            if vol < 20_000_000:    # 20M（之前 30M 過嚴）
+                skipped_reasons["vol"] += 1
+                continue
+            if abs(ret_24h_est) > 30:   # 24h 移動 > 30% 視為極端
+                skipped_reasons["ret"] += 1
+                continue
+            if abs(funding) > 0.0025:   # 0.25%/8h（之前 0.15% 過嚴）
+                skipped_reasons["funding"] += 1
+                continue
+            filtered.append(it)
+
+        scored = compute_strength_scores(filtered)
+        chosen = [it["symbol"] for it in scored[:self.trading_size]]
+
+        # 守護：若篩出 0 個，保留現有 trading 不清空（避免空名單 = 0 掃描）
+        if not chosen and self.trading:
+            elapsed = asyncio.get_event_loop().time() - t0
+            return {
+                "chosen": list(self.trading),
+                "dropped": [], "added": [], "scored": scored,
+                "elapsed_sec": round(elapsed, 2),
+                "ts": self.last_refresh,
+                "warn": f"strict filters left 0 candidates (vol={skipped_reasons['vol']} "
+                        f"ret={skipped_reasons['ret']} funding={skipped_reasons['funding']}); "
+                        f"keeping previous list",
+            }
+
+        # 更新狀態
+        self.trading = chosen
+        self.last_refresh = dt.datetime.now(tz=dt.timezone.utc)
+
+        # 同步 HOT_SYMBOLS（給 mi_get_snapshot 的 is_hot 用）
+        HOT_SYMBOLS.clear()
+        HOT_SYMBOLS.update(chosen)
+
+        elapsed = asyncio.get_event_loop().time() - t0
+        return {
+            "chosen": chosen,
+            "dropped": list(before - set(chosen)),
+            "added": list(set(chosen) - before),
+            "scored": scored,    # 全部排序後的清單，給報告用
+            "elapsed_sec": round(elapsed, 2),
+            "ts": self.last_refresh,
+        }
+
+
+async def run_refresh_loop(manager: WatchlistManager, source,
+                           daily_at_hour_utc: int = 0,
+                           callback=None):
+    """每日 00:00 UTC（可配置）refresh 交易層。
+    啟動時也立即跑一次。
+    """
+    # 啟動立即 refresh
+    print(f"[refresh] initial refresh starting...")
+    result = await manager.refresh(source)
+    print(f"[refresh] chose {len(result['chosen'])} symbols, elapsed={result['elapsed_sec']}s")
+    if callback:
+        await callback(result)
+
+    while True:
+        # 算到下一個 00:00 UTC 的秒數
+        now = dt.datetime.now(tz=dt.timezone.utc)
+        next_run = now.replace(hour=daily_at_hour_utc, minute=0, second=0, microsecond=0)
+        if next_run <= now:
+            next_run = next_run + dt.timedelta(days=1)
+        wait = (next_run - now).total_seconds()
+        print(f"[refresh] next at {next_run.strftime('%Y-%m-%d %H:%M UTC')} (in {wait/3600:.1f}h)")
+        await asyncio.sleep(wait)
+
+        result = await manager.refresh(source)
+        print(f"[refresh] re-ranked: added={result['added']}  dropped={result['dropped']}")
+        if callback:
+            await callback(result)

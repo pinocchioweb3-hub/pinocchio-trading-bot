@@ -1,0 +1,26 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+*.db
+*.sqlite
+.venv/
+venv/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# 本機執行產物（不進開源 repo）
+.claude/
+bot.log.*
+*.err.log
+sweep_output.txt
+real_backtest_output.txt
+deepdive_btc_v2.txt
+charts/
+*.backup_*.db
