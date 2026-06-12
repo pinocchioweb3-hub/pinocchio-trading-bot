@@ -138,6 +138,8 @@ def render_fire_message(decision_dict: dict[str, Any]) -> tuple[str, list[list[d
         f"{emoji} <b>{_esc(sym)}/USDT</b>  [{setup_zh}]\n"
         f"{dir_emoji} <b>{dir_zh}</b>  綜合分=<code>{score:+.2f}</code>  "
         f"強勢分=<code>{strength_str}</code>\n"
+        f"⚡ <b>可立即執行</b> — 現價在進場區內，"
+        f"{'掛限價或市價' + dir_zh if setup == 'intraday' else '分批限價埋伏'}皆可\n"
         f"🕐 {timestamp}   主時框 4h／進場 1h\n"
         "\n"
         "📊 <b>觸發原因</b>\n"

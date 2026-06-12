@@ -217,7 +217,9 @@ async def amain(args: argparse.Namespace) -> int:
         ("daily_macro", lambda: run_daily_macro_loop(tg_intel, source, watchlist,
                                                      target_hour_utc=args.daily_macro_hour_utc,
                                                      run_on_startup=_consume_startup("daily_macro"))),
-        ("hourly_pulse", lambda: run_hourly_pulse_loop(tg_intel, source, watchlist,
+        # v23: pulse 獨立主題（市場情報只留 Daily Macro，避免堆疊）
+        ("hourly_pulse", lambda: run_hourly_pulse_loop(router.client("pulse"),
+                                                       source, watchlist,
                                                        args.pulse_interval)),
         # v16: deepdive 是具體交易計畫（報單）→ 改推交易訊號主題（使用者明確要求）
         ("deepdive", lambda: run_per_symbol_loop(tg_trade, source, watchlist,
