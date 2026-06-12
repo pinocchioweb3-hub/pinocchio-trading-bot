@@ -191,9 +191,9 @@ def render_paper_summary(stats: dict) -> str:
     return (f"📜 紙上驗證（{stats['window_days']}d）："
             f"已平 <code>{stats['n_closed']}</code> 筆 "
             f"勝率 <code>{stats['win_rate_pct']}%</code> "
-            f"PnL <code>${stats['total_pnl_usd']:+.0f}</code> "
-            f"avg <code>{stats['avg_r']:+.2f}R</code>　"
-            f"Stage1 門檻 <code>{stats['stage0_progress']}</code>")
+            f"期望值 <code>{stats['avg_r']:+.2f}R</code>/筆　"
+            f"Stage1 門檻 <code>{stats['stage0_progress']}</code>"
+            f"　<i>(100U 風險基準 PnL ${stats['total_pnl_usd']:+.0f})</i>")
 
 
 if __name__ == "__main__":

@@ -772,10 +772,15 @@ def render_stats_summary(stats: dict, label: str = "") -> str:
             f"勝率：<code>{stats['win_rate_pct']}%</code> "
             f"（{stats['n_wins']} 勝 / {stats['n_losses']} 負 / {stats['n_scratch']} 平）"
         )
-        lines.append(f"總 PnL：<code>${stats['total_pnl_usd']:+.2f}</code>  平均 R：<code>{stats['avg_r']:+.3f}</code>")
-        lines.append(f"最佳：<code>{stats['best_r']:+.2f}R</code>  最差：<code>{stats['worst_r']:+.2f}R</code>")
-        lines.append(f"最大連虧：<code>{stats['max_consecutive_losses']}</code>  最大回撤：<code>${stats['max_drawdown_usd']:.2f}</code>")
-        lines.append(f"獲利因子：<code>{pf_str}</code>")
+        # v22-3: R 倍數為主、金額為輔（開源訊號慣例 — 任何本金都能直接套用）
+        lines.append(f"期望值：<code>{stats['avg_r']:+.3f}R</code>/筆  "
+                     f"獲利因子：<code>{pf_str}</code>")
+        lines.append(f"最佳：<code>{stats['best_r']:+.2f}R</code>  "
+                     f"最差：<code>{stats['worst_r']:+.2f}R</code>  "
+                     f"最大連虧：<code>{stats['max_consecutive_losses']}</code>")
+        lines.append(f"<i>金額參考（單筆風險 100U 基準）："
+                     f"PnL <code>${stats['total_pnl_usd']:+.2f}</code>  "
+                     f"最大回撤 <code>${stats['max_drawdown_usd']:.2f}</code></i>")
 
         if stats["by_setup"]:
             lines.append("\n<b>各 setup 表現：</b>")
