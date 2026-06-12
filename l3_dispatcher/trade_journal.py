@@ -97,6 +97,21 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status_entry ON trades(status, entry_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_status ON trades(symbol, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_legs_trade ON trade_legs(trade_id)")
+
+        # v23-3 idempotent migration：訂單生命週期欄位
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        for col, ddl in (
+            ("entry_kind",    "ALTER TABLE trades ADD COLUMN entry_kind TEXT"),
+            #   'direct_fire'  價在區內直接推送
+            #   'wait_trigger' 先等待、價回區後觸發
+            #   'market_chase' 確認成交價超出進場區（市價追入）
+            ("entry_zone_lo", "ALTER TABLE trades ADD COLUMN entry_zone_lo REAL"),
+            ("entry_zone_hi", "ALTER TABLE trades ADD COLUMN entry_zone_hi REAL"),
+            ("fill_price",    "ALTER TABLE trades ADD COLUMN fill_price REAL"),
+            ("triggered_at",  "ALTER TABLE trades ADD COLUMN triggered_at INTEGER"),
+        ):
+            if col not in existing:
+                conn.execute(ddl)
     finally:
         conn.close()
 
@@ -124,6 +139,10 @@ class EntryRecord:
     cross_check_confidence: int | None = None
     tags: list[str] = field(default_factory=list)
     notes: str = ""
+    # v23-3: 訂單生命週期欄位
+    entry_kind: str | None = None        # 'direct_fire' / 'wait_trigger' / 'market_chase'
+    entry_zone_lo: float | None = None
+    entry_zone_hi: float | None = None
 
 
 def record_entry(entry: EntryRecord, initial_status: str = "signal") -> int:
@@ -141,15 +160,19 @@ def record_entry(entry: EntryRecord, initial_status: str = "signal") -> int:
     conn = _conn()
     try:
         now_ms = int(time.time() * 1000)
+        # v23-3: entry_kind 未指定時由 initial_status 推導
+        kind = entry.entry_kind or (
+            "wait_trigger" if initial_status == "waiting" else "direct_fire")
         cur = conn.execute(
             """INSERT INTO trades (
                 symbol, setup, direction, entry_price, stop_price,
                 tp1, tp2, tp3, risk_usd, leverage, margin_usd, notional_usd,
                 entry_at, status, fire_id, tg_message_id, decision_snapshot,
                 cross_check_confidence, notes, tags,
-                created_at, updated_at
+                created_at, updated_at,
+                entry_kind, entry_zone_lo, entry_zone_hi
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?)""",
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 entry.symbol, entry.setup, entry.direction,
                 entry.entry_price, entry.stop_price,
@@ -161,6 +184,7 @@ def record_entry(entry: EntryRecord, initial_status: str = "signal") -> int:
                 entry.cross_check_confidence, entry.notes,
                 ",".join(entry.tags) if entry.tags else None,
                 now_ms, now_ms,
+                kind, entry.entry_zone_lo, entry.entry_zone_hi,
             ),
         )
         return cur.lastrowid
@@ -213,14 +237,27 @@ def confirm_trade(trade_id: int, fill_price: float | None = None) -> dict:
                     "msg": f"狀態 {status} 不能確認（已平倉或已略過）"}
         now_ms = int(time.time() * 1000)
         if fill_price is not None and fill_price > 0:
-            conn.execute(
-                "UPDATE trades SET status='open', entry_price=?, entry_at=?, "
-                "updated_at=? WHERE id=?",
-                (fill_price, now_ms, now_ms, trade_id),
-            )
+            # v23-3: fill_price 獨立保存（與訊號價分離）；成交價超出進場區
+            #        → 標記市價追單（market_chase）
+            zone = conn.execute(
+                "SELECT entry_zone_lo, entry_zone_hi FROM trades WHERE id=?",
+                (trade_id,)).fetchone()
+            chase = (zone and zone[0] and zone[1]
+                     and not (zone[0] <= fill_price <= zone[1]))
+            if chase:
+                conn.execute(
+                    "UPDATE trades SET status='open', entry_price=?, fill_price=?, "
+                    "entry_kind='market_chase', entry_at=?, updated_at=? WHERE id=?",
+                    (fill_price, fill_price, now_ms, now_ms, trade_id))
+            else:
+                conn.execute(
+                    "UPDATE trades SET status='open', entry_price=?, fill_price=?, "
+                    "entry_at=?, updated_at=? WHERE id=?",
+                    (fill_price, fill_price, now_ms, now_ms, trade_id))
         else:
             conn.execute(
-                "UPDATE trades SET status='open', entry_at=?, updated_at=? WHERE id=?",
+                "UPDATE trades SET status='open', fill_price=entry_price, "
+                "entry_at=?, updated_at=? WHERE id=?",
                 (now_ms, now_ms, trade_id),
             )
         return {"ok": True, "status": "open",
@@ -294,6 +331,70 @@ def get_open_trade(symbol: str) -> dict | None:
 
 
 # ===========================================================================
+# v23-3: 訂單生命週期查詢（訂單卡與每日總帳的資料源）
+# ===========================================================================
+def get_trade_full(trade_id: int) -> dict | None:
+    """單筆訂單完整資料：trades 整列 + legs 時間線 + 派生欄位。"""
+    init_db()
+    conn = _conn()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
+        if not row:
+            return None
+        t = dict(row)
+        legs = [dict(r) for r in conn.execute(
+            "SELECT leg_label, size_pct, exit_price, exit_at, pnl_usd, realized_r "
+            "FROM trade_legs WHERE trade_id=? ORDER BY exit_at", (trade_id,))]
+        t["legs"] = legs
+        t["leg_sequence"] = "→".join(l["leg_label"].upper() for l in legs) or None
+        if t.get("entry_at") and t.get("exit_at"):
+            t["duration_h"] = round((t["exit_at"] - t["entry_at"]) / 3600000, 1)
+        # 出場劇本分類
+        labels = [l["leg_label"] for l in legs]
+        if not labels:
+            t["exit_scenario"] = None
+        elif all(l.startswith("tp") for l in labels) and len(labels) >= 3:
+            t["exit_scenario"] = "tp_full"        # TP 全收
+        elif any(l.startswith("tp") for l in labels) and \
+                any(l in ("stop", "timeout") for l in labels):
+            t["exit_scenario"] = "tp_then_exit"   # 部分止盈後止損/逾時
+        elif labels == ["stop"]:
+            t["exit_scenario"] = "stop"
+        elif labels == ["timeout"]:
+            t["exit_scenario"] = "timeout"
+        else:
+            t["exit_scenario"] = "mixed"
+        return t
+    finally:
+        conn.close()
+
+
+def get_funnel_stats(since_ms: int, until_ms: int | None = None) -> dict:
+    """訊號漏斗統計：推送 → 確認/略過/過期 → 平倉（每日總帳用）。
+
+    注意：風控阻擋/持倉抑制不寫 trades（只在 fire_queue mark_failed），
+    這裡先回 trades 端的漏斗；fire_queue 端的分母由呼叫方補。"""
+    init_db()
+    until_ms = until_ms or int(time.time() * 1000)
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT entry_kind, status, COUNT(*) FROM trades "
+            "WHERE created_at BETWEEN ? AND ? GROUP BY entry_kind, status",
+            (since_ms, until_ms)).fetchall()
+        out = {"total": 0, "direct": {}, "waiting": {}, "chase": {}}
+        for kind, status, n in rows:
+            out["total"] += n
+            bucket = ("waiting" if kind == "wait_trigger" else
+                      "chase" if kind == "market_chase" else "direct")
+            out[bucket][status] = out[bucket].get(status, 0) + n
+        return out
+    finally:
+        conn.close()
+
+
+# ===========================================================================
 # v18-D: 等待觸發狀態機（waiting → signal → open；waiting 6h 未觸 → expired）
 # ===========================================================================
 def get_waiting_trades() -> list[dict]:
@@ -322,9 +423,9 @@ def trigger_waiting(trade_id: int) -> dict:
     try:
         now_ms = int(time.time() * 1000)
         cur = conn.execute(
-            "UPDATE trades SET status='signal', entry_at=?, updated_at=? "
-            "WHERE id=? AND status='waiting'",
-            (now_ms, now_ms, trade_id),
+            "UPDATE trades SET status='signal', entry_at=?, updated_at=?, "
+            "triggered_at=? WHERE id=? AND status='waiting'",   # v23-3: 觸發時點
+            (now_ms, now_ms, now_ms, trade_id),
         )
         if cur.rowcount == 0:
             return {"ok": False, "msg": "not in waiting state"}

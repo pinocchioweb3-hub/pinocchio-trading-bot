@@ -169,6 +169,8 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
                 decision_snapshot={"snapshot": snap, "reason": decision.get("reason", "")},
                 cross_check_confidence=cc.get("confidence") if cc else None,
                 tags=[f"regime:{regime}"],
+                entry_kind="wait_trigger",                      # v23-3
+                entry_zone_lo=zone_lo, entry_zone_hi=zone_hi,
             ), initial_status="waiting")
             print(f"[dispatcher] #{fire_id} {sym}/{direction} -> WAITING "
                   f"(live={live} 偏離 zone [{zone_lo:.6g}, {zone_hi:.6g}], trade_id={tid})")
@@ -256,6 +258,8 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
             decision_snapshot={"snapshot": snap, "reason": decision.get("reason", "")},
             cross_check_confidence=cc.get("confidence") if cc else None,
             tags=[f"regime:{regime}"],
+            entry_kind="direct_fire",                           # v23-3
+            entry_zone_lo=zone_lo, entry_zone_hi=zone_hi,
         ), initial_status="signal")
 
         # v16: 同步開紙上倉（Stage 0 — 每筆訊號自動追蹤，驗證引擎期望值）

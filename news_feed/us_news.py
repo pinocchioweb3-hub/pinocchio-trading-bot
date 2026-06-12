@@ -33,9 +33,45 @@ TV_HEADERS = {
 
 SOURCE = "tvnews"
 MAX_AGE_S = 2 * 3600          # 超過 2 小時的舊聞不推（冷啟動防灌水）
-MAX_PUSH_PER_CYCLE = 4
+MAX_PUSH_PER_CYCLE = 2        # v23-3 降噪：4→2（實測首小時 21 則過量）
 MIN_IMPORTANCE_FLASH = 5
-MIN_IMPORTANCE_NORMAL = 6
+MIN_IMPORTANCE_NORMAL = 7     # v23-3 降噪：6→7（一般新聞抬高門檻，flash 不動）
+
+
+def _word_set(title: str) -> set[str]:
+    import re
+    return {w.lower() for w in re.findall(r"[A-Za-z]{3,}", title)}
+
+
+def _is_dup_story(title: str, recent_titles: list[str]) -> bool:
+    """跨來源同事件去重：與近期已推標題的字詞重疊 >50% 視為同一條新聞。
+    （實測 SpaceX 上市新聞 3 個來源各推一次 — 內容相同只差措辭）"""
+    ws = _word_set(title)
+    if len(ws) < 3:
+        return False
+    for old in recent_titles:
+        ow = _word_set(old)
+        if not ow:
+            continue
+        overlap = len(ws & ow) / min(len(ws), len(ow))
+        if overlap > 0.5:
+            return True
+    return False
+
+
+def _recent_pushed_titles(hours: int = 24) -> list[str]:
+    import sqlite3
+    from botpaths import db_path
+    try:
+        conn = sqlite3.connect(db_path("news_feed.db"))
+        rows = conn.execute(
+            "SELECT content_preview FROM seen_posts "
+            "WHERE source=? AND pushed=1 AND seen_at > ?",
+            (SOURCE, int(time.time()) - hours * 3600)).fetchall()
+        conn.close()
+        return [r[0] or "" for r in rows]
+    except Exception:
+        return []
 
 
 async def fetch_headlines() -> list[dict]:
@@ -85,6 +121,7 @@ async def process_once(tg) -> int:
     fresh.sort(key=lambda x: (not x.get("is_flash"), -(x.get("published") or 0)))
 
     pushed = 0
+    recent_titles = _recent_pushed_titles(24)   # v23-3: 跨來源去重基準
     for it in fresh:
         pid = str(it["id"])
         provider = str(it.get("provider") or "tv")
@@ -94,6 +131,10 @@ async def process_once(tg) -> int:
         # 全部標記已讀（不論推不推，避免下輪重複進 AI）
         if is_low_content(title):
             mark_seen(SOURCE, provider, pid, pushed=False, push_reason="low_content")
+            continue
+        # v23-3: 同一事件已從別的來源推過 → 不再推
+        if _is_dup_story(title, recent_titles):
+            mark_seen(SOURCE, provider, pid, pushed=False, push_reason="dup_story")
             continue
         if pushed >= MAX_PUSH_PER_CYCLE:
             mark_seen(SOURCE, provider, pid, pushed=False, push_reason="cycle_cap")
@@ -126,6 +167,7 @@ async def process_once(tg) -> int:
             mark_seen(SOURCE, provider, pid, pushed=True,
                       push_reason=f"i={verdict.get('importance')}",
                       content_preview=title[:150])
+            recent_titles.append(title)   # 同輪內也去重
             print(f"[us_news] pushed: [{provider}] {title[:60]} "
                   f"(flash={is_flash}, i={verdict.get('importance')})")
         except Exception as e:
