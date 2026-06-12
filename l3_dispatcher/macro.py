@@ -662,6 +662,15 @@ async def run_performance_loop(tg, target_hour_utc: int = 0,
             await _send_to_telegram(tg, text, prefix="📅 <b>每日績效總結</b>\n\n")
             print(f"[performance] sent: 7d={stats7['n_trades_closed']} closed, "
                   f"30d={stats30['n_trades_closed']} closed")
+
+            # v21-B: 成績卡圖片（最近 6 筆已平倉，輸贏都上卡）
+            try:
+                from .report_card import render_report_cards
+                card = render_report_cards(6)
+                if card:
+                    await tg.send_photo(card, caption="🗂 最近平倉成績卡（紙上驗證帳，不挑單）")
+            except Exception as e:
+                print(f"[performance] report card error: {type(e).__name__}: {e}")
         except Exception as e:
             print(f"[performance] error: {type(e).__name__}: {e}")
 
