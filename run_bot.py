@@ -234,7 +234,9 @@ async def amain(args: argparse.Namespace) -> int:
                                                                args.position_tracker_interval)),
         # 新聞（已過濾 + 繁中翻譯）→ 新聞快訊主題
         ("truth_social", lambda: run_truth_social_loop(tg_news, args.truth_social_interval)),
-        ("twitter_apify", lambda: run_twitter_apify_loop(tg_news, args.twitter_interval)),
+        ("twitter_apify", lambda: run_twitter_apify_loop(
+            tg_news, args.twitter_interval,
+            tg_us=router.client("usstock"))),   # v22: 美股類帳號分流
         ("watchlist_refresh", lambda: run_refresh_loop(watchlist, source, callback=on_refresh)),
         ("supervisor", lambda: run_supervisor_loop(tg_sys, source, sup_state,
                                                    args.supervisor_interval)),

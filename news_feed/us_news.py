@@ -1,4 +1,4 @@
-"""v22-4: 美股第一線快訊 — TradingView 隱藏新聞 API（零成本、零金鑰）。
+﻿"""v22-4: 美股第一線快訊 — TradingView 隱藏新聞 API（零成本、零金鑰）。
 
 數據源（2026-06 實測可用）：
     GET news-headlines.tradingview.com/v2/headlines
@@ -93,10 +93,10 @@ async def process_once(tg) -> int:
 
         # 全部標記已讀（不論推不推，避免下輪重複進 AI）
         if is_low_content(title):
-            mark_seen(SOURCE, provider, pid, pushed=False, reason="low_content")
+            mark_seen(SOURCE, provider, pid, pushed=False, push_reason="low_content")
             continue
         if pushed >= MAX_PUSH_PER_CYCLE:
-            mark_seen(SOURCE, provider, pid, pushed=False, reason="cycle_cap")
+            mark_seen(SOURCE, provider, pid, pushed=False, push_reason="cycle_cap")
             continue
 
         verdict = await classify_and_translate(
@@ -105,7 +105,7 @@ async def process_once(tg) -> int:
         ok = verdict.get("relevant") and verdict.get("importance", 0) >= gate
         if not ok:
             mark_seen(SOURCE, provider, pid, pushed=False,
-                      reason=f"filtered i={verdict.get('importance')}")
+                      push_reason=f"filtered i={verdict.get('importance')}")
             continue
 
         icon = "⚡" if is_flash else "📰"
@@ -124,13 +124,13 @@ async def process_once(tg) -> int:
             await tg.send_message(text, parse_mode="HTML")
             pushed += 1
             mark_seen(SOURCE, provider, pid, pushed=True,
-                      reason=f"i={verdict.get('importance')}",
+                      push_reason=f"i={verdict.get('importance')}",
                       content_preview=title[:150])
             print(f"[us_news] pushed: [{provider}] {title[:60]} "
                   f"(flash={is_flash}, i={verdict.get('importance')})")
         except Exception as e:
             print(f"[us_news] send error: {e}")
-            mark_seen(SOURCE, provider, pid, pushed=False, reason="send_error")
+            mark_seen(SOURCE, provider, pid, pushed=False, push_reason="send_error")
     return pushed
 
 

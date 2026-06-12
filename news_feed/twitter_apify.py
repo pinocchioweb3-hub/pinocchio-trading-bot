@@ -252,11 +252,16 @@ def _render_tweet_msg(post: dict, filter_meta: dict, llm: dict | None = None) ->
     return clamp_news_html(build)
 
 
+#: v22 路由修正：純美股類帳號改推 🇺🇸 美股主題（使用者規格：純美股新聞只進美股頻道）
+US_TOPIC_CATEGORIES = {"squawk", "options_flow", "macro_analysis"}
+
+
 async def poll_once(tg=None, max_push_per_run: int = 10,
-                    max_llm_per_run: int = 12) -> dict:
+                    max_llm_per_run: int = 12, tg_us=None) -> dict:
     """跑一次 Apify poll → filter → push TG。
 
     max_llm_per_run: 單輪 LLM 呼叫上限 — 防 backlog 時 114 篇 × 30s 卡死整輪
+    tg_us: 美股主題 client — US_TOPIC_CATEGORIES 的帳號分流到這裡
     """
     init_db()
     stats = {"fetched": 0, "new": 0, "pushed": 0, "filtered_out": 0,
@@ -357,7 +362,11 @@ async def poll_once(tg=None, max_push_per_run: int = 10,
 
         try:
             text = _render_tweet_msg(post, fmeta, llm)
-            status, resp = await safe_send(tg, text)
+            # v22: 美股類帳號分流到美股主題
+            target = (tg_us if (tg_us is not None and
+                                fmeta.get("category") in US_TOPIC_CATEGORIES)
+                      else tg)
+            status, resp = await safe_send(target, text)
             if status == "ok":
                 stats["pushed"] += 1
                 push_count += 1
@@ -377,7 +386,8 @@ async def poll_once(tg=None, max_push_per_run: int = 10,
     return stats
 
 
-async def run_twitter_apify_loop(tg, interval_seconds: int = DEFAULT_POLL_SECONDS):
+async def run_twitter_apify_loop(tg, interval_seconds: int = DEFAULT_POLL_SECONDS,
+                                 tg_us=None):
     """Worker 主迴圈。若無 APIFY_TOKEN 則直接 print warning 並退出（讓 daemon 繼續跑其他 worker）"""
     if not _get_token():
         print("[twitter_apify] APIFY_TOKEN not set in .env, worker disabled (set APIFY_TOKEN and restart to enable)")
@@ -391,7 +401,7 @@ async def run_twitter_apify_loop(tg, interval_seconds: int = DEFAULT_POLL_SECOND
     limit_notified = False
     while True:
         try:
-            stats = await poll_once(tg=tg)
+            stats = await poll_once(tg=tg, tg_us=tg_us)
             if stats.get("monthly_limit_hit"):
                 # v15.1: 月額度用罄 → 退避 6 小時（額度月初重置；持續打只是浪費 log）
                 if not limit_notified and tg is not None:

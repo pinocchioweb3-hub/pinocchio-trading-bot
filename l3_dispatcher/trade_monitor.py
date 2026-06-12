@@ -132,7 +132,7 @@ def _check_timeout(trade: dict, hold_max_hours: int = DEFAULT_HOLD_MAX_HOURS) ->
     return trade["size_remaining"]
 
 
-async def monitor_once(source, tg=None) -> list[MonitorEvent]:
+async def monitor_once(source, tg=None, tg_fire=None) -> list[MonitorEvent]:
     """掃一次所有 open trades（實倉 + 紙上）。回實倉觸發事件。"""
     opens = get_open_trades()
     events: list[MonitorEvent] = []
@@ -214,15 +214,19 @@ async def monitor_once(source, tg=None) -> list[MonitorEvent]:
 
     # === v18-D: 等待觸發檢查（價格回進場區 → 轉正式訊號）===
     try:
-        await _check_waiting_trades(source, tg, bars_cache)
+        await _check_waiting_trades(source, tg, bars_cache, tg_fire=tg_fire)
     except Exception as e:
         print(f"[trade_monitor] waiting check error: {type(e).__name__}: {e}")
 
     return events
 
 
-async def _check_waiting_trades(source, tg, bars_cache: dict[str, list]) -> None:
-    """waiting trades：回進場區 → signal + 推正式 FIRE 訊息 + 開紙上倉；6h 未觸 → expired"""
+async def _check_waiting_trades(source, tg, bars_cache: dict[str, list],
+                                tg_fire=None) -> None:
+    """waiting trades：回進場區 → signal + 推正式 FIRE 訊息 + 開紙上倉；6h 未觸 → expired
+
+    v22 路由修正：觸發成功的正式 FIRE（含按鈕）發 tg_fire（🎯 交易訊號主題），
+    與 dispatcher 首發訊號同主題；逾時放棄等雜務留在 tg（📈 持倉與績效）。"""
     from .dispatcher import compute_entry_zone
     from .trade_journal import expire_stale_waiting, get_waiting_trades, trigger_waiting
 
@@ -274,9 +278,11 @@ async def _check_waiting_trades(source, tg, bars_cache: dict[str, list]) -> None
             {"text": "✅ 已下單", "callback_data": f"fill:{w['fire_id']}"},
             {"text": "⏭ 略過", "callback_data": f"skip:{w['fire_id']}"},
         ]]
-        if tg is not None:
+        fire_client = tg_fire or tg   # v22: 正式訊號回到 🎯 交易訊號主題
+        if fire_client is not None:
             try:
-                await tg.send_message(text, parse_mode="HTML", inline_buttons=buttons)
+                await fire_client.send_message(text, parse_mode="HTML",
+                                               inline_buttons=buttons)
             except Exception as e:
                 print(f"[trade_monitor] waiting-trigger send error: {e}")
 
@@ -437,7 +443,7 @@ async def run_trade_monitor_loop(tg, source, interval_seconds: int = 900,
                 except Exception:
                     pass
 
-            events = await monitor_once(source, tg=tg)
+            events = await monitor_once(source, tg=tg, tg_fire=tg_alert)
             opens_count = len(get_open_trades())
             if events:
                 event_summary = ", ".join(f"{e.symbol}/{e.event}" for e in events)

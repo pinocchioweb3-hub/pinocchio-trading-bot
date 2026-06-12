@@ -125,7 +125,8 @@ HIGH_IMPACT_KEYWORDS = {
     "sec investigation", "antitrust", "emergency", "opec",
 }
 
-TS_HOURLY_CAP = 15  # Ts 單帳號每小時最多通過件數（DeItaone 日量可達 300+）
+TS_HOURLY_CAP = 6   # v22 降噪：15→6（實測 FirstSquawk ~47則/天洗版；
+                    # TradingView API 已接管終端快訊主流量，X 端只留補強）
 
 US_CASH_SESSION_UTC = ((13, 30), (20, 0))   # 夏令；冬令 ((14, 30), (21, 0))
 
