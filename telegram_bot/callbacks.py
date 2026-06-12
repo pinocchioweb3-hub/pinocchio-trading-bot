@@ -323,6 +323,14 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
                 reply = "用法：/adopt <建議編號> [分數1-10] [實裝說明]"
         else:
             reply = "此指令僅限管理者"
+    elif cmd == "gate_approve":
+        # 僅限管理者：舊用戶人工放行（v22-2）
+        import os
+        if str((msg.get("from") or {}).get("id", "")) == os.getenv("TELEGRAM_CHAT_ID", ""):
+            from .invite_gate import admin_approve
+            reply = await admin_approve(tg, args)
+        else:
+            reply = "此指令僅限管理者"
     elif cmd == "review":
         # 僅限管理者：待審核的高潛力建議清單
         import os
@@ -384,9 +392,29 @@ async def run_interactive_listener(tg: TelegramClient, poll_seconds: float = 2.0
                     offset = upd["update_id"] + 1
                     try:
                         if "callback_query" in upd:
-                            await _handle_callback(tg, upd["callback_query"])
+                            # v22-2: gate: 前綴按鈕（私訊選單）優先給入群閘門
+                            cq = upd["callback_query"]
+                            if (cq.get("data") or "").startswith("gate:"):
+                                from .invite_gate import handle_gate_callback
+                                await handle_gate_callback(tg, cq)
+                            else:
+                                await _handle_callback(tg, cq)
+                        elif "chat_join_request" in upd:
+                            # v22-2: 入群申請 → 自動核對放行
+                            from .invite_gate import handle_join_request
+                            await handle_join_request(tg, upd["chat_join_request"])
                         elif "message" in upd:
-                            await _handle_command(tg, upd["message"])
+                            m = upd["message"]
+                            chat = m.get("chat") or {}
+                            # v22-2: 私訊 → 先給入群閘門（/start 與流程中訊息）；
+                            # 沒被消化的（管理員指令等）走原本路徑
+                            if chat.get("type") == "private":
+                                from .invite_gate import handle_private_message
+                                consumed = await handle_private_message(tg, m)
+                                if not consumed:
+                                    await _handle_command(tg, m)
+                            else:
+                                await _handle_command(tg, m)
                     except Exception as e:
                         print(f"[callbacks] handle error: {type(e).__name__}: {e}")
         except Exception as e:

@@ -81,7 +81,8 @@ class TelegramClient:
         """getUpdates。timeout=0 = 短輪詢（立即返回，避開不穩網路的長連線超時）。"""
         body: dict[str, Any] = {"timeout": timeout,
                                 "allowed_updates": ["message", "callback_query",
-                                                    "my_chat_member", "chat_member"]}
+                                                    "my_chat_member", "chat_member",
+                                                    "chat_join_request"]}
         if offset is not None:
             body["offset"] = offset
         # 短輪詢時用固定 20s HTTP 超時就夠（請求本身瞬間返回）
