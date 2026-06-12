@@ -197,6 +197,8 @@ async def amain(args: argparse.Namespace) -> int:
     from news_feed.unlock_calendar import run_unlock_calendar_loop as _run_unlock
     # v20: Threads 建造日誌自動發布（無 token 時優雅待命）
     from threads_publisher import run_threads_publisher_loop as _run_threads
+    # v22-4: 美股第一線快訊（TradingView 隱藏 API，零成本）
+    from news_feed.us_news import run_us_news_loop as _run_us_news
 
     # v14: 每個 worker 用 supervise() 隔離 — 單一 worker 崩潰自動重啟，不再全滅
     # v14.1: run_on_startup 只在首次啟動為 True — supervise 崩潰重啟不重推開機報告
@@ -251,6 +253,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("unlock_calendar", lambda: _run_unlock(router.client("econ"))),
         # v20: Threads 自動發布（token 未設定時 no-op 待命）
         ("threads_publisher", lambda: _run_threads(tg_sys)),
+        # v22-4: 美股快訊（DJ 終端 flash 優先，AI 過濾+繁中）→ 美股主題
+        ("us_news", lambda: _run_us_news(router.client("usstock"))),
     ]
     try:
         await asyncio.gather(*[
