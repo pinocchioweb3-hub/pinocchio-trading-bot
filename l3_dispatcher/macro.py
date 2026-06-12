@@ -410,10 +410,35 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
     return result
 
 
+def _mark_daily_macro_sent() -> None:
+    """v23-2: 記錄 daily macro 發送時間（重啟去重用）"""
+    import json as _json
+    import time as _t
+    from botpaths import data_dir
+    try:
+        (data_dir() / "daily_macro_state.json").write_text(
+            _json.dumps({"last_sent_ts": _t.time()}), encoding="utf-8")
+    except Exception:
+        pass
+
+
 async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3600):
-    """每小時推送即時動態 pulse（聚焦 1h/24h/3d/1w delta）"""
+    """每小時推送即時動態 pulse（v23-2 差分式：只報與上次相比的變化）"""
+    import json as _json
+    from botpaths import data_dir
     from telegram_bot.message_format import render_macro_report
     from .synthesizer import synthesize_hourly_pulse
+
+    # 上次報告持久化（重啟不失憶，差分基準連續）
+    state_file = data_dir() / "pulse_state.json"
+    last_text: str | None = None
+    last_ts: str | None = None
+    try:
+        if state_file.exists():
+            st = _json.loads(state_file.read_text(encoding="utf-8"))
+            last_text, last_ts = st.get("text"), st.get("ts")
+    except Exception:
+        pass
 
     # 啟動延後（讓 daily macro 先跑，避免衝突）
     await asyncio.sleep(min(interval_seconds, 60))
@@ -421,7 +446,8 @@ async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3
     while True:
         try:
             pulse_state = await compute_pulse_state(source, watchlist)
-            text, meta = await synthesize_hourly_pulse(pulse_state)
+            text, meta = await synthesize_hourly_pulse(
+                pulse_state, last_pulse_text=last_text, last_pulse_ts=last_ts)
             if text:
                 # v18-E: pulse 頂部固定一行市場廣度（全市場 356 檔即時統計）
                 breadth_prefix = ""
@@ -433,6 +459,16 @@ async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3
                 await _send_to_telegram(
                     tg, text, prefix=f"⚡ <b>每小時即時動態</b>\n{breadth_prefix}")
                 print(f"[pulse] sent ({meta.get('output_chars')} chars)")
+                # v23-2: 存為下次的差分基準
+                last_text = text
+                last_ts = dt.datetime.now(tz=dt.timezone.utc).strftime("%m-%d %H:%M UTC")
+                try:
+                    state_file.write_text(
+                        _json.dumps({"text": last_text, "ts": last_ts},
+                                    ensure_ascii=False),
+                        encoding="utf-8")
+                except Exception:
+                    pass
             else:
                 print(f"[pulse] synth failed: {meta.get('error')}")
         except Exception as e:
@@ -650,8 +686,15 @@ async def run_performance_loop(tg, target_hour_utc: int = 0,
             risk = get_risk_status()
 
             # v16: 紙上驗證進度（引擎期望值）
+            # v23-2: Stage 0 門檻只算加密引擎；美股實驗引擎獨立一行
             from .paper_journal import get_paper_stats, render_paper_summary
-            paper_line = render_paper_summary(get_paper_stats(30))
+            paper_line = render_paper_summary(
+                get_paper_stats(30, setup_not="us_breakout"))
+            us = get_paper_stats(30, setup="us_breakout")
+            if us["n_closed"] or us["n_open"]:
+                paper_line += (f"\n🧪 美股紙上（實驗）30d：已平 <code>{us['n_closed']}</code> 筆 "
+                               f"勝率 <code>{us['win_rate_pct']}%</code> "
+                               f"期望值 <code>{us['avg_r']:+.2f}R</code>/筆")
 
             text = (
                 render_stats_summary(stats7, label="📈 過去 7 天（實倉）") + "\n\n" +
@@ -693,6 +736,21 @@ async def run_daily_macro_loop(tg, source, watchlist, target_hour_utc: int = 0,
     from .synthesizer import synthesize_via_claude_code
 
     # 啟動時可選跑一次（避免等到隔天）
+    # v23-2: 6 小時內已發過就跳過 — 重啟頻繁時不再轟炸完整 Daily Macro
+    if run_on_startup:
+        import json as _json
+        from botpaths import data_dir
+        dm_state = data_dir() / "daily_macro_state.json"
+        try:
+            if dm_state.exists():
+                st = _json.loads(dm_state.read_text(encoding="utf-8"))
+                age_h = (dt.datetime.now(tz=dt.timezone.utc).timestamp()
+                         - st.get("last_sent_ts", 0)) / 3600
+                if age_h < 6:
+                    print(f"[daily-macro] startup skip（{age_h:.1f}h 前已發過）")
+                    run_on_startup = False
+        except Exception:
+            pass
     if run_on_startup:
         await asyncio.sleep(60)
         try:
@@ -707,6 +765,7 @@ async def run_daily_macro_loop(tg, source, watchlist, target_hour_utc: int = 0,
             if text:
                 await _send_to_telegram(tg, text, prefix="📅 <b>Daily Macro 啟動版</b>\n")
                 print(f"[daily-macro] startup sent ({meta.get('output_chars')} chars)")
+                _mark_daily_macro_sent()
         except Exception as e:
             print(f"[daily-macro] startup error: {e}")
 
@@ -728,6 +787,7 @@ async def run_daily_macro_loop(tg, source, watchlist, target_hour_utc: int = 0,
             if text:
                 await _send_to_telegram(tg, text, prefix="📅 <b>每日宏觀分析 (08:00 台北)</b>\n")
                 print(f"[daily-macro] sent ({meta.get('output_chars')} chars)")
+                _mark_daily_macro_sent()
             else:
                 print(f"[daily-macro] synth failed: {meta.get('error')}")
         except Exception as e:

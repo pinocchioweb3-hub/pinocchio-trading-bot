@@ -1,4 +1,4 @@
-"""Worker 2: 訊息分派器（含 risk_manager + trade_journal 整合）。
+﻿"""Worker 2: 訊息分派器（含 risk_manager + trade_journal 整合）。
 
 流程：
     1. dequeue 一筆 FIRE
@@ -120,16 +120,18 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
         return True
 
     # === v18-D: 交易計畫先算（waiting 與 FIRE 兩路徑共用）===
+    # v23-2: SL/TP/風險全部走 botconfig 單一來源（修三份複製的不同步隱患）
+    from botconfig import CONFIG
     snap = decision["snapshot"]
     entry_price = snap["price"]
-    sl_pct = 4.0 if setup == "intraday" else 5.0
+    sl_pct = CONFIG.sl_pct(setup)
     if direction == "bull":
         stop = round(entry_price * (1 - sl_pct / 100), 6)
     else:
         stop = round(entry_price * (1 + sl_pct / 100), 6)
     lev = choose_leverage(sym, snap.get("atr_pct_7d"))
-    pos = compute_position(entry_price, stop, 100.0, lev)
-    tp_r = (1.0, 1.5, 2.0) if setup == "intraday" else (1.0, 1.5, 2.5)
+    pos = compute_position(entry_price, stop, CONFIG.risk_per_trade_usd, lev)
+    tp_r = CONFIG.tp_r(setup)
     tps = compute_tp_prices(entry_price, stop, direction, tp_r)
     atr = snap.get("atr_pct_7d")
     regime = ("unknown" if atr is None else
@@ -161,7 +163,7 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
                 symbol=sym, setup=setup, direction=direction,
                 entry_price=entry_price, stop_price=stop,
                 tp1=tps["tp1"], tp2=tps["tp2"], tp3=tps["tp3"],
-                risk_usd=100.0, leverage=lev,
+                risk_usd=CONFIG.risk_per_trade_usd, leverage=lev,
                 margin_usd=pos["margin_usd"], notional_usd=pos["notional_usd"],
                 fire_id=fire_id, tg_message_id=msg_id,
                 decision_snapshot={"snapshot": snap, "reason": decision.get("reason", "")},
@@ -248,7 +250,7 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
             symbol=sym, setup=setup, direction=direction,
             entry_price=entry_price, stop_price=stop,
             tp1=tps["tp1"], tp2=tps["tp2"], tp3=tps["tp3"],
-            risk_usd=100.0, leverage=lev,
+            risk_usd=CONFIG.risk_per_trade_usd, leverage=lev,
             margin_usd=pos["margin_usd"], notional_usd=pos["notional_usd"],
             fire_id=fire_id, tg_message_id=msg_id,
             decision_snapshot={"snapshot": snap, "reason": decision.get("reason", "")},

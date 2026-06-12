@@ -28,10 +28,14 @@ ATR_TIER_HIGH = 8.0
 
 
 def choose_leverage(symbol: str, atr_pct_7d: Optional[float],
-                    default: int = 15) -> int:
+                    default: int | None = None) -> int:
     """回傳該標的合理槓桿。
     None → 保守 5x（不冒險）。
+    v23-2: default 未指定時讀 botconfig（讓 .env 的 DEFAULT_LEVERAGE 活過來）。
     """
+    if default is None:
+        from botconfig import CONFIG
+        default = CONFIG.default_leverage
     if symbol in LEVERAGE_OVERRIDES:
         return LEVERAGE_OVERRIDES[symbol]
     if atr_pct_7d is None:

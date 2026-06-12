@@ -231,7 +231,8 @@ async def amain(args: argparse.Namespace) -> int:
                                                      run_on_startup=_consume_startup("performance"))),
         ("trade_monitor", lambda: run_trade_monitor_loop(tg_positions, source,
                                                          args.monitor_interval,
-                                                         tg_alert=tg_trade)),
+                                                         tg_alert=tg_trade,
+                                                         tg_us=router.client("usstock"))),
         ("position_tracker", lambda: run_position_tracker_loop(tg_positions, source,
                                                                args.position_tracker_interval)),
         # 新聞（已過濾 + 繁中翻譯）→ 新聞快訊主題

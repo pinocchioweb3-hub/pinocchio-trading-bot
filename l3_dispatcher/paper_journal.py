@@ -18,7 +18,10 @@ from botpaths import db_path as _db_path
 
 DB_PATH = _db_path("trade_journal.db")
 
-RISK_USD = 100.0  # 紙上固定 1R = $100，與訊號設計一致
+# v23-2: 與實倉同源（botconfig）— 紙上 1R 跟著用戶設定走
+from botconfig import CONFIG as _CFG
+
+RISK_USD = _CFG.risk_per_trade_usd  # 紙上 1R，與訊號設計一致
 
 
 def _conn() -> sqlite3.Connection:
@@ -153,8 +156,10 @@ def apply_paper_event(paper_id: int, leg_label: str, size_pct: float,
         conn.close()
 
 
-def get_paper_stats(days: int = 30, setup: str | None = None) -> dict:
-    """紙上帳統計（引擎期望值驗證用）。setup 指定時只統計該引擎。"""
+def get_paper_stats(days: int = 30, setup: str | None = None,
+                    setup_not: str | None = None) -> dict:
+    """紙上帳統計（引擎期望值驗證用）。setup 指定時只統計該引擎；
+    setup_not 排除指定引擎（v23-2: Stage 0 門檻只算加密，排除 us_breakout）。"""
     init_db()
     conn = _conn()
     try:
@@ -164,6 +169,9 @@ def get_paper_stats(days: int = 30, setup: str | None = None) -> dict:
         if setup:
             sql += " AND setup=?"
             args.append(setup)
+        if setup_not:
+            sql += " AND setup != ?"
+            args.append(setup_not)
         rows = conn.execute(sql, args).fetchall()
         closed = [r for r in rows if r[0] == "closed"]
         opens = [r for r in rows if r[0] == "open"]

@@ -84,16 +84,18 @@ def render_fire_message(decision_dict: dict[str, Any]) -> tuple[str, list[list[d
     # === 風控數字 ===
     # v15: SL 與 dispatcher 帳本/trade_monitor 監控統一為 4.0%（intraday loose profile）
     # 原本這裡寫 3.5% 但帳本記 4.0%，使用者照訊息掛單、系統卻用另一個價判停損
+    # v23-2: 與 dispatcher 同源（botconfig）— 終結兩處複製的不同步隱患
+    from botconfig import CONFIG
     entry = snap["price"]
-    sl_pct = 4.0 if setup == "intraday" else 5.0
+    sl_pct = CONFIG.sl_pct(setup)
     if direction == "bull":
         stop = round(entry * (1 - sl_pct / 100), 6)
     else:
         stop = round(entry * (1 + sl_pct / 100), 6)
-    risk_usd = 100.0
+    risk_usd = CONFIG.risk_per_trade_usd
     lev = choose_leverage(sym, snap.get("atr_pct_7d"))
     pos = compute_position(entry, stop, risk_usd, lev)
-    tp_r = (1.0, 1.5, 2.0) if setup == "intraday" else (1.0, 1.5, 2.5)
+    tp_r = CONFIG.tp_r(setup)
     tps = compute_tp_prices(entry, stop, direction, tp_r)
 
     # === 進場區間（不是單一價）===
@@ -155,9 +157,12 @@ def render_fire_message(decision_dict: dict[str, Any]) -> tuple[str, list[list[d
         f"保證金約 ${pos['margin_usd']} @ {lev}x）</i>\n"
         "\n"
         "🎯 <b>止盈（三段分批）</b>\n"
-        f"   TP1（1.0R）：<code>${tps['tp1']}</code> → 平 1/3、止損移到開倉價\n"
-        f"   TP2（1.5R）：<code>${tps['tp2']}</code> → 平 1/3\n"
-        f"   TP3（{tp_r[2]}R）：<code>${tps['tp3']}</code> → 平剩餘或移動止損\n"
+        f"   TP1（{tp_r[0]}R）：<code>${tps['tp1']}</code> → "
+        f"平 {CONFIG.tp_size_split[0]*100:.0f}%、止損移到開倉價\n"
+        f"   TP2（{tp_r[1]}R）：<code>${tps['tp2']}</code> → "
+        f"平 {CONFIG.tp_size_split[1]*100:.0f}%\n"
+        f"   TP3（{tp_r[2]}R）：<code>${tps['tp3']}</code> → "
+        f"平剩餘 {CONFIG.tp_size_split[2]*100:.0f}% 或移動止損\n"
     )
 
     if setup == "ambush":

@@ -102,54 +102,30 @@ SYSTEM_PROMPT = DAILY_MACRO_PROMPT
 
 
 # ====================== Hourly Pulse Prompt（每小時） ======================
-HOURLY_PULSE_PROMPT = """你是專業交易監視員，每小時報告市場「即時動態」。
+HOURLY_PULSE_PROMPT = """你是專業交易監視員，每小時做「差分回報」：只報告與上一次報告相比 *新發生* 的變化。
 
-**核心規則：絕對不要重複日線級別的敘事**（那是早上 08:00 的 daily macro 任務）。
-**聚焦在：過去 1h、24h、3d、1w 內 *發生了什麼變化*、什麼新進的力量、什麼結束的力量。**
-
-# 你必須遵守的寫作鐵律
-
-**禁止：**
-- ❌ 重複「BTC 在 bear_deleveraging 階段」這種日線級別判斷
-- ❌ 重複「距 ATH 跌 50%」這種跨月份的脈絡
-- ❌ 籠統說「市場震盪」「需要觀察」
-- ❌ 講「過去 30/60/90 天」這些是 daily macro 的事
-
-**必須：**
-- ✅ 用 1h、24h、3d、1w 的具體變動數字
-- ✅ 點出「過去 N 小時新發生的事」（反彈、破位、爆量、機構進場）
-- ✅ 識別資金流向變化（CVD 轉向、ETF 翻盤、鯨魚動作）
-- ✅ 短期內可觀察的具體價位/閾值
+# 差分鐵律（最高優先，違反即失敗）
+1. user message 末尾附有「上一次 pulse 報告全文」。凡是上次已講過、且數字無實質變化的內容，禁止再寫。
+2. 「實質變化」門檻（低於門檻 = 視為沒變，不准提）：
+   - 價格：1h 變動 |≥0.8%|，或突破/跌破上次報告提到的觀察價位或 24h 高低
+   - Funding：較上次 |≥0.005 百分點/8h|
+   - ETF：出現「新的」單日流向數字（Farside 一天只更新一次；數字沒換 = 沒新資料，禁止重講）
+   - 鯨魚：淨多百分比變動 |≥5 個百分點| 或總倉變動 |≥20%|
+   - Fear & Greed：變動 |≥5 點|
+   - 清算：過去 1h 出現單邊 > $20M
+3. 若所有項目都低於門檻 → 只輸出一行，不准多寫任何字：
+   ⚪ 過去 1h 無顯著變化｜BTC $XX,XXX（1h ±X.X%）｜上次觀察價位仍有效
+4. 有變化時，只列有變化的項目，每項 1-2 句：
+   🔺 <項目>：<上次值> → <現值>，<一句因果含義>
+5. 上次報告若提了觀察價位/事件：第一句先回答「觸發了沒」，再給新觀察點。
+6. 禁止重述 regime、跨月脈絡、30/60/90 天敘事 — 那是早上 08:00 daily macro 的事。
+7. 禁止固定段落模板；報告長度跟著變化量走，不准為了湊版面而寫。
 
 # 輸出格式（HTML for Telegram）
-
-<b>⚡ 1. 過去 1 小時即時動態</b>
-（2-3 句：發生什麼價/量/資金流變化）
-
-<b>📊 2. 24h-3d 結構演變</b>
-（反彈了？破位了？盤整了？用具體區間/百分比）
-- 過去 24h 高 vs 低 vs 現在
-- 過去 3d 趨勢
-- 1w 結構（簡述，不展開敘事）
-
-<b>🏛 3. 機構/鯨魚即時動向</b>
-（24h 內 ETF 進/出、Hyperliquid 鯨魚新進/減倉、選擇權 OI 變化）
-
-<b>💧 4. 流動性與情緒變化</b>
-（funding 上升/下降、liquidation 失衡、F&G 變化、有無關鍵新聞）
-
-<b>⏰ 5. 下個小時觀察重點</b>
-（1-2 句：等什麼價位/事件）
-
-# 長度與格式（v17 雙層）
-- 掃讀層 = 第 1-2 段 + 觀察重點，總長 ≤ 300 中文字
-- 第 3-4 段（機構/流動性細節）整段包進一個 <blockquote expandable>（≤ 400 字）
-- HTML 標籤：<b>, <i>, <code>, <blockquote expandable>
-- 緊湊、無冗餘；若這小時「沒有顯著變化」，直接輸出單行：
-  「⚪ 過去 1h 無顯著變化（BTC ±X.X%，無新資金流事件）」— 不要硬寫
-
-# 給你的數據
-（之後在 user message 給你 delta-focused 資料）"""
+- 有變化：≤ 250 中文字。🔺 變化條列 + 最後一行「⏰ 觀察：<價位/事件>」。
+  標籤限 <b>、<i>、<code>。
+- 無變化：第 3 條的單行格式。
+- 若本次是今日第一則（無上次報告）：給 3-4 句當下基準描述即可，標註「（基準）」。"""
 
 
 # ====================== Per-Symbol Deep Dive Prompt（每 6 小時，每個強勢幣一份） ======================
@@ -604,11 +580,21 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
     return "\n".join(parts)
 
 
-async def synthesize_hourly_pulse(pulse_state: dict, timeout_sec: int = 180) -> tuple[str | None, dict]:
-    """每小時 pulse 報告"""
+async def synthesize_hourly_pulse(pulse_state: dict, timeout_sec: int = 180,
+                                  last_pulse_text: str | None = None,
+                                  last_pulse_ts: str | None = None
+                                  ) -> tuple[str | None, dict]:
+    """每小時 pulse 報告（v23-2 差分式：附上次報告全文當基準）"""
+    user_data = _format_pulse_data(pulse_state)
+    if last_pulse_text:
+        user_data += (f"\n\n## 上一次 pulse 報告全文（{last_pulse_ts or '?'}）"
+                      f"— 差分基準，已講過且沒變的禁止再講\n"
+                      f"{last_pulse_text[:1500]}")
+    else:
+        user_data += "\n\n## 上一次報告：無（今日第一則，輸出基準描述）"
     return await _synthesize_with_prompt(
         system_prompt=HOURLY_PULSE_PROMPT,
-        user_data=_format_pulse_data(pulse_state),
+        user_data=user_data,
         timeout_sec=timeout_sec,
     )
 

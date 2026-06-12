@@ -26,8 +26,11 @@ from typing import Any
 from .trade_journal import get_open_trades, record_leg
 
 
-# TP 分批比例（必須加總 = 1.0）
-TP_SIZE_PCT = {"tp1": 0.5, "tp2": 0.3, "tp3": 0.2}
+# TP 分批比例（必須加總 = 1.0）— v23-2: botconfig 同源
+from botconfig import CONFIG as _CFG
+
+TP_SIZE_PCT = {"tp1": _CFG.tp_size_split[0], "tp2": _CFG.tp_size_split[1],
+               "tp3": _CFG.tp_size_split[2]}
 
 # 預設 hold_max_hours（intraday 用 48h，與 loose profile 一致）
 DEFAULT_HOLD_MAX_HOURS = int(os.getenv("HOLD_MAX_HOURS", "48"))
@@ -132,7 +135,7 @@ def _check_timeout(trade: dict, hold_max_hours: int = DEFAULT_HOLD_MAX_HOURS) ->
     return trade["size_remaining"]
 
 
-async def monitor_once(source, tg=None, tg_fire=None) -> list[MonitorEvent]:
+async def monitor_once(source, tg=None, tg_fire=None, tg_us=None) -> list[MonitorEvent]:
     """掃一次所有 open trades（實倉 + 紙上）。回實倉觸發事件。"""
     opens = get_open_trades()
     events: list[MonitorEvent] = []
@@ -208,7 +211,7 @@ async def monitor_once(source, tg=None, tg_fire=None) -> list[MonitorEvent]:
 
     # === v16: 紙上交易追蹤（每筆訊號自動開倉，驗證引擎期望值）===
     try:
-        await _monitor_paper(source, tg, bars_cache)
+        await _monitor_paper(source, tg, bars_cache, tg_us=tg_us)
     except Exception as e:
         print(f"[trade_monitor] paper monitor error: {type(e).__name__}: {e}")
 
@@ -304,8 +307,12 @@ async def _check_waiting_trades(source, tg, bars_cache: dict[str, list],
         print(f"[trade_monitor] ⏳→🔥 waiting triggered: {sym} {w['direction']} @ {live}")
 
 
-async def _monitor_paper(source, tg, bars_cache: dict[str, list]) -> None:
-    """紙上倉位 TP/SL/timeout 判定。事件彙整成單則低噪訊息。"""
+async def _monitor_paper(source, tg, bars_cache: dict[str, list],
+                         tg_us=None) -> None:
+    """紙上倉位 TP/SL/timeout 判定。事件彙整成單則低噪訊息。
+
+    v23-2 美股斷層修復：us_breakout 的事件發 tg_us（🇺🇸 美股主題）—
+    進場通知在哪、出場事件就在哪；加密事件留 tg（📈 持倉與績效）。"""
     from .paper_journal import apply_paper_event, get_open_paper, get_paper_stats
 
     papers = get_open_paper()
@@ -313,6 +320,7 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list]) -> None:
         return
 
     paper_lines: list[str] = []
+    us_lines: list[str] = []
     for pt in papers:
         sym = pt["symbol"]
         bars = bars_cache.get(sym)
@@ -323,12 +331,15 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list]) -> None:
         if not bars:
             continue
 
+        is_us = pt.get("setup", "") == "us_breakout"
+        lines = us_lines if is_us else paper_lines
+
         # TP/SL（與實倉同一套純函式）
         for label, price, size in _check_trade(pt, bars):
             r = apply_paper_event(pt["id"], label, size, price)
             icon = "🎯" if label.startswith("tp") else "🛑"
             closed_str = "（已平倉）" if r["closed"] else ""
-            paper_lines.append(
+            lines.append(
                 f"{icon} {sym} {pt['direction']} {label.upper()} "
                 f"{r['leg_r']:+.2f}R{closed_str}")
             pt["legs_hit"].append(label)
@@ -340,21 +351,34 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list]) -> None:
         if remain is not None and remain > 0.001:
             last_close = bars[-1]["close"]
             r = apply_paper_event(pt["id"], "timeout", remain, last_close)
-            paper_lines.append(
+            lines.append(
                 f"⏰ {sym} {pt['direction']} TIMEOUT {r['leg_r']:+.2f}R（已平倉）")
 
+    # 加密事件 → 📈 持倉與績效（Stage 0 門檻只算加密引擎）
     if paper_lines and tg is not None:
-        stats = get_paper_stats(30)
+        stats = get_paper_stats(30, setup_not="us_breakout")
         text = ("📜 <b>紙上驗證事件</b>（自動追蹤，非實倉）\n" +
                 "\n".join(f"  {ln}" for ln in paper_lines) +
                 f"\n30d：{stats['n_closed']} 筆平倉 / 勝率 {stats['win_rate_pct']}% / "
-                f"${stats['total_pnl_usd']:+.0f}　Stage1 門檻 {stats['stage0_progress']}")
+                f"期望值 {stats['avg_r']:+.2f}R　Stage1 門檻 {stats['stage0_progress']}")
         try:
             await tg.send_message(text, parse_mode="HTML")
         except Exception as e:
             print(f"[trade_monitor] paper push error: {e}")
-    if paper_lines:
-        print(f"[trade_monitor] paper events: {len(paper_lines)}")
+    # v23-2: 美股事件 → 🇺🇸 美股主題（進場通知在哪、出場就在哪）
+    if us_lines and (tg_us or tg) is not None:
+        us_stats = get_paper_stats(30, setup="us_breakout")
+        text = ("🧪 <b>美股紙上事件</b>（實驗性引擎，非實倉）\n" +
+                "\n".join(f"  {ln}" for ln in us_lines) +
+                f"\n30d：{us_stats['n_closed']} 筆平倉 / 勝率 {us_stats['win_rate_pct']}% / "
+                f"期望值 {us_stats['avg_r']:+.2f}R")
+        try:
+            await (tg_us or tg).send_message(text, parse_mode="HTML")
+        except Exception as e:
+            print(f"[trade_monitor] us paper push error: {e}")
+    if paper_lines or us_lines:
+        print(f"[trade_monitor] paper events: crypto={len(paper_lines)} "
+              f"us={len(us_lines)}")
 
 
 def _render_event_msg(ev: MonitorEvent) -> str:
@@ -416,7 +440,7 @@ async def _push_event(tg, ev: MonitorEvent) -> None:
 
 
 async def run_trade_monitor_loop(tg, source, interval_seconds: int = 900,
-                                 tg_alert=None):
+                                 tg_alert=None, tg_us=None):
     """Worker 主迴圈：每 N 秒（預設 900=15min）掃一次 open trades。
 
     v15: tg = 持倉與績效主題；tg_alert = 進場訊號主題（熔斷即時警報用，
@@ -443,7 +467,7 @@ async def run_trade_monitor_loop(tg, source, interval_seconds: int = 900,
                 except Exception:
                     pass
 
-            events = await monitor_once(source, tg=tg, tg_fire=tg_alert)
+            events = await monitor_once(source, tg=tg, tg_fire=tg_alert, tg_us=tg_us)
             opens_count = len(get_open_trades())
             if events:
                 event_summary = ", ".join(f"{e.symbol}/{e.event}" for e in events)

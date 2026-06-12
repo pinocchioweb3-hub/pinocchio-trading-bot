@@ -32,8 +32,10 @@ class RiskConfig:
     account_balance_usd: float = float(os.getenv("ACCOUNT_BALANCE_USD", "5000"))
     max_risk_per_trade_usd: float = float(os.getenv("RISK_PER_TRADE_USD", "100"))
 
-    # 部位層
-    max_concurrent_trades: int = int(os.getenv("MAX_CONCURRENT_TRADES", "3"))
+    # 部位層（v23-2: 雙鍵相容 — 修 .env.example 歷史鍵名 MAX_CONCURRENT_POSITIONS）
+    max_concurrent_trades: int = int(os.getenv("MAX_CONCURRENT_TRADES")
+                                     or os.getenv("MAX_CONCURRENT_POSITIONS")
+                                     or "3")
     max_per_family: int = int(os.getenv("MAX_PER_CORRELATED_FAMILY", "2"))
 
     # 熔斷層
