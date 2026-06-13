@@ -24,6 +24,27 @@ from market_intel_mcp.symbol_mapping import (
 )
 
 
+def _market_candidates(min_vol_usd: float = 20_000_000, cap: int = 120) -> list[str]:
+    """v31: 從掃描器即時全市場快照取候選池（取代固定 29 檔策展清單）。
+    回 vol>=門檻、依量排序的 base symbols；失敗回空（呼叫端 fallback）。"""
+    import sqlite3
+    from botpaths import db_path
+    try:
+        conn = sqlite3.connect(db_path("scanner.db"))
+        try:
+            mx = conn.execute("SELECT MAX(ts) FROM snapshots").fetchone()[0]
+            if not mx:
+                return []
+            rows = conn.execute(
+                "SELECT inst, vol24h_usd FROM snapshots WHERE ts=? AND vol24h_usd>=? "
+                "ORDER BY vol24h_usd DESC LIMIT ?", (mx, min_vol_usd, cap)).fetchall()
+            return [r[0] for r in rows]
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+
 @dataclass
 class WatchlistManager:
     indicator: tuple[str, ...] = TIER_INDICATOR     # 固定
@@ -60,10 +81,18 @@ class WatchlistManager:
         before = set(self.trading)
         t0 = asyncio.get_event_loop().time()
 
+        # v31: 候選池改用掃描器全市場即時清單（union 固定 candidates 確保主流幣在內）；
+        #      掃描器未就緒（冷啟動）時 fallback 固定清單
+        market = _market_candidates()
+        if market:
+            pool = list(dict.fromkeys(list(self.candidate_pool) + market))
+        else:
+            pool = list(self.candidate_pool)
+
         # 走公開介面，不依賴 source 的私有方法
         universe = await source.get_strength_universe(
-            limit=len(self.candidate_pool),
-            candidate_symbols=list(self.candidate_pool),
+            limit=len(pool),
+            candidate_symbols=pool,
         )
         if isinstance(universe, dict) and universe.get("error"):
             elapsed = asyncio.get_event_loop().time() - t0

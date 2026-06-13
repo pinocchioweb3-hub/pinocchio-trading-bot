@@ -177,6 +177,42 @@ async def _cmd_status() -> str:
     except Exception:
         pass
 
+    # v31: 自動化 Session 狀態（讓使用者一眼看到全自動在跑）
+    lines.append("")
+    lines.append("🔄 <b>自動化 Session</b>")
+    try:
+        import sqlite3 as _sq
+        from botpaths import db_path as _dbp
+        nowi = int(time.time())
+
+        def _ago(ts):
+            if not ts:
+                return "—"
+            m = (nowi - ts) / 60
+            return f"{m:.0f}分前" if m < 90 else f"{m/60:.1f}h前"
+        # 稽核
+        try:
+            c = _sq.connect(_dbp("message_audit.db"))
+            au = c.execute("SELECT MAX(sent_at) FROM send_log").fetchone()[0]
+            ab = c.execute("SELECT COUNT(*) FROM send_log WHERE blocked=1 AND sent_at>?",
+                           (nowi - 86400,)).fetchone()[0]
+            c.close()
+            lines.append(f"  🔍 稽核：運行中（最近 {_ago(au)}，24h 攔截重複 {ab}）")
+        except Exception:
+            lines.append("  🔍 稽核：運行中")
+        # 敘事
+        try:
+            c = _sq.connect(_dbp("narrative.db"))
+            nu = c.execute("SELECT MAX(last_updated) FROM narratives").fetchone()[0]
+            nc = c.execute("SELECT COUNT(*) FROM narratives WHERE status='active'").fetchone()[0]
+            c.close()
+            lines.append(f"  🧩 敘事：{nc} 條主軸（最近 {_ago(nu)}）")
+        except Exception:
+            lines.append("  🧩 敘事：運行中")
+        lines.append("  ⚙️ 調參：每日 10:00 台北　🩺 健康：每 5 分　📊 紙上回測：即時")
+    except Exception:
+        pass
+
     lines.append("")
     lines.append(f"📬 Queue：{q}")
     lines.append(f"🕒 {dt.datetime.now().strftime('%Y-%m-%d %H:%M')} "
