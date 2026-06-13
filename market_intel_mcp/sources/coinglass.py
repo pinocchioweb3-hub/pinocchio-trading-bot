@@ -367,6 +367,56 @@ class CoinGlassSource:
             "ts": self._extract_ts(data[-1]),
         }
 
+    async def get_funding_series(self, symbol, window: str = "4h",
+                                 limit: int = 60) -> dict:
+        """資金費率歷史序列（v33 圖表用）。value = 當期 funding rate（小數，0.0009=0.09%）。"""
+        result = await self._get(
+            "/api/futures/funding-rate/history",
+            {"exchange": self.DEFAULT_EXCHANGE, "symbol": to_coinglass(symbol),
+             "interval": window, "limit": min(max(limit, 1), 500)},
+            tool="mi_get_funding_series", symbol=symbol,
+        )
+        if result.get("error"):
+            return result
+        data = result["data"] or []
+        series = []
+        for d in data:
+            v = self._to_float(d.get("close"))
+            if v is not None:
+                series.append({"ts": self._extract_ts(d), "value": v})
+        if not series:
+            return make_error(tool="mi_get_funding_series", symbol=symbol,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no funding series")
+        return {"symbol": symbol, "source": "coinglass",
+                "latest": series[-1]["value"], "series": series}
+
+    async def get_liquidation_series(self, symbol, window: str = "4h",
+                                     limit: int = 60) -> dict:
+        """清算歷史序列（v33 圖表用）。每點含多單清算 long_usd / 空單清算 short_usd。"""
+        agg_sym = self._agg_symbol(symbol)
+        result = await self._get(
+            "/api/futures/liquidation/aggregated-history",
+            {"symbol": agg_sym, "interval": window,
+             "exchange_list": self.DEFAULT_OI_EXCHANGES,
+             "limit": min(max(limit, 1), 500)},
+            tool="mi_get_liquidation_series", symbol=symbol,
+        )
+        if result.get("error"):
+            return result
+        data = result["data"] or []
+        series = []
+        for d in data:
+            vl = self._to_float(d.get("aggregated_long_liquidation_usd"))
+            vs = self._to_float(d.get("aggregated_short_liquidation_usd"))
+            series.append({"ts": self._extract_ts(d),
+                           "long_usd": vl or 0.0, "short_usd": vs or 0.0})
+        if not series:
+            return make_error(tool="mi_get_liquidation_series", symbol=symbol,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no liquidation series")
+        return {"symbol": symbol, "source": "coinglass", "series": series}
+
     # =====================================================================
     # Price series（per-exchange OHLC + volume）
     # =====================================================================

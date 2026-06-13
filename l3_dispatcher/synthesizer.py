@@ -538,6 +538,34 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
             ls = cg["ls_ratio"]
             ltone = "大戶偏多" if ls > 1.05 else "大戶偏空" if ls < 0.95 else "多空均衡"
             parts.append(f"- 大戶帳戶多空比：{ls:.2f}（{ltone}）")
+        # v33 新增佐證：清算 / 期現基差 / 結構評分 / 情緒
+        liq = cg.get("liq_24h") or {}
+        if liq:
+            lo, sh = liq.get("long", 0) / 1e6, liq.get("short", 0) / 1e6
+            fuel = ("空頭被清算較多→軋空燃料" if sh > lo * 1.3 else
+                    "多頭被清算較多→下殺燃料" if lo > sh * 1.3 else "多空清算均衡")
+            parts.append(f"- 近24h 清算：多 {lo:.2f}M／空 {sh:.2f}M USD（{fuel}）")
+        basis = cg.get("basis") or {}
+        if basis.get("pct") is not None:
+            parts.append(f"- 期現基差：{basis['pct']:+.3f}%"
+                         + (f"（{basis['interp']}）" if basis.get("interp") else ""))
+        st = cg.get("structure") or {}
+        if st:
+            seg = []
+            if st.get("cvd_slope_7d") is not None:
+                seg.append(f"CVD斜率7d {st['cvd_slope_7d']:+.2f}")
+            if st.get("oi_delta_7d_pct") is not None:
+                seg.append(f"OI 7d {st['oi_delta_7d_pct']:+.1f}%")
+            if st.get("higher_lows_7d") is not None:
+                seg.append("墊高低點✓" if st["higher_lows_7d"] else "未墊高低點")
+            if st.get("above_4h_200ma") is not None:
+                seg.append("站上4h_200MA✓" if st["above_4h_200ma"] else "在4h_200MA下")
+            if seg:
+                parts.append("- 結構評分（7d）：" + "／".join(seg))
+        senti = cg.get("sentiment") or {}
+        if senti.get("fg") is not None:
+            parts.append(f"- 市場情緒：恐懼貪婪 {senti['fg']}"
+                         + (f"（{senti['fg_label']}）" if senti.get("fg_label") else ""))
 
     # Hyperliquid 鯨魚（如果這個 symbol 上榜）
     whales = sym_state.get("whales", {})

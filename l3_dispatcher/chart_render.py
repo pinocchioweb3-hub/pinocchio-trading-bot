@@ -23,8 +23,8 @@ from botpaths import data_dir
 CHART_DIR = data_dir() / "charts"
 KEEP_CHARTS = 50
 
-UP = "#26a69a"      # 綠
-DOWN = "#ef5350"    # 紅
+UP = "#26a69a"      # 綠（看漲/支撐/需求）
+DOWN = "#ef5350"    # 紅（看跌/阻力/供給）
 BG = "#131722"      # TradingView 深色
 FG = "#d1d4dc"
 GRID = "#2a2e39"
@@ -32,6 +32,12 @@ VOLMA = "#f5d442"   # 量能均線（黃）
 OICOL = "#5b9bd5"   # OI 線（藍）
 SNR_R = "#ef5350"   # 壓力
 SNR_S = "#26a69a"   # 支撐
+# v33 語意化配色
+BREAKER = "#ab47bc" # 紫（Breaker / 反轉結構）
+PLAN_E = "#f5d442"  # 進場線（黃）
+FUND_C = "#ffa726"  # 資金費率（橘）
+LSCOL = "#26c6da"   # 多空比（青）
+SWEEP = "#ffca28"   # 流動性掃單標記（琥珀）
 
 
 def _vol(c: dict) -> float:
@@ -46,7 +52,9 @@ def _vol(c: dict) -> float:
 
 
 def _compute_snr(candles: list[dict], n_levels: int = 3) -> dict:
-    """從近期 swing 高低密集區算支撐壓力。回 {resistance:[...], support:[...]}。"""
+    """從近期 swing 高低密集區算支撐壓力『區帶』。
+    v33：只保留觸及次數 >=3 的密集區（剔除單次雜訊線；不足則放寬到 >=2）；
+    回 {resistance:[(price,cnt,lo,hi)...], support:[...]}（含區帶上下緣供畫 axhspan）。"""
     if len(candles) < 10:
         return {"resistance": [], "support": []}
     highs, lows = [], []
@@ -62,21 +70,31 @@ def _compute_snr(candles: list[dict], n_levels: int = 3) -> dict:
     rng = max(c["high"] for c in candles) - min(c["low"] for c in candles)
     tol = rng * 0.012 if rng else cur * 0.005
 
-    def _cluster(levels: list[float]) -> list[tuple[float, int]]:
+    def _cluster(levels: list[float]) -> list[tuple]:
         levels = sorted(levels)
-        clusters = []
+        clusters = []   # [avg, cnt, lo, hi]
         for lv in levels:
             if clusters and abs(lv - clusters[-1][0]) <= tol:
-                cnt = clusters[-1][1] + 1
-                avg = (clusters[-1][0] * clusters[-1][1] + lv) / cnt
-                clusters[-1] = (avg, cnt)
+                avg, cnt, lo, hi = clusters[-1]
+                cnt2 = cnt + 1
+                clusters[-1] = [(avg * cnt + lv) / cnt2, cnt2, min(lo, lv), max(hi, lv)]
             else:
-                clusters.append((lv, 1))
-        return sorted(clusters, key=lambda x: -x[1])   # 觸及次數多者優先
+                clusters.append([lv, 1, lv, lv])
+        return clusters
 
-    res = [c[0] for c in _cluster(highs) if c[0] > cur][:n_levels]
-    sup = [c[0] for c in _cluster(lows) if c[0] < cur][:n_levels]
-    return {"resistance": sorted(res), "support": sorted(sup, reverse=True)}
+    def _pick(clusters, keep, want):
+        # 先取觸及 >=3 的；不足補 >=2；再不足放任何
+        for thr in (3, 2, 1):
+            sel = sorted([c for c in clusters if c[1] >= thr and keep(c[0])],
+                         key=lambda x: -x[1])
+            if len(sel) >= want or thr == 1:
+                return [(round(c[0], 10), c[1], c[2], c[3]) for c in sel[:want]]
+        return []
+
+    res = _pick(_cluster(highs), lambda p: p > cur, n_levels)
+    sup = _pick(_cluster(lows), lambda p: p < cur, n_levels)
+    return {"resistance": sorted(res, key=lambda x: x[0]),
+            "support": sorted(sup, key=lambda x: -x[0])}
 
 
 def _prune_old():
@@ -87,6 +105,42 @@ def _prune_old():
             p.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _structure_scorecard_lines(overlays: dict) -> list[str]:
+    """v33：把 CoinGlass 結構評分卡 + 基差 + 情緒組成圖上佐證框文字。無資料回空。"""
+    lines: list[str] = []
+    st = overlays.get("structure") or {}
+    if st:
+        lines.append("◆ 結構評分（7d）")
+        if st.get("atr_pct_7d") is not None:
+            lines.append(f"  ATR% {st['atr_pct_7d']:.1f}　量比 "
+                         f"{(st.get('vol_24h_vs_30d') or 0):.2f}")
+        cvs = st.get("cvd_slope_7d")
+        tts = st.get("top_trader_slope_7d")
+        if cvs is not None or tts is not None:
+            lines.append(f"  CVD斜率 {(cvs or 0):+.2f}　大戶斜率 {(tts or 0):+.2f}")
+        oid = st.get("oi_delta_7d_pct")
+        if oid is not None:
+            lines.append(f"  OI 7d {oid:+.1f}%")
+        flags = []
+        if st.get("higher_lows_7d") is not None:
+            flags.append("墊高低點✓" if st["higher_lows_7d"] else "未墊高低點")
+        if st.get("above_4h_200ma") is not None:
+            flags.append("站上4h_200MA✓" if st["above_4h_200ma"] else "在4h_200MA下")
+        if flags:
+            lines.append("  " + "　".join(flags))
+    basis = overlays.get("basis") or {}
+    if basis.get("pct") is not None:
+        lines.append(f"◆ 期現基差 {basis['pct']:+.3f}%"
+                     + (f"（{basis['interp']}）" if basis.get("interp") else ""))
+    senti = overlays.get("sentiment") or {}
+    if senti.get("fg") is not None:
+        s = f"◆ 恐懼貪婪 {senti['fg']}"
+        if senti.get("fg_label"):
+            s += f"（{senti['fg_label']}）"
+        lines.append(s)
+    return lines
 
 
 def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
@@ -103,14 +157,24 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
         overlays = overlays or {}
         has_cvd = bool(overlays.get("cvd"))
         has_oi = bool(overlays.get("oi"))
+        has_fund = bool(overlays.get("funding_series"))
+        has_liq = bool(overlays.get("liq_long_series"))
+        has_ls = bool(overlays.get("ls_series"))
 
-        # v30: 多面板（畫質提升 dpi 150）— 價格/SMC/SNR + 成交量 + CVD + OI
-        panels = [("price", 3.4), ("vol", 1.0)]
+        # v33: 全指標多面板（畫質提升 dpi 180）— 價格/SMC/SNR + 量 + CVD + OI
+        #      + 資金費率 + 清算(多空) + 多空比
+        panels = [("price", 3.6), ("vol", 1.0)]
         if has_cvd:
             panels.append(("cvd", 1.0))
         if has_oi:
             panels.append(("oi", 1.0))
-        fig = plt.figure(figsize=(13, 6 + 1.6 * len(panels)), dpi=150)
+        if has_fund:
+            panels.append(("funding", 0.85))
+        if has_liq:
+            panels.append(("liq", 0.9))
+        if has_ls:
+            panels.append(("ls", 0.85))
+        fig = plt.figure(figsize=(13, 6 + 1.55 * len(panels)), dpi=180)
         fig.patch.set_facecolor(BG)
         gs = GridSpec(len(panels), 1, height_ratios=[p[1] for p in panels],
                       hspace=0.07, figure=fig)
@@ -131,39 +195,49 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                                    max(body_hi - body_lo, c["close"] * 1e-5),
                                    facecolor=color, edgecolor=color, zorder=3))
 
-        # === FVG（半透明矩形，從出現處延伸到最右）===
-        for f in (smc.get("fvg") or [])[:6]:
-            if f.get("mitigated"):
-                continue
+        # === FVG（v33：只留未填補的最近 3 個 + 50% CE 中線；進場參考 CE 較緊）===
+        _fvgs = [f for f in (smc.get("fvg") or []) if not f.get("mitigated")][:3]
+        for f in _fvgs:
             x0 = max(0, n - 1 - int(f.get("ago_bars") or 0))
             color = UP if (f.get("type") or "").lower().startswith("bull") else DOWN
+            ce = (f["top"] + f["bottom"]) / 2
             ax.add_patch(Rectangle((x0, f["bottom"]), n - x0,
                                    f["top"] - f["bottom"],
-                                   facecolor=color, alpha=0.13, edgecolor="none", zorder=1))
-            ax.text(n - 0.5, (f["top"] + f["bottom"]) / 2, "FVG",
-                    color=color, fontsize=7, va="center", ha="right", alpha=0.8, zorder=4)
+                                   facecolor=color, alpha=0.12, edgecolor="none", zorder=1))
+            # 50% CE 中線（虛線）
+            ax.plot([x0, n], [ce, ce], color=color, linewidth=0.7,
+                    linestyle=(0, (2, 3)), alpha=0.7, zorder=2)
+            ax.text(n - 0.5, ce, "FVG·CE", color=color, fontsize=6.8, va="center",
+                    ha="right", alpha=0.9, zorder=4,
+                    bbox=dict(boxstyle="round,pad=0.12", fc=BG, ec=color, lw=0.4, alpha=0.7))
 
-        # === Order Blocks（边框矩形）===
-        for ob in (smc.get("order_blocks") or [])[:4]:
-            if ob.get("mitigated"):
-                continue
+        # === Order Blocks（v33：只留未緩解最近 3 個；demand=綠 supply=紅）===
+        _obs = [o for o in (smc.get("order_blocks") or []) if not o.get("mitigated")][:3]
+        for ob in _obs:
             x0 = max(0, n - 1 - int(ob.get("ago_bars") or 0))
-            color = UP if (ob.get("type") or "").lower().startswith("bull") else DOWN
+            is_bull = (ob.get("type") or "").lower().startswith("bull")
+            color = UP if is_bull else DOWN
+            lbl = "需求OB" if is_bull else "供給OB"
             ax.add_patch(Rectangle((x0, ob["bottom"]), n - x0,
                                    ob["top"] - ob["bottom"],
-                                   facecolor="none", edgecolor=color,
-                                   linewidth=1.0, linestyle="--", alpha=0.7, zorder=2))
-            ax.text(x0 + 0.3, ob["top"], "OB", color=color, fontsize=7,
-                    va="bottom", alpha=0.9, zorder=4)
+                                   facecolor=color, alpha=0.06, edgecolor=color,
+                                   linewidth=1.0, linestyle="--", zorder=2))
+            ax.text(x0 + 0.3, ob["top"], lbl, color=color, fontsize=6.8,
+                    va="bottom", alpha=0.95, zorder=4,
+                    bbox=dict(boxstyle="round,pad=0.12", fc=BG, ec=color, lw=0.4, alpha=0.7))
 
-        # === BoS / CHoCH（水平短線 + 標籤）===
-        for b in (smc.get("bos_choch") or [])[:5]:
+        # === BoS / CHoCH（v33：CHoCH 實線=結構反轉、BOS 點線=趨勢延續，只留最近 3）===
+        for b in (smc.get("bos_choch") or [])[:3]:
             x0 = max(0, n - 1 - int(b.get("ago_bars") or 0))
             color = UP if b.get("direction") == "bull" else DOWN
+            typ = (b.get("type") or "BOS").upper()
+            is_choch = "CHOCH" in typ or "CHANGE" in typ
             ax.plot([x0, min(x0 + 12, n - 1)], [b["level"], b["level"]],
-                    color=color, linewidth=1.0, alpha=0.85, zorder=2)
-            ax.text(x0, b["level"], b.get("type", "BOS"), color=color,
-                    fontsize=7, va="bottom", alpha=0.9, zorder=4)
+                    color=color, linewidth=1.1,
+                    linestyle="-" if is_choch else (0, (1, 2)),
+                    alpha=0.9, zorder=2)
+            ax.text(x0, b["level"], "CHoCH" if is_choch else "BOS", color=color,
+                    fontsize=6.8, va="bottom", alpha=0.95, zorder=4)
 
         # === Swing 高低點（v28: 標 HH/HL/LH/LL 市場結構）===
         swings = sorted((smc.get("swing_points") or []),
@@ -186,18 +260,24 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                 ax.annotate(f"▁{tag}", (x0, lvl), color=UP, fontsize=7.5,
                             ha="center", va="top", zorder=5)
 
-        # === SNR 支撐壓力（v28：水平虛線，標觸及次數密集區）===
+        # === SNR 支撐壓力（v33：畫『區帶』axhspan + 觸及次數，只留密集區）===
         snr = _compute_snr(candles)
-        for r in snr["resistance"]:
-            ax.axhline(r, color=SNR_R, linewidth=0.8, linestyle=(0, (6, 4)),
-                       alpha=0.55, zorder=1)
-            ax.text(n + 0.5, r, f"壓力 {r:,.6g}", color=SNR_R, fontsize=7,
-                    va="center", ha="left", alpha=0.9, zorder=5)
-        for sp in snr["support"]:
-            ax.axhline(sp, color=SNR_S, linewidth=0.8, linestyle=(0, (6, 4)),
-                       alpha=0.55, zorder=1)
-            ax.text(n + 0.5, sp, f"支撐 {sp:,.6g}", color=SNR_S, fontsize=7,
-                    va="center", ha="left", alpha=0.9, zorder=5)
+        _rng = (max(c["high"] for c in candles) - min(c["low"] for c in candles)) or 1
+        _band = _rng * 0.004   # 區帶最小半高
+        for price, cnt, lo, hi in snr["resistance"]:
+            lo2, hi2 = min(lo, price - _band), max(hi, price + _band)
+            ax.axhspan(lo2, hi2, color=SNR_R, alpha=0.10, zorder=1)
+            ax.axhline(price, color=SNR_R, linewidth=0.7, linestyle=(0, (6, 4)),
+                       alpha=0.5, zorder=1)
+            ax.text(n + 0.5, price, f"壓力 {price:,.6g}（×{cnt}）", color=SNR_R,
+                    fontsize=7, va="center", ha="left", alpha=0.9, zorder=5)
+        for price, cnt, lo, hi in snr["support"]:
+            lo2, hi2 = min(lo, price - _band), max(hi, price + _band)
+            ax.axhspan(lo2, hi2, color=SNR_S, alpha=0.10, zorder=1)
+            ax.axhline(price, color=SNR_S, linewidth=0.7, linestyle=(0, (6, 4)),
+                       alpha=0.5, zorder=1)
+            ax.text(n + 0.5, price, f"支撐 {price:,.6g}（×{cnt}）", color=SNR_S,
+                    fontsize=7, va="center", ha="left", alpha=0.9, zorder=5)
 
         # === 交易計畫線 ===
         if plan:
@@ -277,6 +357,64 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                 axo.text(0.01, 0.92, "　".join(extra), transform=axo.transAxes,
                          color=FG, fontsize=8, va="top", ha="left")
 
+        # === 資金費率面板（v33：序列 + 0 軸 + 過熱/過冷帶）===
+        if has_fund and "funding" in axes:
+            axf = axes["funding"]
+            fs = overlays["funding_series"][-n:]
+            fx = range(n - len(fs), n)
+            fpct = [v * 100 for v in fs]   # 轉 %
+            axf.axhspan(0.05, max(max(fpct), 0.06), color=DOWN, alpha=0.06)
+            axf.axhspan(min(min(fpct), -0.06), -0.05, color=UP, alpha=0.06)
+            axf.plot(list(fx), fpct, color=FUND_C, linewidth=1.2, zorder=3)
+            axf.axhline(0, color=FG, linewidth=0.4, alpha=0.3)
+            last = fpct[-1] if fpct else 0
+            tone = "過熱偏多（軋空風險）" if last > 0.05 else "偏空（空頭擁擠）" if last < -0.05 else "中性"
+            axf.set_ylabel("資金費率%", color=FG, fontsize=8)
+            axf.text(0.01, 0.9, f"資金費率 {last:+.4f}%/8h（{tone}）",
+                     transform=axf.transAxes, color=FUND_C, fontsize=8, va="top", ha="left")
+
+        # === 清算面板（v33：多頭清算紅、空頭清算綠，正負雙向 bar）===
+        if has_liq and "liq" in axes:
+            axl = axes["liq"]
+            ll = overlays["liq_long_series"][-n:]
+            sl = overlays["liq_short_series"][-n:]
+            lx = list(range(n - len(ll), n))
+            # 多頭被清算 = 下殺燃料（紅，畫正向）；空頭被清算 = 軋空燃料（綠，畫負向）
+            axl.bar(lx, ll, color=DOWN, alpha=0.7, width=0.8, zorder=3, label="多頭清算")
+            axl.bar(lx, [-s for s in sl], color=UP, alpha=0.7, width=0.8, zorder=3, label="空頭清算")
+            axl.axhline(0, color=FG, linewidth=0.4, alpha=0.3)
+            axl.set_ylabel("清算量", color=FG, fontsize=8)
+            l24 = overlays.get("liq_24h") or {}
+            if l24:
+                axl.text(0.01, 0.9, f"近24h 多 {l24.get('long',0)/1e6:.2f}M／空 {l24.get('short',0)/1e6:.2f}M USD",
+                         transform=axl.transAxes, color=FG, fontsize=8, va="top", ha="left")
+            axl.legend(loc="upper right", fontsize=6.5, facecolor=BG, edgecolor=GRID,
+                       labelcolor=FG, ncol=2)
+
+        # === 多空比面板（v33：大戶帳戶多空比序列 + 均衡線 1.0）===
+        if has_ls and "ls" in axes:
+            axls = axes["ls"]
+            lsv = overlays["ls_series"][-n:]
+            lsx = range(n - len(lsv), n)
+            axls.plot(list(lsx), lsv, color=LSCOL, linewidth=1.3, zorder=3)
+            axls.axhline(1.0, color=FG, linewidth=0.5, linestyle=(0, (4, 4)), alpha=0.4)
+            axls.fill_between(list(lsx), lsv, 1.0,
+                              where=[v >= 1.0 for v in lsv], color=UP, alpha=0.10)
+            axls.fill_between(list(lsx), lsv, 1.0,
+                              where=[v < 1.0 for v in lsv], color=DOWN, alpha=0.10)
+            last = lsv[-1] if lsv else 1.0
+            tone = "大戶偏多" if last > 1.05 else "大戶偏空" if last < 0.95 else "均衡"
+            axls.set_ylabel("多空比", color=FG, fontsize=8)
+            axls.text(0.01, 0.9, f"大戶帳戶多空比 {last:.2f}（{tone}）",
+                      transform=axls.transAxes, color=LSCOL, fontsize=8, va="top", ha="left")
+
+        # === 結構評分卡 + 基差 + 情緒（v33：CoinGlass 佐證，標在價格面板右上）===
+        _sc = _structure_scorecard_lines(overlays)
+        if _sc:
+            ax.text(0.985, 0.97, "\n".join(_sc), transform=ax.transAxes,
+                    color=FG, fontsize=7.3, va="top", ha="right", zorder=6,
+                    bbox=dict(boxstyle="round,pad=0.4", fc="#1a1f2e", ec=GRID, lw=0.6, alpha=0.85))
+
         # === 樣式 ===
         for a in axes.values():
             a.grid(color=GRID, linewidth=0.4, alpha=0.5)
@@ -312,10 +450,15 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
 
 
 async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
-    """v30: 抓 CoinGlass 可畫序列（CVD / OI）+ 即時指標（資金費率/多空比）。
+    """v33: 抓 CoinGlass 全指標 — 可畫序列（CVD/OI/資金費率/清算/多空比）
+    + 純量佐證（期現基差/結構評分卡/市場情緒/24h清算）。
     任何失敗都回部分結果，絕不阻斷繪圖。"""
     out: dict = {"cvd": None, "oi": None, "funding": None, "ls_ratio": None,
-                 "ls_series": None, "oi_delta_24h": None, "cvd_slope": None}
+                 "ls_series": None, "oi_delta_24h": None, "cvd_slope": None,
+                 # v33 新增
+                 "funding_series": None, "liq_long_series": None,
+                 "liq_short_series": None, "basis": None, "structure": None,
+                 "sentiment": None, "liq_24h": None}
     try:
         from market_intel_mcp.sources import get_source
         src = get_source()
@@ -327,11 +470,17 @@ async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
             except Exception:
                 return None
         # 多空比用大戶帳戶比（top_trader_account）；"global" 非有效 ratio_type
-        cvd, oi, fund, pos = await _aio.gather(
+        (cvd, oi, fund, pos, fser, lser,
+         basis, struct, senti) = await _aio.gather(
             _safe(src.get_cvd_series(symbol, tf, n)),
             _safe(src.get_oi(symbol, tf, n)),
             _safe(src.get_funding(symbol)),
             _safe(src.get_positioning(symbol, "top_trader_account", tf, n)),
+            _safe(src.get_funding_series(symbol, tf, n)),
+            _safe(src.get_liquidation_series(symbol, tf, n)),
+            _safe(src.get_spot_futures_basis(symbol)),
+            _safe(src.get_structure(symbol)),
+            _safe(src.get_sentiment()),
         )
         if cvd and not cvd.get("error") and cvd.get("series"):
             out["cvd"] = [s["value"] for s in cvd["series"]][-n:]
@@ -346,6 +495,29 @@ async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
             out["ls_ratio"] = pos.get("ratio") or pos.get("latest") or (
                 pser[-1]["value"] if pser else None)
             out["ls_series"] = [s["value"] for s in pser][-n:] if pser else None
+        if fser and not fser.get("error") and fser.get("series"):
+            out["funding_series"] = [s["value"] for s in fser["series"]][-n:]
+        if lser and not lser.get("error") and lser.get("series"):
+            ls_ = lser["series"][-n:]
+            out["liq_long_series"] = [s["long_usd"] for s in ls_]
+            out["liq_short_series"] = [s["short_usd"] for s in ls_]
+            out["liq_24h"] = {
+                "long": sum(s["long_usd"] for s in ls_[-6:]),   # 4h×6≈24h
+                "short": sum(s["short_usd"] for s in ls_[-6:])}
+        if basis and not basis.get("error"):
+            out["basis"] = {"pct": basis.get("basis_pct"),
+                            "interp": basis.get("interpretation")}
+        if struct and not struct.get("error"):
+            out["structure"] = {k: struct.get(k) for k in (
+                "atr_pct_7d", "vol_24h_vs_30d", "cvd_slope_7d",
+                "top_trader_slope_7d", "oi_delta_7d_pct",
+                "higher_lows_7d", "above_4h_200ma")}
+        if senti and not senti.get("error"):
+            out["sentiment"] = {
+                "fg": senti.get("fear_greed_now"),
+                "fg_label": senti.get("fear_greed_label"),
+                "ahr999": senti.get("ahr999_now"),
+                "ahr999_label": senti.get("ahr999_label")}
     except Exception as e:
         print(f"[chart] coinglass overlay error: {type(e).__name__}: {e}")
     return out
