@@ -209,6 +209,19 @@ async def _cmd_status() -> str:
             lines.append(f"  🧩 敘事：{nc} 條主軸（最近 {_ago(nu)}）")
         except Exception:
             lines.append("  🧩 敘事：運行中")
+        # 回測 Session（每週歷史回放，顯示最近一次最強策略結果）
+        try:
+            from backtest.backtest_session import latest_backtest
+            bt = latest_backtest("intraday")
+            if bt and bt.get("n_trades"):
+                ba = _ago(bt["run_ts"] // 1000)
+                lines.append(f"  🔬 回測：intraday {bt['n_trades']}筆 期望"
+                             f"{bt['expectancy_r']:+.2f}R／勝率{bt['win_rate']*100:.0f}%"
+                             f"（{ba}）")
+            else:
+                lines.append("  🔬 回測：每週一 11:00 台北（首跑待排程）")
+        except Exception:
+            lines.append("  🔬 回測：每週一 11:00 台北")
         lines.append("  ⚙️ 調參：每日 10:00 台北　🩺 健康：每 5 分　📊 紙上回測：即時")
     except Exception:
         pass

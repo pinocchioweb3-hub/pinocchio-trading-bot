@@ -57,10 +57,29 @@ def analyze_setup(setup: str, days: int = 60) -> dict:
             "timeouts": timeouts, "tp1_only": tp1_only}
 
 
+def _backtest_anchor(setup: str) -> str | None:
+    """紙上樣本不足時，引用回測 Session 的歷史回放期望值當錨點。"""
+    try:
+        from backtest.backtest_session import latest_backtest
+        bt = latest_backtest(setup)
+    except Exception:
+        bt = None
+    if not bt or bt.get("n_trades", 0) < MIN_SAMPLE:
+        return None
+    exp = bt["expectancy_r"]
+    tone = "✅正期望" if exp >= 0.2 else ("⚠️負期望" if exp < 0 else "持平")
+    return (f"回測錨點（近 {bt['days']}天 {bt['n_symbols']}檔回放，{bt['n_trades']}筆）："
+            f"期望值 {exp:+.2f}R、勝率 {bt['win_rate']*100:.0f}%、PF {bt['profit_factor']:.2f} {tone}")
+
+
 def suggest(a: dict) -> list[str]:
     """規則式參數建議（保守）。回建議清單。"""
     if a["n"] < MIN_SAMPLE:
-        return [f"樣本僅 {a['n']}/{MIN_SAMPLE} 筆 — 繼續累積，暫不調參"]
+        tips = [f"樣本僅 {a['n']}/{MIN_SAMPLE} 筆 — 繼續累積，暫不調參"]
+        anchor = _backtest_anchor(a["setup"])
+        if anchor:
+            tips.append(anchor)
+        return tips
     s, tips = a, []
     to_pct = s["timeouts"] / s["n"]
     stop_pct = s["stops"] / s["n"]

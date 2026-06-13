@@ -233,6 +233,8 @@ async def amain(args: argparse.Namespace) -> int:
     from news_feed.narrative_engine import run_narrative_loop as _run_narrative
     # v31: 調參 Session（task #27，自動分析紙上帳產參數建議）
     from l3_dispatcher.auto_tuner import run_auto_tuner_loop as _run_tuner
+    # v32: 回測 Session（每週真實歷史回放，驗證啟用策略期望值 → 系統主題 + 供 auto_tuner 參照）
+    from backtest.backtest_session import run_backtest_loop as _run_backtest
 
     # v14: 每個 worker 用 supervise() 隔離 — 單一 worker 崩潰自動重啟，不再全滅
     # v14.1: run_on_startup 只在首次啟動為 True — supervise 崩潰重啟不重推開機報告
@@ -300,6 +302,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("narrative", lambda: _run_narrative(tg_intel)),
         # v31: 調參 Session（每日分析紙上帳 → 參數建議到系統主題，僅建議）
         ("auto_tuner", lambda: _run_tuner(tg_sys)),
+        # v32: 回測 Session（每週歷史回放驗證期望值 → 系統主題，純讀不下單）
+        ("backtest", lambda: _run_backtest(tg_sys)),
     ]
     try:
         await asyncio.gather(*[
