@@ -219,20 +219,31 @@ def render_startup(backend: str, watchlist: list[str], interval_s: int) -> str:
         strat = "日內爆發"
     try:
         from botconfig import CONFIG
-        risk_line = (f"   單筆風險：<code>${CONFIG.risk_per_trade_usd:.0f}</code>（1R），"
+        if CONFIG.risk_per_trade_pct > 0:
+            rtxt = f"帳戶 {CONFIG.risk_per_trade_pct:g}%（≈${CONFIG.risk_per_trade_usd:.0f}）"
+        else:
+            rtxt = f"${CONFIG.risk_per_trade_usd:.0f}"
+        risk_line = (f"   單筆風險：<code>{rtxt}</code>（1R），"
                      f"最多 <code>{CONFIG.max_concurrent_trades}</code> 倉位\n")
     except Exception:
         risk_line = ""
+    # v27: 全市場框架 — 不再列固定種子幣，掃描器涵蓋全 OKX 永續，訊號層動態 Top N
+    try:
+        from l3_dispatcher.market_scanner import get_latest_breadth
+        b = get_latest_breadth()
+        market_n = b["n_total"] if b else "—"
+    except Exception:
+        market_n = "—"
     n = len(watchlist)
-    wl = ", ".join(watchlist[:8]) + (f" …等 {n} 檔" if n > 8 else "")
     return (
         "🤖 <b>交易機器人上線</b>\n"
         f"   數據後端：<code>{_esc(backend_zh)}</code>\n"
-        f"   交易層觀察：<code>{_esc(wl)}</code>\n"
+        f"   全市場掃描：<code>OKX 永續 {market_n} 檔</code>（異常即時偵測）\n"
+        f"   訊號層：<code>動態 Top {n}</code>（依強勢排名，非固定幣種）\n"
         f"   掃描間隔：<code>{interval_s} 秒</code>\n"
         f"   啟用策略：<code>{_esc(strat)}</code>\n"
         + risk_line +
-        "\n🛰 開始監看市場...（/strategies 看完整策略清單）"
+        "\n🛰 開始監看市場...（/settings 自訂風險與策略 ｜ /strategies 看策略清單）"
     )
 
 

@@ -136,8 +136,12 @@ REGISTRY: dict[str, StrategyMeta] = {
 
 def enabled_strategies() -> list[StrategyMeta]:
     """目前啟用的策略（會被 scheduler 跑）。
-    STRATEGIES_ENABLED 白名單優先；否則用各策略 enabled_default。"""
-    wl = (os.getenv("STRATEGIES_ENABLED") or "").strip()
+    STRATEGIES_ENABLED 白名單優先（含 /settings 選單覆寫）；否則用各策略 enabled_default。"""
+    try:
+        from botconfig import get_str
+        wl = get_str("STRATEGIES_ENABLED", "").strip()
+    except Exception:
+        wl = (os.getenv("STRATEGIES_ENABLED") or "").strip()
     if wl:
         ids = {s.strip() for s in wl.split(",") if s.strip()}
         return [m for m in REGISTRY.values() if m.id in ids]

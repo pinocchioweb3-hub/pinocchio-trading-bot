@@ -13,14 +13,58 @@ worker / 渲染 / 帳本一律 `from botconfig import CONFIG`，禁止再寫字�
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 
 _WARNINGS: list[str] = []
 
+# v27: 執行期覆寫層（Telegram /settings 選單寫入 bot_settings.json）
+#      優先序：runtime override > env > 預設
+try:
+    from botpaths import data_dir as _data_dir
+    _SETTINGS_FILE = _data_dir() / "bot_settings.json"
+except Exception:
+    _SETTINGS_FILE = None
+
+_OVERRIDES: dict = {}
+
+
+def _load_overrides() -> None:
+    global _OVERRIDES
+    _OVERRIDES = {}
+    try:
+        if _SETTINGS_FILE and _SETTINGS_FILE.exists():
+            _OVERRIDES = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8")) or {}
+    except Exception:
+        _OVERRIDES = {}
+
+
+def _raw(key: str):
+    """取原始字串值：override 優先，再 env。"""
+    if key in _OVERRIDES and _OVERRIDES[key] not in (None, ""):
+        return str(_OVERRIDES[key])
+    return os.getenv(key)
+
+
+def set_override(key: str, value) -> None:
+    """寫入執行期覆寫並持久化（選單用）。"""
+    _load_overrides()
+    _OVERRIDES[key] = value
+    if _SETTINGS_FILE:
+        try:
+            _SETTINGS_FILE.write_text(json.dumps(_OVERRIDES, ensure_ascii=False,
+                                                 indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    reload()
+
+
+_load_overrides()
+
 
 def _f(key: str, default: float, lo: float, hi: float) -> float:
-    raw = os.getenv(key)
+    raw = _raw(key)
     if raw is None or not raw.strip():
         return default
     try:
@@ -40,7 +84,7 @@ def _i(key: str, default: int, lo: int, hi: int) -> int:
 def _tf(key: str, default: tuple[float, ...], lo: float = 0.1,
         hi: float = 20.0) -> tuple[float, ...]:
     """逗號分隔浮點數列（如 TP_R_INTRADAY=1.0,1.5,2.0）。強制遞增、長度=3。"""
-    raw = os.getenv(key)
+    raw = _raw(key)
     if raw is None or not raw.strip():
         return default
     try:
@@ -58,7 +102,8 @@ def _tf(key: str, default: tuple[float, ...], lo: float = 0.1,
 class BotConfig:
     # === 帳戶與風險（用戶最常自訂的三個）===
     account_balance_usd: float
-    risk_per_trade_usd: float        # 單筆風險 = 1R 的美元值
+    risk_per_trade_usd: float        # 單筆風險 = 1R 的美元值（最終生效值）
+    risk_per_trade_pct: float        # v27: >0 時改用「帳戶 %」計算 1R（覆蓋固定 USD）
     max_concurrent_trades: int       # 最多同時持倉數
     default_leverage: int
     # === 交易計畫 ===
@@ -80,10 +125,16 @@ class BotConfig:
             _WARNINGS.append(f"TP_SIZE_SPLIT 總和 {sum(split)} ≠ 1.0，回退預設")
             split = (0.5, 0.3, 0.2)
 
+        # v27: 風險百分比模式 — RISK_PER_TRADE_PCT>0 時，1R = 帳戶 × %
+        bal = _f("ACCOUNT_BALANCE_USD", 5000, 100, 10_000_000)
+        pct = _f("RISK_PER_TRADE_PCT", 0.0, 0.0, 20.0)
+        risk_usd = round(bal * pct / 100, 2) if pct > 0 else _f("RISK_PER_TRADE_USD", 100, 1, 10_000)
+
         return cls(
-            account_balance_usd=_f("ACCOUNT_BALANCE_USD", 5000, 100, 10_000_000),
-            risk_per_trade_usd=_f("RISK_PER_TRADE_USD", 100, 1, 10_000),
-            max_concurrent_trades=_i("MAX_CONCURRENT_TRADES", 3, 1, 10),
+            account_balance_usd=bal,
+            risk_per_trade_usd=risk_usd,
+            risk_per_trade_pct=pct,
+            max_concurrent_trades=_i("MAX_CONCURRENT_TRADES", 3, 1, 20),
             default_leverage=_i("DEFAULT_LEVERAGE", 15, 1, 50),
             sl_pct_intraday=_f("SL_PCT_INTRADAY", 4.0, 0.5, 15.0),
             sl_pct_ambush=_f("SL_PCT_AMBUSH", 5.0, 0.5, 20.0),
@@ -106,10 +157,17 @@ if _WARNINGS:
         print(f"[botconfig] ⚠️ {w}")
 
 
+def get_str(key: str, default: str = "") -> str:
+    """字串設定（override > env > default）— 給策略白名單等非數值設定用。"""
+    v = _raw(key)
+    return v if v not in (None, "") else default
+
+
 def reload() -> BotConfig:
-    """測試 / 未來 /set 指令熱更新用"""
+    """設定熱更新（/settings 選單寫入後呼叫）"""
     global CONFIG
     _WARNINGS.clear()
+    _load_overrides()
     CONFIG = BotConfig.from_env()
     return CONFIG
 

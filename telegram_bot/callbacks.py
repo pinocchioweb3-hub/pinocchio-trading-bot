@@ -326,6 +326,16 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
     elif cmd in ("strategies", "strats"):
         from l2_trigger.registry import render_strategy_menu
         reply = render_strategy_menu()
+    elif cmd in ("settings", "setting", "set"):
+        # v27: 互動式自助餐設定選單（風險/倉位/策略）
+        from .settings_menu import render_settings
+        text, buttons = render_settings()
+        try:
+            await tg.send_message(text, parse_mode="HTML", inline_buttons=buttons,
+                                  message_thread_id=msg.get("message_thread_id"))
+        except Exception as e:
+            print(f"[callbacks] settings menu error: {e}")
+        return
     elif cmd == "gate_approve":
         # 僅限管理者：舊用戶人工放行（v22-2）
         import os
@@ -400,6 +410,9 @@ async def run_interactive_listener(tg: TelegramClient, poll_seconds: float = 2.0
                             if (cq.get("data") or "").startswith("gate:"):
                                 from .invite_gate import handle_gate_callback
                                 await handle_gate_callback(tg, cq)
+                            elif (cq.get("data") or "").startswith("set:"):
+                                from .settings_menu import handle_settings_callback
+                                await handle_settings_callback(tg, cq)
                             else:
                                 await _handle_callback(tg, cq)
                         elif "chat_join_request" in upd:

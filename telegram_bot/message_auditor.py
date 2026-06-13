@@ -88,34 +88,40 @@ def _h(s: str) -> str:
 
 
 # ── 類型推斷 ──────────────────────────────────────────────────────────────
-KIND_SIGNATURES = [
-    ("fire",     ("可立即執行", "進場區間", "倉位配置（r", "已下單", "失效條件")),
-    ("waiting",  ("等待觸發", "價格回到進場區會自動")),
-    ("order_card", ("訂單卡 #", "時間線")),
-    ("tp_sl",    ("命中止盈", "觸發停損", "持倉超時", "已平倉", "本段")),
-    ("position", ("持倉追蹤", "距 tp1", "距 sl")),
-    ("paper",    ("紙上驗證", "紙上對照", "美股紙上")),
-    ("perf",     ("每日績效", "每日總帳", "過去 7 天", "成績卡")),
-    ("macro",    ("daily macro", "每日宏觀", "市場廣度", "regime")),
-    ("pulse",    ("每小時即時動態", "過去 1h")),
+# v27: 每類給一個「唯一強特徵」（命中即定案，不靠計分避免誤判）
+STRONG_SIGNATURES = [
+    ("system",   ("稽核 session 報告", "worker 崩潰", "機器人上線", "🧵 threads", "token 續期")),
+    ("pulse",    ("每小時即時動態",)),
+    ("macro",    ("daily macro", "每日宏觀分析")),
+    ("perf",     ("每日績效", "每日總帳", "成績卡")),
+    ("order_card", ("訂單卡 #",)),
+    ("fire",     ("可立即執行", "倉位配置（r")),
+    ("waiting",  ("等待觸發",)),
+    ("paper",    ("紙上驗證事件", "紙上對照", "美股紙上事件", "分批進場觸發")),
+    ("narrative", ("市場敘事脈絡", "因果鏈")),
     ("usnews",   ("美股快訊",)),
-    ("news",     ("truth social", "推文", "realdonaldtrump", "x（")),
-    ("econ",     ("經濟數據", "cpi", "ppi", "fomc", "解鎖")),
-    ("alert",    ("異常警報", "資金流向", "掃描器")),
-    ("system",   ("worker 崩潰", "機器人上線", "關機", "supervisor", "threads")),
-    ("invite",   ("歡迎加入", "入群", "邀請碼", "uid")),
-    ("suggestion", ("建議 #", "意見箱", "貢獻排行", "ai 初評")),
+    ("econ",     ("經濟數據", "解鎖")),
+    ("alert",    ("異常警報", "資金流向圖")),
+    ("invite",   ("歡迎加入", "邀請碼")),
+    ("suggestion", ("建議 #", "貢獻排行", "ai 初評")),
+]
+# 弱特徵（計分用，前面強特徵都沒命中才用）
+KIND_SIGNATURES = [
+    ("tp_sl",    ("命中止盈", "觸發停損", "持倉超時", "已平倉")),
+    ("position", ("持倉追蹤", "距 tp1", "距 sl")),
+    ("news",     ("truth social", "realdonaldtrump")),
 ]
 
 KIND_TO_TOPICS = {
-    "fire":      {"trade"},
-    "waiting":   {"trade"},
-    "order_card": {"positions", "usstock"},
-    "tp_sl":     {"positions", "usstock"},
-    "position":  {"positions"},
-    "paper":     {"positions", "usstock"},
+    "fire":      {"trade", "us_signals"},
+    "waiting":   {"trade", "us_signals"},
+    "order_card": {"positions", "us_positions"},
+    "tp_sl":     {"positions", "us_positions"},
+    "position":  {"positions", "us_positions"},
+    "paper":     {"positions", "us_positions"},
     "perf":      {"positions"},
     "macro":     {"intel"},
+    "narrative": {"intel"},
     "pulse":     {"pulse"},
     "usnews":    {"usstock"},
     "news":      {"news", "usstock"},
@@ -129,6 +135,11 @@ KIND_TO_TOPICS = {
 
 def infer_msg_kind(text: str) -> str:
     low = _normalize(text)
+    # 先比強特徵（命中即定案）
+    for kind, sigs in STRONG_SIGNATURES:
+        if any(s in low for s in sigs):
+            return kind
+    # 再用弱特徵計分
     best, best_score = "unknown", 0
     for kind, sigs in KIND_SIGNATURES:
         score = sum(1 for s in sigs if s in low)
