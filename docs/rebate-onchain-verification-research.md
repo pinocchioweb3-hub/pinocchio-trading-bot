@@ -221,6 +221,56 @@ GMX 的 `ReferralStorage` 是公開合約，任何人在 Arbiscan 直接讀，**
 
 ---
 
+## 9-ter. 第四輪：可落地的驗證系統設計 + CEX 平台研究（2026-06-14）
+
+### 我們到底怎麼讓大家驗證 Hyperliquid 返佣（白話）
+返佣公式是公開固定的（推薦人拿被推薦人手續費 10%、扣對方折扣、前 $25M 享 4% 折扣、10% 適用前 $1B 量），而**每筆成交手續費可從 Hyperliquid 免費公開 API（`type=userFills` 帶 fee 欄位）逐筆抓到**。所以做三件事：
+1. **開源驗證器**：任何人能 clone 的 Python，照公開公式重算返佣總額，再跟官方 referral API 的 claimed/unclaimed 對帳，差異即異常。
+2. **鏈上錨定**：每天把帳本算一個 Merkle root 寫上鏈（Base/HyperEVM，每筆 <1 美分），蓋不可竄改時間戳。
+3. **免費公開儀表板 + 斷線即警訊**：攤出總額/逐筆/最新錨定雜湊；停更就 Telegram + 外部死手警報。
+
+### 🎯 信任邊界地圖（最重要的誠實底線）
+| 區塊 | 是否 trustless | 說明 |
+|---|---|---|
+| 鏈上錨定/時間戳 | ✅ 真 trustless | 任何人抓同期資料→算 root→比對鏈上，一致＝密碼學證明「帳本未被事後竄改」 |
+| 計算層（開源驗證器） | ✅ 真 trustless | 決定性、可 byte-for-byte 複現 |
+| 原始數字（HL API 回的 JSON） | ❌ 仍需信任 HL | 是「信任 Hyperliquid 伺服器」，非密碼學證明（除非上 zkTLS） |
+| HL 節點二進位 | ❌ 仍需信任 | hl-node 核心閉源簽章二進位，跑節點＝信任其輸出（非如比特幣可自行重執行） |
+| **referral 歸因** | ⚠️ **部分** | **見下方關鍵結論** |
+
+### ⚠️ 關鍵誠實結論：「完全不靠官方 API 的 trustless referral 驗證器」= 做不到
+對抗式查證 holds=false，對外**必須降調宣稱**：
+- ✅ **可獨立驗**：已「領取(claim)」動作本身（`RewardsClaim` 事件帶領取者地址+金額，可自架節點重放）；referral 綁定關係（`registerReferrer` 是鏈上簽名 action）。
+- ❌ **官方 API 獨佔（開源節點不支援）**：`RewardsClaim` 把 builder fee 與 referrer fee **混在一起、無 type、無 per-referee 明細**，無法歸因為「合法 10% 返佣」；推薦人→被推薦人清單；未領取累積。
+- 🟡 **影子重算**：可用「被推薦人清單 × 逐筆 fee × 10%」對帳，但**被推薦人清單只能先向官方 API 拿**（鏈上無此索引）→ 已破壞「不靠 API」前提。
+- 對照組：**builder fee 遠強**（`node_fills` 逐筆直接帶 builder 地址+fee，可完全鏈上歸因，不需 API）——但 builder fee 需機器人替用戶下單（撞實彈界線）。
+
+→ **對外只能說**：「返佣計算可被任何人複現 + 帳本快照有不可竄改鏈上時間戳 + 與官方數字對帳」，**不可說**「完全去信任、不靠官方就能驗 referral」。這仍遠勝「相信我」，且誠實。
+
+### 🛠️ MVP 建置計畫（1–2 週、月營運 < US$20，純軟體我可直接做）
+1. **開源驗證器** `l1_daemon/referral_verifier.py`（仿 okx_affiliate.py）：決定性重算 + 官方 API 對帳 + 輸入 SHA-256 + 單元測試，公開 GitHub。**最高槓桿、零成本、當天可雛形。**
+2. **攝取 worker**：免費公開 Info API（`userFills`/`referral`，30–60s 輪詢）掛進 run_bot.py，複用 supervise() 重啟+TG 警報；新增 `referral_fills`/`referral_snapshots`/`anchors` 三表。
+3. **心跳警訊**：Telegram + healthchecks.io 死手 + `/referral` 指令回總額與最新錨定連結。
+4. **靜態儀表板**：JSON → GitHub Pages/Cloudflare 免費層，每個數字連到鏈上錨定快照。
+5. **鏈上錨定（收尾）**：極簡 `anchor(bytes32)` 合約到 Base/HyperEVM，每日送 Merkle root（年 US$1–4）。**此步驟簽名/付 gas 由發起人執行，我準備好。**
+- 第二階段（非 MVP）：自架非驗證者節點（雲端 ~US$150–400/月）全量對帳、zkTLS 補「相信輸入」缺口。
+
+### 💰 CEX→鏈上驗證：誠實建議「漸進三階，別一步上 zkTLS」
+- **第 0 階（本週、近零成本）**：公開唯讀返佣帳本 + 我方私鑰簽 API 回應 + **OpenTimestamps**（免費，錨到 Bitcoin）+ 斷線警訊。誠實標：**防事後竄改/倒填，非來源證明**（簽的是自己，擋不了一開始就造假）。
+- **第 1 階（1–2 週）**：每日/週彙總用 **EAS** 上鏈 attestation（Base/OP，每筆 <US$0.05），給每筆公開鏈上 UID。
+- **第 2 階（數週、需先 PoC）**：用 **Reclaim(zkFetch)** 或 **Primus** zkTLS 對實際 OKX/Binance 返佣端點產證（先人工跑通再自動化），proof hash 寫進 EAS。**這才是真來源證明**，信任從「相信你」降到「相信 TLS+attestor」。先例：ZKP2P（生產級）、Brevis×Primus 證 Binance 餘額。
+- **平台排序**：Reclaim(zkFetch，最成熟自助) > Primus(信任假設較強、成本透明 ~0.000035 ETH/筆) > zkPass(易上手、去中心化最弱) > Opacity(信任最強但 B2B) > Chainlink CRE/DECO(不建議、B2B、Functions 2026-09 下線)。
+- **誠實大坑**：返佣是「**自己證自己**」——提證者就是資料擁有者，proxy mode 下可 MITM 自身，zkTLS 對 affiliate 本人這個被約束方**結構上不穩健**；且 attestor 預設中心化。所以 zkTLS 只證「回應確經 TLS 來自該 API」，**不證數字誠實**。
+
+### ⛳ 實務前置（發起人需知）
+- **Hyperliquid 要先有 $10,000 累積交易量才能生成推薦碼**（這是真門檻）。
+- **彙整/代抓他人帳號返佣**有 CEX 條款與招攬/返佣**法律邊界**（呼應台灣返佣紅線），須逐端點 PoC + 法遵確認。
+- 凡**簽鏈上交易/付 gas/部署合約**：由發起人執行，AI 只準備（與「不下實彈、秘鑰不入聊天室」界線一致）。
+
+來源：[HL Info API](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint)、[HL L1 schemas](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/nodes/l1-data-schemas)、[Chainstack referral 端點](https://docs.chainstack.com/reference/hyperliquid-info-referral)、[HL referral revenue 公開頁](https://hyperliquid.allium.so/referral-revenue)、[Reclaim zkFetch](https://docs.reclaimprotocol.org/)、[Primus](https://docs.primuslabs.xyz/)、[OpenTimestamps](https://opentimestamps.org/)、[EAS](https://docs.attest.org)
+
+---
+
 ## 9. 變更紀錄（Evolution Log）
 
 | 日期 | 事件 |
@@ -229,6 +279,7 @@ GMX 的 `ReferralStorage` 是公開合約，任何人在 Arbiscan 直接讀，**
 | 2026-06-14 | 第一輪研究：CEX 返佣鏈上化現況 + zkTLS/oracle/EAS 比較（22 源、25 主張對抗查證、0 推翻） |
 | 2026-06-14 | 第二輪查證：Gemini 兩份 DEX 草案事實核對（Hyperliquid/Aster/Chainlink）；推翻「DEX 返佣＝原生鏈上可查」假設，確立 builder codes 為核心軌 |
 | 2026-06-14 | 第三輪查證（上線前）：**Aster 定案不可鏈上驗證**（後台帳本＋預設隱私＋刷量爭議）；**誠實校正 Hyperliquid**（自架節點重算，非一鍵鏈上查）；確認 **GMX 是唯一公開合約一鍵可讀**；釐清 referral vs builder 分叉 |
+| 2026-06-14 | 第四輪設計：**可落地 MVP 方案定案**（開源驗證器+免費API攝取+鏈上錨定+斷線警訊，<US$20/月）；信任邊界地圖；**referral 完全去信任驗證＝做不到**（須降調宣稱）；CEX 漸進三階（簽章+OpenTimestamps → EAS → zkTLS PoC），平台 Reclaim>Primus>zkPass |
 
 ---
 
