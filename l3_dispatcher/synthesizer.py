@@ -203,6 +203,13 @@ PER_SYMBOL_DEEPDIVE_PROMPT = """你是專業加密貨幣交易計畫師。針對
 - 長度 800-1500 字
 - HTML 標籤：<b>, <i>, <code>
 
+# 🔧 機器可讀計畫（務必遵守）
+在文章的「最後一行之後」，附上一段機器可讀的計畫，用下列標記嚴格包住（標記獨立成行、JSON 用半形雙引號、無多餘文字）：
+===PLAN_JSON===
+{"actionable": true 或 false, "direction": "bull" 或 "bear" 或 null, "entry_type": "market" 或 "limit", "entry": 數字, "entry_lo": 數字或null, "entry_hi": 數字或null, "stop": 數字, "tp1": 數字, "tp2": 數字, "tp3": 數字}
+===END_PLAN===
+規則：可做單才填 actionable=true 且 direction/stop/tp1-3 必為數字；限價分批進場用 entry_type="limit" 並給 entry_lo/entry_hi 區間；市價追入用 entry_type="market"、entry 給現價附近。觀望則 actionable=false、其餘可為 null。數字不帶千分位逗號與貨幣符號。
+
 # 給你的數據
 （之後在 user message 給你 5 時框 + 全數據）"""
 
@@ -656,14 +663,44 @@ async def synthesize_hourly_pulse(pulse_state: dict, timeout_sec: int = 180,
     )
 
 
+def _extract_plan_block(text: str) -> tuple[str, dict | None]:
+    """v33：從 deepdive 文末抽機器可讀 PLAN_JSON 區塊；回 (去掉區塊的文章, plan dict 或 None)。"""
+    import json
+    import re
+    m = re.search(r"===PLAN_JSON===\s*(\{.*?\})\s*===END_PLAN===", text, re.DOTALL)
+    if not m:
+        return text, None
+    clean = (text[:m.start()] + text[m.end():]).strip()
+    try:
+        plan = json.loads(m.group(1))
+    except Exception:
+        return clean, None
+    # 正規化數字欄位
+    def _num(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    for k in ("entry", "entry_lo", "entry_hi", "stop", "tp1", "tp2", "tp3"):
+        plan[k] = _num(plan.get(k))
+    plan["actionable"] = bool(plan.get("actionable"))
+    if plan.get("direction") not in ("bull", "bear"):
+        plan["direction"] = None
+    return clean, plan
+
+
 async def synthesize_per_symbol(symbol: str, sym_state: dict,
                                timeout_sec: int = 180) -> tuple[str | None, dict]:
-    """單一標的交易計畫"""
-    return await _synthesize_with_prompt(
+    """單一標的交易計畫（v33：附帶機器可讀 plan，存進 meta['plan']）。"""
+    text, meta = await _synthesize_with_prompt(
         system_prompt=PER_SYMBOL_DEEPDIVE_PROMPT.replace("{SYMBOL}", symbol),
         user_data=_format_symbol_data(symbol, sym_state),
         timeout_sec=timeout_sec,
     )
+    if text:
+        text, plan = _extract_plan_block(text)
+        meta["plan"] = plan
+    return text, meta
 
 
 async def _synthesize_with_prompt(system_prompt: str, user_data: str,

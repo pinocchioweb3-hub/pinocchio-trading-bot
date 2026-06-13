@@ -479,6 +479,46 @@ async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3
         await asyncio.sleep(interval_seconds)
 
 
+def _record_deepdive_plan(sym: str, plan: dict | None) -> dict | None:
+    """v33：把 deepdive 可執行計畫存進紙上帳（等待觸發），回給圖表用的 plan dict。
+    不可做單 / 缺關鍵價位 / 已有同標的 open 倉 → 不重複建單。任何錯誤回 None，不阻塞。"""
+    if not plan or not plan.get("actionable"):
+        return None
+    direction = plan.get("direction")
+    entry = plan.get("entry")
+    stop = plan.get("stop")
+    tp1, tp2, tp3 = plan.get("tp1"), plan.get("tp2"), plan.get("tp3")
+    if direction not in ("bull", "bear") or stop is None or tp1 is None:
+        return None
+    # 限價分批：用區間中點當名目進場價
+    lo, hi = plan.get("entry_lo"), plan.get("entry_hi")
+    is_limit = (plan.get("entry_type") == "limit") and lo is not None and hi is not None
+    if entry is None:
+        entry = (lo + hi) / 2 if is_limit else None
+    if entry is None:
+        return None
+    chart_plan = {"entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2,
+                  "tp3": tp3, "direction": direction}
+    try:
+        from .paper_journal import record_paper_entry, open_paper_symbols
+        if sym in open_paper_symbols("deepdive"):
+            return chart_plan   # 已在追蹤：畫線但不重複建單
+        record_paper_entry(
+            symbol=sym, setup="deepdive", direction=direction,
+            entry_price=entry, stop_price=stop,
+            tp1=tp1, tp2=tp2 if tp2 is not None else tp1,
+            tp3=tp3 if tp3 is not None else tp1,
+            regime="deepdive",
+            zone_lo=lo if is_limit else None, zone_hi=hi if is_limit else None,
+            split_mode=is_limit,
+        )
+        print(f"[deepdive] {sym} paper entry recorded ({direction}, "
+              f"{'limit' if is_limit else 'market'})")
+    except Exception as e:
+        print(f"[deepdive] {sym} paper record error: {type(e).__name__}: {e}")
+    return chart_plan
+
+
 async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 21600,
                              max_symbols_per_run: int = 3):
     """每 N 秒（預設 6h）對交易層 top N 個強勢幣做 deep dive，每幣一份計畫。
@@ -514,16 +554,24 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
                                 tg, text,
                                 prefix=f"🎯 <b>{sym} 交易計畫深度分析</b>\n"
                             )
-                            # v18-F: 附 SMC 標記圖（失敗不阻塞）
+                            # v33: 把可執行計畫接進紙上帳（看得到的報單→可追蹤可算勝率），
+                            #      並把計畫線帶進圖表。失敗不阻塞。
+                            plan = meta.get("plan")
+                            chart_plan = _record_deepdive_plan(sym, plan)
+                            # v18-F: 附 SMC 標記圖（v33 帶計畫線；失敗不阻塞）
                             try:
                                 from .chart_render import render_symbol_chart
-                                chart = await render_symbol_chart(sym, "4h", 120)
+                                chart = await render_symbol_chart(sym, "4h", 120,
+                                                                  plan=chart_plan)
                                 if chart:
-                                    await tg.send_photo(
-                                        chart, caption=f"📐 {sym} 4H SMC 結構圖")
+                                    cap = f"📐 {sym} 4H SMC＋全指標結構圖"
+                                    if chart_plan:
+                                        cap += "（已建紙上追蹤）"
+                                    await tg.send_photo(chart, caption=cap)
                             except Exception as e:
                                 print(f"[deepdive] chart error: {e}")
-                            print(f"[deepdive] {sym} sent ({meta.get('output_chars')} chars)")
+                            print(f"[deepdive] {sym} sent ({meta.get('output_chars')} chars)"
+                                  f"{' +paper' if chart_plan else ''}")
                         else:
                             print(f"[deepdive] {sym} synth failed: {meta.get('error')}")
                         # 避免 Telegram 連續發送被限速

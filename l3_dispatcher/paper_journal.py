@@ -182,6 +182,23 @@ def apply_entry_fill(paper_id: int, live_price: float) -> dict | None:
         conn.close()
 
 
+def open_paper_symbols(setup: str | None = None) -> set:
+    """v33：回目前 open（含 pending 等待觸發）的紙上倉位 symbol 集合，供 deepdive 去重。"""
+    init_db()
+    conn = _conn()
+    try:
+        if setup:
+            rows = conn.execute(
+                "SELECT DISTINCT symbol FROM paper_trades WHERE status='open' AND setup=?",
+                (setup,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT symbol FROM paper_trades WHERE status='open'").fetchall()
+        return {r[0] for r in rows}
+    finally:
+        conn.close()
+
+
 def get_open_paper() -> list[dict]:
     """回所有 open 紙上倉位，dict 形狀與 trade_monitor._check_trade 相容。"""
     init_db()

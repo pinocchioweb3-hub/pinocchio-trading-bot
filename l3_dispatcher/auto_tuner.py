@@ -100,7 +100,7 @@ def suggest(a: dict) -> list[str]:
 
 def build_report(days: int = 60) -> str | None:
     """掃所有 setup 產調參建議報告。無資料回 None。"""
-    setups = ["intraday", "ambush", "us_breakout"]
+    setups = ["intraday", "ambush", "us_breakout", "deepdive"]
     blocks = []
     any_data = False
     for st in setups:
