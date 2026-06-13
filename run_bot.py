@@ -120,7 +120,10 @@ async def amain(args: argparse.Namespace) -> int:
 
     # === 初始化 watchlist manager + 立即 refresh 交易層 ===
     source = get_source()
-    watchlist = WatchlistManager(trading_size=args.trading_size)
+    # v27: 訊號層大小走 botconfig（全市場 Top N，可 /settings 調）；CLI 明確指定才覆蓋
+    from botconfig import CONFIG as _BC
+    _tsize = args.trading_size if args.trading_size else _BC.trading_size
+    watchlist = WatchlistManager(trading_size=_tsize)
     print(f"[startup] refreshing trading tier...")
     refresh_result = await watchlist.refresh(source)
     print(f"[startup] trading tier: {refresh_result['chosen']}")
@@ -336,7 +339,7 @@ def main() -> int:
     p.add_argument("--twitter-interval", type=int, default=1800,
                    help="v15.1: Apify Twitter 抓取間隔秒（預設 1800=30min；"
                         "配合 since_time 增量抓取，月成本從 $150+ 降到 <$1）")
-    p.add_argument("--trading-size", type=int, default=8,
+    p.add_argument("--trading-size", type=int, default=0,   # 0=用 botconfig TRADING_SIZE
                    help="交易層大小（7-10 區間）")
     p.add_argument("--supervisor-interval", type=int, default=300,
                    help="健康監督檢查間隔秒（預設 300=5min）")

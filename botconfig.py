@@ -112,6 +112,7 @@ class BotConfig:
     tp_r_intraday: tuple[float, ...]
     tp_r_ambush: tuple[float, ...]
     tp_size_split: tuple[float, ...]   # 分批比例，總和必須 = 1.0
+    trading_size: int                  # v27: 訊號層動態 Top N（全市場挑強勢）
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -141,6 +142,7 @@ class BotConfig:
             tp_r_intraday=_tf("TP_R_INTRADAY", (1.0, 1.5, 2.0)),
             tp_r_ambush=_tf("TP_R_AMBUSH", (1.0, 1.5, 2.5)),
             tp_size_split=split,
+            trading_size=_i("TRADING_SIZE", 12, 3, 40),   # v27: 8→12（全市場擴容）
         )
 
     def sl_pct(self, setup: str) -> float:

@@ -15,6 +15,7 @@ matplotlib.use("Agg")  # 無頭模式（daemon 內無 GUI）
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "SimHei", "Arial"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Rectangle
 
 from botpaths import data_dir
@@ -27,6 +28,55 @@ DOWN = "#ef5350"    # 紅
 BG = "#131722"      # TradingView 深色
 FG = "#d1d4dc"
 GRID = "#2a2e39"
+VOLMA = "#f5d442"   # 量能均線（黃）
+OICOL = "#5b9bd5"   # OI 線（藍）
+SNR_R = "#ef5350"   # 壓力
+SNR_S = "#26a69a"   # 支撐
+
+
+def _vol(c: dict) -> float:
+    for k in ("volume", "vol", "vol_ccy", "volCcy", "baseVol"):
+        v = c.get(k)
+        if v:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def _compute_snr(candles: list[dict], n_levels: int = 3) -> dict:
+    """從近期 swing 高低密集區算支撐壓力。回 {resistance:[...], support:[...]}。"""
+    if len(candles) < 10:
+        return {"resistance": [], "support": []}
+    highs, lows = [], []
+    w = 2
+    for i in range(w, len(candles) - w):
+        hi = candles[i]["high"]
+        lo = candles[i]["low"]
+        if hi == max(candles[j]["high"] for j in range(i - w, i + w + 1)):
+            highs.append(hi)
+        if lo == min(candles[j]["low"] for j in range(i - w, i + w + 1)):
+            lows.append(lo)
+    cur = candles[-1]["close"]
+    rng = max(c["high"] for c in candles) - min(c["low"] for c in candles)
+    tol = rng * 0.012 if rng else cur * 0.005
+
+    def _cluster(levels: list[float]) -> list[tuple[float, int]]:
+        levels = sorted(levels)
+        clusters = []
+        for lv in levels:
+            if clusters and abs(lv - clusters[-1][0]) <= tol:
+                cnt = clusters[-1][1] + 1
+                avg = (clusters[-1][0] * clusters[-1][1] + lv) / cnt
+                clusters[-1] = (avg, cnt)
+            else:
+                clusters.append((lv, 1))
+        return sorted(clusters, key=lambda x: -x[1])   # 觸及次數多者優先
+
+    res = [c[0] for c in _cluster(highs) if c[0] > cur][:n_levels]
+    sup = [c[0] for c in _cluster(lows) if c[0] < cur][:n_levels]
+    return {"resistance": sorted(res), "support": sorted(sup, reverse=True)}
 
 
 def _prune_old():
@@ -48,11 +98,15 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
         if not candles or len(candles) < 30:
             return None
         n = len(candles)
-        xs = range(n)
 
-        fig, ax = plt.subplots(figsize=(12, 6.5), dpi=110)
+        # v28: 雙面板 — 上 75% K線/SMC/SNR，下 25% 成交量+量能MA(+OI)
+        fig = plt.figure(figsize=(12, 8), dpi=110)
         fig.patch.set_facecolor(BG)
+        gs = GridSpec(2, 1, height_ratios=[3.2, 1.0], hspace=0.06, figure=fig)
+        ax = fig.add_subplot(gs[0])
+        axv = fig.add_subplot(gs[1], sharex=ax)
         ax.set_facecolor(BG)
+        axv.set_facecolor(BG)
 
         # === K 線 ===
         for i, c in enumerate(candles):
@@ -97,15 +151,39 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
             ax.text(x0, b["level"], b.get("type", "BOS"), color=color,
                     fontsize=7, va="bottom", alpha=0.9, zorder=4)
 
-        # === Swing 高低點 ===
-        for s in (smc.get("swing_points") or [])[:10]:
+        # === Swing 高低點（v28: 標 HH/HL/LH/LL 市場結構）===
+        swings = sorted((smc.get("swing_points") or []),
+                        key=lambda s: -(int(s.get("ago_bars") or 0)))  # 由舊到新
+        prev_high = prev_low = None
+        for s in swings[:14]:
             x0 = max(0, n - 1 - int(s.get("ago_bars") or 0))
             is_high = s.get("type") == "high"
-            ax.annotate("⌃" if is_high else "⌄",
-                        (x0, s["level"]),
-                        color=(DOWN if is_high else UP), fontsize=10,
-                        ha="center",
-                        va="bottom" if is_high else "top", zorder=5)
+            lvl = s["level"]
+            if is_high:
+                tag = ("HH" if prev_high is not None and lvl > prev_high
+                       else "LH" if prev_high is not None else "H")
+                prev_high = lvl
+                ax.annotate(f"▔{tag}", (x0, lvl), color=DOWN, fontsize=7.5,
+                            ha="center", va="bottom", zorder=5)
+            else:
+                tag = ("LL" if prev_low is not None and lvl < prev_low
+                       else "HL" if prev_low is not None else "L")
+                prev_low = lvl
+                ax.annotate(f"▁{tag}", (x0, lvl), color=UP, fontsize=7.5,
+                            ha="center", va="top", zorder=5)
+
+        # === SNR 支撐壓力（v28：水平虛線，標觸及次數密集區）===
+        snr = _compute_snr(candles)
+        for r in snr["resistance"]:
+            ax.axhline(r, color=SNR_R, linewidth=0.8, linestyle=(0, (6, 4)),
+                       alpha=0.55, zorder=1)
+            ax.text(n + 0.5, r, f"壓力 {r:,.6g}", color=SNR_R, fontsize=7,
+                    va="center", ha="left", alpha=0.9, zorder=5)
+        for sp in snr["support"]:
+            ax.axhline(sp, color=SNR_S, linewidth=0.8, linestyle=(0, (6, 4)),
+                       alpha=0.55, zorder=1)
+            ax.text(n + 0.5, sp, f"支撐 {sp:,.6g}", color=SNR_S, fontsize=7,
+                    va="center", ha="left", alpha=0.9, zorder=5)
 
         # === 交易計畫線 ===
         if plan:
@@ -123,24 +201,59 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                 ax.text(0.5, y, f" {label} {y:,.6g}", color=color, fontsize=8,
                         va="bottom", zorder=5)
 
+        # === 成交量副圖（v28：SMC 真假突破判斷關鍵）===
+        vols = [_vol(c) for c in candles]
+        for i, c in enumerate(candles):
+            color = UP if c["close"] >= c["open"] else DOWN
+            axv.add_patch(Rectangle((i - 0.35, 0), 0.7, vols[i],
+                                    facecolor=color, edgecolor=color, alpha=0.55, zorder=2))
+        # 量能 MA20（突顯爆量 vs 量縮）
+        ma_win = 20
+        if len(vols) >= ma_win:
+            vma = [sum(vols[max(0, i - ma_win + 1):i + 1]) /
+                   min(i + 1, ma_win) for i in range(len(vols))]
+            axv.plot(range(n), vma, color=VOLMA, linewidth=1.1, zorder=3,
+                     label=f"量能MA{ma_win}")
+        # 標最後一根是否爆量
+        if len(vols) >= ma_win and vma[-1] > 0:
+            ratio = vols[-1] / vma[-1]
+            tag = ("● 爆量" if ratio >= 1.8 else "○ 量縮" if ratio <= 0.6 else "")
+            if tag:
+                axv.text(n - 1, vols[-1], f"{tag} {ratio:.1f}x", color=VOLMA,
+                         fontsize=7.5, va="bottom", ha="right", zorder=4)
+        # OI 疊加（若 candle 帶 oi 欄位）
+        ois = [c.get("oi") or c.get("open_interest") for c in candles]
+        if any(o for o in ois):
+            axoi = axv.twinx()
+            axoi.plot(range(n), [o or 0 for o in ois], color=OICOL,
+                      linewidth=1.0, alpha=0.8, zorder=3, label="OI")
+            axoi.tick_params(colors=OICOL, labelsize=7)
+            axoi.set_ylabel("OI", color=OICOL, fontsize=8)
+            for sp in axoi.spines.values():
+                sp.set_color(GRID)
+
         # === 樣式 ===
-        ax.grid(color=GRID, linewidth=0.4, alpha=0.5)
-        ax.tick_params(colors=FG, labelsize=8)
-        for spine in ax.spines.values():
-            spine.set_color(GRID)
+        for a in (ax, axv):
+            a.grid(color=GRID, linewidth=0.4, alpha=0.5)
+            a.tick_params(colors=FG, labelsize=8)
+            for spine in a.spines.values():
+                spine.set_color(GRID)
+        axv.set_ylabel("成交量", color=FG, fontsize=8)
+        axv.legend(loc="upper left", fontsize=7, facecolor=BG, edgecolor=GRID,
+                   labelcolor=FG)
+        plt.setp(ax.get_xticklabels(), visible=False)
         cur = candles[-1]["close"]
         dir_str = ""
         if plan and plan.get("direction"):
             dir_str = "・做多" if plan["direction"] == "bull" else "・做空"
-        ax.set_title(f"{symbol}/USDT 永續・{tf.upper()}・SMC 結構{dir_str}"
+        ax.set_title(f"{symbol}/USDT 永續・{tf.upper()}・SMC＋SNR 結構{dir_str}"
                      f"（現價 {cur:,.6g}）",
                      color=FG, fontsize=11)
-        ax.set_xlim(-1, n + 6)
+        ax.set_xlim(-1, n + 8)
 
         _prune_old()
         out = CHART_DIR / f"{symbol}_{int(time.time())}.png"
-        fig.tight_layout()
-        fig.savefig(out, facecolor=BG, bbox_inches="tight")
+        fig.savefig(out, facecolor=BG, bbox_inches="tight")   # GridSpec 已配版面
         plt.close(fig)
         return out
     except Exception as e:
