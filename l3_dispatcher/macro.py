@@ -435,8 +435,15 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
 
     # 跑 SMC 量化指標於 4h（戰術層）與 1d（戰略層）
     smc_levels = {}
+    regime = {"label": "資料不足"}
     if isinstance(c_4h, dict) and not c_4h.get("error"):
-        smc_levels["4h"] = compute_smc_levels(c_4h.get("candles", []), swing_length=10)
+        c4 = c_4h.get("candles", [])
+        smc_levels["4h"] = compute_smc_levels(c4, swing_length=10)
+        try:
+            from market_intel_mcp.regime import classify_regime
+            regime = classify_regime(c4)   # v33: 市場狀態標籤
+        except Exception:
+            pass
     if isinstance(c_1d, dict) and not c_1d.get("error"):
         smc_levels["1d"] = compute_smc_levels(c_1d.get("candles", []), swing_length=5)
 
@@ -447,6 +454,7 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
         "snapshot": _safe(snap),
         "whales": _safe(whales),
         "smc_levels": smc_levels,
+        "regime": regime,                                       # v33: 市場狀態標籤
         "coinglass": cg_ov if isinstance(cg_ov, dict) else {},   # v32: CoinGlass 佐證序列
         "binance_xcheck": _binance_divergence(                   # v33: Binance 交叉驗證
             cg_ov if isinstance(cg_ov, dict) else {},

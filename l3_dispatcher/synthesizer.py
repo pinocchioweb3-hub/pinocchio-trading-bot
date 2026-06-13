@@ -476,6 +476,13 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
     parts.append("- 若計算後 5x 槓桿超出 $500 margin → 必須建議 10-15x 才塞得進")
     parts.append("- WLFI 等低流通幣最多 5x，BTC/ETH/SOL 主流可達 15x\n")
 
+    # v33：市場狀態（regime）— 策略-狀態適配的前提
+    rg = sym_state.get("regime") or {}
+    if rg.get("label") and rg["label"] != "資料不足":
+        parts.append(f"## 🧭 市場狀態（4h regime）：{rg['label']}")
+        parts.append("（趨勢態：順勢突破/續勢勝率高；盤整態：區間高賣低買、對順勢追單降權；"
+                     "高波動：縮小倉位。請依此狀態調整策略選擇與信心，不要不分狀態硬套同一招。）\n")
+
     # 多時框型態
     pattern = sym_state.get("pattern", {})
     if pattern and not pattern.get("error"):
