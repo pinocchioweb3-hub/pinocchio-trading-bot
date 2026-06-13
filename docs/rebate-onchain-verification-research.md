@@ -180,6 +180,47 @@ Hyperliquid 官方機制可精確重現草案數字：
 
 ---
 
+## 9-bis. 第三輪查證：Aster 定案 + Hyperliquid 文案誠實校正（2026-06-14）
+
+針對「近期公開要大家綁 Hyperliquid + Aster 邀請碼」做上線前查證，結論明確：
+
+### ❌ Aster 無法做到與 Hyperliquid 同等的第三方獨立鏈上驗證（三層全過不了）
+1. **返佣本身＝中心化後台帳本**：官方文件明載「每日 00:00 UTC 計算、09:00 UTC 更新、隔日轉入你的 Aster 帳戶」，入帳到內部帳戶餘額。全套官方文件/智能合約清單/公開 API 目錄**找不到任何返佣合約地址、事件或查詢端點**。返佣只能登入 Aster 後台 UI 看，第三方無帳戶看不到。（對比：GMX 有公開 `ReferralStorage` 合約可在 Arbiscan 直接讀。）
+2. **底層成交也驗不了**：Aster Pro 鏈下撮合 CLOB、鏈上只結算；新 Aster Chain L1 **預設開啟 Account Privacy**——訂單 ZK 加密、一次性隱身地址、「訂單資料從不以明文上鏈」、暗池隱藏單。第三方要讀某用戶逐筆成交，**必須由用戶主動提供 viewer pass 解密**——定義上就不是「獨立」驗證。
+3. **量能誠信存疑**：DefiLlama 2025-10-05 因 Aster 量與 Binance 永續近 1:1 鏡像、「無法提供足夠細節供獨立驗證」而下架；兩週後應 Aster 要求復列，但 0xngmi 仍稱「依然是黑盒」。Aster **不提供節點軟體**，無人能自跑節點稽核（這是它與 Hyperliquid/GMX 的根本差異）。
+
+→ **可誠實說「帳面量居前段」，但絕不能對 Aster 掛「鏈上可驗證」標籤。** Aster 改列「高流動性選項（後台返佣，不可鏈上驗）」獨立分類。
+來源：[Aster referral 文件](https://docs.asterdex.com/program-and-rewards/referral-program)、[Aster 智能合約清單](https://docs.asterdex.com/overview/smart-contracts)、[AsterScan /verify](https://aster-scan.com/verify)、[DefiLlama 復列但驗證仍有缺口](https://coincentral.com/defillama-relists-aster-perpetual-data-despite-verification-gaps/)
+
+### ⚠️ 誠實校正：連 Hyperliquid 也不是「純鏈上一鍵可查」
+前面把 Hyperliquid builder fee 講成「純鏈上、人人可逐筆讀」**是我過度宣稱**。實情：realized 逐筆 builder fee 是撮合引擎產物，**HyperCore 沒有像以太坊那樣的公開區塊瀏覽器/開放 RPC 能讀出逐筆 builder fee**；要拿到「builder 地址＋金額」必須**自跑 Hyperliquid（非開源）節點 `--write-fills`、或下載官方 S3 桶**再 join `replica_cmds` 重放。
+
+→ 這比「信任單一 REST API」可審計性高很多，但仍依賴 Hyperliquid 自家軟體/基礎設施。**對外文案的精確措辭**：
+- ✅ 可寫：「Hyperliquid 返佣/builder fee **可由任何人自架節點獨立重算對賬，不需信任單一 API**」
+- ❌ 不可寫：「純鏈上、區塊瀏覽器一鍵可查」
+
+### 🥇 真正「一鍵公開合約可讀」的只有 GMX
+GMX 的 `ReferralStorage` 是公開合約，任何人在 Arbiscan 直接讀，**連節點都不用自架**。可驗證性是三者最強（代價：量小）。
+
+### referral vs builder 的關鍵分叉（影響「綁邀請碼」這個動作）
+| 路徑 | 收益來源 | 可驗證性 | 需要什麼 |
+|---|---|---|---|
+| **GMX 綁推薦碼** | referral | ✅ 公開合約一鍵可讀（最乾淨） | 用戶手動交易即可 |
+| **Hyperliquid builder codes** | builder fee | 🟡 自架節點可重算（強，非一鍵） | **機器人需替用戶路由下單**（深整合） |
+| **Hyperliquid 綁推薦碼** | referral | 🔴 僅 HL 中心化 API（開源節點不支援該端點）≈ 跟 CEX 一樣 | 用戶手動交易 |
+| **Aster 綁邀請碼** | referral | 🔴 後台帳本，不可第三方驗 | — |
+
+> ⚠️ 重要：本專案目前是**訊號機器人（用戶手動下單）**。若近期只做「綁邀請碼」漏斗 = 走 **referral**。而 **Hyperliquid 的 referral 反而不可鏈上驗（只能 HL API）**；真正可驗證的 Hyperliquid builder fee **需要機器人實際替用戶路由下單**（更深整合，且觸及代下單議題）。因此若要「綁碼即可鏈上驗證」的乾淨故事，**現階段最契合的其實是 GMX**。
+
+### 上線前 do-now（校正後）
+1. 對外「可驗證 DEX」軌**只放 Hyperliquid + GMX**，移除 Aster。
+2. Aster 改列「高流動性選項（後台返佣，不可鏈上驗）」，邀請碼可放但文案明說「以 Aster 官方後台為準、無法第三方鏈上重算」，並一句帶過 DefiLlama 下架事實。
+3. Hyperliquid 文案改用「自架節點獨立重算、不需信任單一 API」，不要寫「一鍵鏈上查」。
+4. 釐清要推 referral（綁碼即可、GMX 可驗 / HL 不可驗）還是 builder codes（HL 可驗但需路由下單）——這是產品深度的抉擇。
+5. Aster 設「升軌條件」（開放節點軟體／返佣上鏈合約／DefiLlama 解除疑慮），達標前維持觀察。
+
+---
+
 ## 9. 變更紀錄（Evolution Log）
 
 | 日期 | 事件 |
@@ -187,6 +228,7 @@ Hyperliquid 官方機制可精確重現草案數字：
 | 2026-06-14 | 社群 bett.erlife1003 提出「被動驗證 / 公開鑰匙查詢 / 斷線即警訊」，公開採納入路線圖 |
 | 2026-06-14 | 第一輪研究：CEX 返佣鏈上化現況 + zkTLS/oracle/EAS 比較（22 源、25 主張對抗查證、0 推翻） |
 | 2026-06-14 | 第二輪查證：Gemini 兩份 DEX 草案事實核對（Hyperliquid/Aster/Chainlink）；推翻「DEX 返佣＝原生鏈上可查」假設，確立 builder codes 為核心軌 |
+| 2026-06-14 | 第三輪查證（上線前）：**Aster 定案不可鏈上驗證**（後台帳本＋預設隱私＋刷量爭議）；**誠實校正 Hyperliquid**（自架節點重算，非一鍵鏈上查）；確認 **GMX 是唯一公開合約一鍵可讀**；釐清 referral vs builder 分叉 |
 
 ---
 
