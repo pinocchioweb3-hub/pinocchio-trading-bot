@@ -574,6 +574,22 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
             parts.append(f"- 市場情緒：恐懼貪婪 {senti['fg']}"
                          + (f"（{senti['fg_label']}）" if senti.get("fg_label") else ""))
 
+    # v33：Binance 第二來源交叉驗證（兩所分歧＝資訊，須在分析點出）
+    xc = sym_state.get("binance_xcheck") or {}
+    bn = xc.get("binance") or {}
+    if bn:
+        line = "\n## 🔀 跨所交叉驗證（Binance 第二來源）"
+        parts.append(line)
+        if bn.get("ls_ratio") is not None:
+            parts.append(f"- Binance 大戶多空比：{bn['ls_ratio']:.2f}")
+        if bn.get("funding") is not None:
+            parts.append(f"- Binance 資金費率：{bn['funding']*100:+.4f}%/8h")
+        if xc.get("flags"):
+            for fl in xc["flags"]:
+                parts.append(f"- ⚠️ {fl}（兩所分歧，留意）")
+        else:
+            parts.append("- ✅ 與主源(OKX/CoinGlass)大致一致，訊號可信度較高")
+
     # Hyperliquid 鯨魚（如果這個 symbol 上榜）
     whales = sym_state.get("whales", {})
     if whales and not whales.get("error"):

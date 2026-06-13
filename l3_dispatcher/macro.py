@@ -365,6 +365,49 @@ async def compute_pulse_state(source, watchlist) -> dict:
     }
 
 
+async def _fetch_binance_raw(symbol: str) -> dict:
+    """v33：抓 Binance 永續 funding/大戶多空比，供與 OKX/CoinGlass 交叉驗證。失敗回 {}。"""
+    try:
+        from market_intel_mcp.sources.binance_perp import get_binance_perp
+        src = get_binance_perp()
+
+        async def _s(c):
+            try:
+                return await c
+            except Exception:
+                return None
+        fund, pos = await asyncio.gather(
+            _s(src.get_funding(symbol)),
+            _s(src.get_positioning(symbol, "4h", 30)),
+        )
+        out = {}
+        if isinstance(fund, dict) and not fund.get("error"):
+            out["funding"] = fund.get("funding")
+        if isinstance(pos, dict) and not pos.get("error"):
+            out["ls_ratio"] = pos.get("latest")
+        return out
+    except Exception:
+        return {}
+
+
+def _binance_divergence(cg: dict, bn: dict) -> dict:
+    """v33：比較 主源(OKX/CoinGlass) vs Binance 的 funding 與大戶多空比，回背離摘要。
+    背離大→在分析註記（兩所對同一品種看法分歧＝資訊，不是錯誤）。"""
+    out = {"binance": bn, "flags": []}
+    cgf, bnf = cg.get("funding"), bn.get("funding")
+    if cgf is not None and bnf is not None:
+        if (cgf > 0) != (bnf > 0) and abs(cgf - bnf) > 0.0002:
+            out["flags"].append(
+                f"資金費率跨所背離：主源 {cgf*100:+.4f}% vs Binance {bnf*100:+.4f}%")
+    cgl, bnl = cg.get("ls_ratio"), bn.get("ls_ratio")
+    if cgl and bnl:
+        hi, lo = max(cgl, bnl), max(min(cgl, bnl), 0.01)
+        if hi / lo > 1.25:
+            out["flags"].append(
+                f"大戶多空比跨所背離：主源 {cgl:.2f} vs Binance {bnl:.2f}")
+    return out
+
+
 async def compute_per_symbol_state(source, symbol: str) -> dict:
     """組單一標的 deep dive 用的完整資料（含 SMC 量化指標）。"""
     from market_intel_mcp.server import (
@@ -377,13 +420,14 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
     # 並行拉所有東西
     from .chart_render import _fetch_coinglass_overlays
     candles_src = get_okx_candles()
-    pattern, snap, whales, c_4h, c_1d, cg_ov = await asyncio.gather(
+    pattern, snap, whales, c_4h, c_1d, cg_ov, bn_raw = await asyncio.gather(
         mi_get_pattern_analysis(symbol, ["15m", "1h", "4h", "12h", "1d", "1w"]),
         mi_get_snapshot(symbol, "1h", 96),
         mi_get_hyperliquid_whales(50),
         candles_src.get_candles(symbol, "4h", 200),
         candles_src.get_candles(symbol, "1d", 200),
         _fetch_coinglass_overlays(symbol, "4h", 120),   # v32: CVD/OI/資金費率/多空比佐證
+        _fetch_binance_raw(symbol),                     # v33: Binance 第二來源交叉驗證
         return_exceptions=True,
     )
 
@@ -404,6 +448,9 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
         "whales": _safe(whales),
         "smc_levels": smc_levels,
         "coinglass": cg_ov if isinstance(cg_ov, dict) else {},   # v32: CoinGlass 佐證序列
+        "binance_xcheck": _binance_divergence(                   # v33: Binance 交叉驗證
+            cg_ov if isinstance(cg_ov, dict) else {},
+            bn_raw if isinstance(bn_raw, dict) else {}),
     }
 
     if symbol in ("BTC", "ETH"):
