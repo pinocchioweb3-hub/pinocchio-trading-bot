@@ -97,6 +97,43 @@ def _compute_snr(candles: list[dict], n_levels: int = 3) -> dict:
             "support": sorted(sup, key=lambda x: -x[0])}
 
 
+def _atr(candles: list[dict], period: int = 14) -> float:
+    """簡易 ATR（給 FVG displacement 過濾用）。"""
+    if len(candles) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if not trs:
+        return 0.0
+    return sum(trs[-period:]) / min(len(trs), period)
+
+
+def _detect_sweeps(candles: list[dict], swings: list[dict], n: int,
+                   lookahead: int = 6) -> list[dict]:
+    """v33：偵測流動性掃單（liquidity sweep）。
+    swing 高被後續K影線刺穿但收盤收回下方＝上方流動性被掃（▼，常見假突破/UTAD）；
+    swing 低被刺穿但收回上方＝下方流動性被掃（▲，常見 Spring）。回標記清單。"""
+    out = []
+    rng = (max(c["high"] for c in candles) - min(c["low"] for c in candles)) or 1
+    tol = rng * 0.0008
+    for s in swings:
+        ago = int(s.get("ago_bars") or 0)
+        idx = n - 1 - ago
+        if idx < 0 or idx >= n:
+            continue
+        lvl = s["level"]
+        is_high = s.get("type") == "high"
+        for j in range(idx + 1, min(idx + 1 + lookahead, n)):
+            c = candles[j]
+            if is_high and c["high"] > lvl + tol and c["close"] < lvl:
+                out.append({"x": j, "level": c["high"], "dir": "down"}); break
+            if (not is_high) and c["low"] < lvl - tol and c["close"] > lvl:
+                out.append({"x": j, "level": c["low"], "dir": "up"}); break
+    return out[-5:]   # 只留最近 5 個避免洗版
+
+
 def _prune_old():
     try:
         CHART_DIR.mkdir(parents=True, exist_ok=True)
@@ -195,20 +232,47 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                                    max(body_hi - body_lo, c["close"] * 1e-5),
                                    facecolor=color, edgecolor=color, zorder=3))
 
-        # === FVG（v33：只留未填補的最近 3 個 + 50% CE 中線；進場參考 CE 較緊）===
-        _fvgs = [f for f in (smc.get("fvg") or []) if not f.get("mitigated")][:3]
-        for f in _fvgs:
+        # === FVG（v33：displacement 過濾 + 50% CE 中線；被反向收破的標 IFVG 換色）===
+        _atr14 = _atr(candles)
+        cur_px = candles[-1]["close"]
+        _all_fvg = smc.get("fvg") or []
+        _fresh, _ifvg = [], []
+        for f in _all_fvg:
+            is_bull = (f.get("type") or "").lower().startswith("bull")
+            # displacement 過濾：形成 FVG 的中間 K 實體須夠大（濾盤整雜訊）
+            mid = n - 1 - int(f.get("ago_bars") or 0)
+            if 0 <= mid < n and _atr14 > 0:
+                body = abs(candles[mid]["close"] - candles[mid]["open"])
+                if body < 0.45 * _atr14:
+                    continue   # 位移不足，視為雜訊 FVG
+            if f.get("mitigated"):
+                # IFVG：被填補且現價在反側 → 反轉成對向 S/R
+                if (is_bull and cur_px < f["bottom"]) or ((not is_bull) and cur_px > f["top"]):
+                    _ifvg.append((f, is_bull))
+            else:
+                _fresh.append((f, is_bull))
+        for f, is_bull in _fresh[:3]:
             x0 = max(0, n - 1 - int(f.get("ago_bars") or 0))
-            color = UP if (f.get("type") or "").lower().startswith("bull") else DOWN
+            color = UP if is_bull else DOWN
             ce = (f["top"] + f["bottom"]) / 2
             ax.add_patch(Rectangle((x0, f["bottom"]), n - x0,
                                    f["top"] - f["bottom"],
                                    facecolor=color, alpha=0.12, edgecolor="none", zorder=1))
-            # 50% CE 中線（虛線）
             ax.plot([x0, n], [ce, ce], color=color, linewidth=0.7,
                     linestyle=(0, (2, 3)), alpha=0.7, zorder=2)
             ax.text(n - 0.5, ce, "FVG·CE", color=color, fontsize=6.8, va="center",
                     ha="right", alpha=0.9, zorder=4,
+                    bbox=dict(boxstyle="round,pad=0.12", fc=BG, ec=color, lw=0.4, alpha=0.7))
+        # IFVG（反向 FVG）：原 bull FVG 被收破 → 變阻力(紅)；反之變支撐(綠)
+        for f, is_bull in _ifvg[:2]:
+            x0 = max(0, n - 1 - int(f.get("ago_bars") or 0))
+            color = DOWN if is_bull else UP   # 反轉
+            ax.add_patch(Rectangle((x0, f["bottom"]), n - x0,
+                                   f["top"] - f["bottom"],
+                                   facecolor=color, alpha=0.08, edgecolor=color,
+                                   linewidth=0.6, linestyle=":", zorder=1))
+            ax.text(n - 0.5, (f["top"] + f["bottom"]) / 2, "IFVG", color=color,
+                    fontsize=6.8, va="center", ha="right", alpha=0.9, zorder=4,
                     bbox=dict(boxstyle="round,pad=0.12", fc=BG, ec=color, lw=0.4, alpha=0.7))
 
         # === Order Blocks（v33：只留未緩解最近 3 個；demand=綠 supply=紅）===
@@ -259,6 +323,15 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                 prev_low = lvl
                 ax.annotate(f"▁{tag}", (x0, lvl), color=UP, fontsize=7.5,
                             ha="center", va="top", zorder=5)
+
+        # === 流動性掃單標記（v33：被掃的 swing 極值 ▲▼，與 Wyckoff Spring/UTAD 互證）===
+        for sw in _detect_sweeps(candles, swings, n):
+            if sw["dir"] == "down":   # 上方流動性被掃（假突破/UTAD）
+                ax.annotate("▼掃", (sw["x"], sw["level"]), color=SWEEP, fontsize=8,
+                            ha="center", va="bottom", fontweight="bold", zorder=6)
+            else:                      # 下方流動性被掃（Spring）
+                ax.annotate("▲掃", (sw["x"], sw["level"]), color=SWEEP, fontsize=8,
+                            ha="center", va="top", fontweight="bold", zorder=6)
 
         # === SNR 支撐壓力（v33：畫『區帶』axhspan + 觸及次數，只留密集區）===
         snr = _compute_snr(candles)
