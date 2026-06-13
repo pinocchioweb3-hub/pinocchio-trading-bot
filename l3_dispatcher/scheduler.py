@@ -103,10 +103,11 @@ async def scan_once(watchlist_or_list, cooldown_seconds: int = 3600,
                 "is_hot": snap.is_hot, "strength_score": snap.strength_score,
                 "stale_count": len(snap.stale_fields),
             })
-            # v11: Setup B (ambush) 已停用（30d 真實 backtest 24/24 全 0 FIRE 證明設計失效）
-            # 只跑 intraday；ambush 留待未來用 SMC + Wyckoff 完整重構
-            for cfg_fn in (get_intraday_config,):
-                cfg = cfg_fn(sym)
+            # v23-5: 策略由註冊表驅動（取代寫死的 intraday）— 用戶可在 .env
+            # STRATEGIES_ENABLED 自選；預設只有 intraday 為 live（行為不變）
+            from l2_trigger.registry import scheduler_strategies
+            for _meta in scheduler_strategies():
+                cfg = _meta.config_factory(sym)
                 decision = evaluate(snap, cfg)
                 if decision.action == TriggerAction.FIRE:
                     # === Cross-check 跨來源一致性檢查 ===

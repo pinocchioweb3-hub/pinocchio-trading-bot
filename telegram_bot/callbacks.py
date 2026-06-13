@@ -323,6 +323,9 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
                 reply = "用法：/adopt <建議編號> [分數1-10] [實裝說明]"
         else:
             reply = "此指令僅限管理者"
+    elif cmd in ("strategies", "strats"):
+        from l2_trigger.registry import render_strategy_menu
+        reply = render_strategy_menu()
     elif cmd == "gate_approve":
         # 僅限管理者：舊用戶人工放行（v22-2）
         import os
