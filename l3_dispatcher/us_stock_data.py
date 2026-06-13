@@ -27,10 +27,11 @@ _sem = asyncio.Semaphore(4)
 
 
 def us_session_now(now: dt.datetime | None = None) -> str:
-    """美股時段：rth（現金盤）/ ext（延長）/ off（夜間+週末）。自動處理夏令。"""
+    """美股時段：rth（現金盤）/ ext（延長）/ wkd（週末）/ off（平日夜間）。自動處理夏令。
+    v32：週末獨立為 wkd（OKX 美股永續 24/7 有真實波動，與平日深夜 off 區分，便於分時段分析）。"""
     now_ny = (now or dt.datetime.now(dt.timezone.utc)).astimezone(_NY)
     if now_ny.weekday() >= 5:  # 週六日
-        return "off"
+        return "wkd"
     t = now_ny.hour * 60 + now_ny.minute
     if 9 * 60 + 30 <= t < 16 * 60:
         return "rth"

@@ -66,7 +66,8 @@ def render_us_fire(d, sl_pct: float, stop: float, tps: dict,
     s = d.snapshot
     dir_zh = "做多" if d.direction.value == "bull" else "做空"
     dir_icon = "📈" if d.direction.value == "bull" else "📉"
-    session_zh = {"rth": "盤中", "ext": "延長時段", "off": "盤外"}.get(s.us_session, "?")
+    session_zh = {"rth": "盤中", "ext": "延長時段", "wkd": "週末盤",
+                  "off": "盤外"}.get(s.us_session, "?")
     entry = s.price
     if d.direction.value == "bull":
         e_lo, e_hi = entry * 0.998, entry * 1.003
@@ -128,7 +129,17 @@ async def run_us_signal_loop(tg, scan_interval: int = 900):
     while True:
         try:
             from .us_stock_data import us_session_now
-            if us_session_now() == "off":
+            # v32: OKX 美股永續 24/7 有真實價格波動（實測週末 K 線新鮮、價格在動）。
+            # 預設連週末(wkd)/平日夜間(off)都掃，避免漏掉 24/7 行情→零訊號（仍 paper-only）。
+            # 可用 US_SCAN_OFFHOURS=false 關回只掃 rth/ext。regime tag 已記時段供分時段分析。
+            sess = us_session_now()
+            try:
+                from botconfig import get_str
+                scan_offhours = get_str("US_SCAN_OFFHOURS", "true").strip().lower() \
+                    not in ("false", "0", "no", "off")
+            except Exception:
+                scan_offhours = True
+            if sess in ("off", "wkd") and not scan_offhours:
                 await asyncio.sleep(scan_interval)
                 continue
 
