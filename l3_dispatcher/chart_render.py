@@ -333,6 +333,28 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                 ax.annotate("▲掃", (sw["x"], sw["level"]), color=SWEEP, fontsize=8,
                             ha="center", va="top", fontweight="bold", zorder=6)
 
+        # === Wyckoff 階段（v33：TR 箱體 + Spring/UTAD/SOS/SOW 事件 + 角落敘事）===
+        wy = overlays.get("wyckoff") or {}
+        if wy.get("box_hi") and wy.get("box_lo"):
+            ax.axhspan(wy["box_lo"], wy["box_hi"], color="#8e99ab", alpha=0.06, zorder=0)
+            for edge in (wy["box_hi"], wy["box_lo"]):
+                ax.plot([0, n], [edge, edge], color="#8e99ab", linewidth=0.6,
+                        linestyle=(0, (5, 5)), alpha=0.45, zorder=1)
+            _evmark = {"Spring": ("▲", UP), "UTAD": ("▼", DOWN),
+                       "SOS": ("⬆SOS", UP), "SOW": ("⬇SOW", DOWN)}
+            for ev in wy.get("events", []):
+                x0 = max(0, n - 1 - int(ev.get("ago_bars") or 0))
+                mk, col = _evmark.get(ev["type"], ("•", FG))
+                va = "top" if ev["type"] in ("UTAD", "SOW") else "bottom"
+                ax.annotate(mk, (x0, ev["level"]), color=col, fontsize=7.5,
+                            ha="center", va=va, alpha=0.9, zorder=6)
+            if wy.get("narrative"):
+                ax.text(0.01, 0.02, f"Wyckoff：{wy['narrative']}　〔{wy.get('caveat','')}〕",
+                        transform=ax.transAxes, color="#c9b6e0", fontsize=7.2,
+                        va="bottom", ha="left", zorder=6,
+                        bbox=dict(boxstyle="round,pad=0.3", fc="#1a1f2e",
+                                  ec=BREAKER, lw=0.5, alpha=0.8))
+
         # === SNR 支撐壓力（v33：畫『區帶』axhspan + 觸及次數，只留密集區）===
         snr = _compute_snr(candles)
         _rng = (max(c["high"] for c in candles) - min(c["low"] for c in candles)) or 1
@@ -614,6 +636,14 @@ async def render_symbol_chart(symbol: str, tf: str = "4h", bars: int = 120,
         if smc.get("error"):
             smc = {}
         overlays = await _fetch_coinglass_overlays(symbol, tf, len(candles))
+        # v33: Wyckoff heuristic 階段（用 CVD/OI 做 effort-vs-result 驗證）
+        try:
+            from market_intel_mcp.wyckoff import classify_wyckoff
+            overlays["wyckoff"] = classify_wyckoff(
+                candles, cvd_slope=overlays.get("cvd_slope"),
+                oi_delta_pct=overlays.get("oi_delta_24h"))
+        except Exception:
+            pass
         return render_smc_chart(symbol, candles, smc, tf=tf, plan=plan, overlays=overlays)
     except Exception as e:
         print(f"[chart] {symbol} error: {type(e).__name__}: {e}")

@@ -485,6 +485,20 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
         parts.append("（趨勢態：順勢突破/續勢勝率高；盤整態：區間高賣低買、對順勢追單降權；"
                      "高波動：縮小倉位。請依此狀態調整策略選擇與信心，不要不分狀態硬套同一招。）\n")
 
+    # v33：Wyckoff 階段（heuristic，定宏觀方向偏置 + 關鍵事件）
+    wy = sym_state.get("wyckoff") or {}
+    if wy.get("phase") and wy.get("narrative"):
+        parts.append(f"## 🔷 Wyckoff 階段：{wy['narrative']}")
+        evs = wy.get("events") or []
+        if evs:
+            parts.append("- 近期事件：" + "、".join(
+                f"{e['type']}({e['ago_bars']}根前)" for e in evs[-4:]))
+        if wy.get("box_lo") and wy.get("box_hi"):
+            parts.append(f"- 交易區間(TR)：{wy['box_lo']:,.6g} ~ {wy['box_hi']:,.6g}"
+                         f"（{wy.get('caveat','')}）")
+        parts.append("（Wyckoff 定方向偏置與『該不該等』；Spring/UTAD 是高勝率反轉前置，"
+                     "但須 CVD/OI 同向驗證避免假突破。）\n")
+
     # 多時框型態
     pattern = sym_state.get("pattern", {})
     if pattern and not pattern.get("error"):
