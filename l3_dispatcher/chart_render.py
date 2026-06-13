@@ -91,22 +91,36 @@ def _prune_old():
 
 def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                      tf: str = "4h",
-                     plan: dict | None = None) -> Path | None:
+                     plan: dict | None = None,
+                     overlays: dict | None = None) -> Path | None:
     """畫圖。plan（可選）= {entry, stop, tp1, tp2, tp3, direction}。
+    overlays（v30 CoinGlass）= {cvd:[...], oi:[...], funding, ls_ratio, ...}。
     回 PNG 路徑；失敗回 None。"""
     try:
         if not candles or len(candles) < 30:
             return None
         n = len(candles)
+        overlays = overlays or {}
+        has_cvd = bool(overlays.get("cvd"))
+        has_oi = bool(overlays.get("oi"))
 
-        # v28: 雙面板 — 上 75% K線/SMC/SNR，下 25% 成交量+量能MA(+OI)
-        fig = plt.figure(figsize=(12, 8), dpi=110)
+        # v30: 多面板（畫質提升 dpi 150）— 價格/SMC/SNR + 成交量 + CVD + OI
+        panels = [("price", 3.4), ("vol", 1.0)]
+        if has_cvd:
+            panels.append(("cvd", 1.0))
+        if has_oi:
+            panels.append(("oi", 1.0))
+        fig = plt.figure(figsize=(13, 6 + 1.6 * len(panels)), dpi=150)
         fig.patch.set_facecolor(BG)
-        gs = GridSpec(2, 1, height_ratios=[3.2, 1.0], hspace=0.06, figure=fig)
-        ax = fig.add_subplot(gs[0])
-        axv = fig.add_subplot(gs[1], sharex=ax)
-        ax.set_facecolor(BG)
-        axv.set_facecolor(BG)
+        gs = GridSpec(len(panels), 1, height_ratios=[p[1] for p in panels],
+                      hspace=0.07, figure=fig)
+        axes = {}
+        ax = fig.add_subplot(gs[0]); axes["price"] = ax
+        for i, (name, _) in enumerate(panels[1:], start=1):
+            axes[name] = fig.add_subplot(gs[i], sharex=ax)
+        axv = axes["vol"]
+        for a in axes.values():
+            a.set_facecolor(BG)
 
         # === K 線 ===
         for i, c in enumerate(candles):
@@ -221,27 +235,59 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
             if tag:
                 axv.text(n - 1, vols[-1], f"{tag} {ratio:.1f}x", color=VOLMA,
                          fontsize=7.5, va="bottom", ha="right", zorder=4)
-        # OI 疊加（若 candle 帶 oi 欄位）
-        ois = [c.get("oi") or c.get("open_interest") for c in candles]
-        if any(o for o in ois):
-            axoi = axv.twinx()
-            axoi.plot(range(n), [o or 0 for o in ois], color=OICOL,
-                      linewidth=1.0, alpha=0.8, zorder=3, label="OI")
-            axoi.tick_params(colors=OICOL, labelsize=7)
-            axoi.set_ylabel("OI", color=OICOL, fontsize=8)
-            for sp in axoi.spines.values():
-                sp.set_color(GRID)
+        axv.set_ylabel("成交量", color=FG, fontsize=8)
+        axv.legend(loc="upper left", fontsize=7, facecolor=BG, edgecolor=GRID,
+                   labelcolor=FG)
+
+        # === CVD 面板（v30：主動買賣淨力 — SMC 真假突破核心）===
+        if has_cvd and "cvd" in axes:
+            axc = axes["cvd"]
+            cvd = overlays["cvd"]
+            cx = range(n - len(cvd), n) if len(cvd) <= n else range(n)
+            cvd = cvd[-n:]
+            slope = overlays.get("cvd_slope") or 0
+            cvd_color = UP if slope >= 0 else DOWN
+            axc.plot(list(cx), cvd, color=cvd_color, linewidth=1.3, zorder=3)
+            axc.fill_between(list(cx), cvd, min(cvd), color=cvd_color, alpha=0.12)
+            axc.axhline(0, color=FG, linewidth=0.4, alpha=0.3)
+            trend = "買盤主導 ↑" if slope > 0.5 else "賣盤主導 ↓" if slope < -0.5 else "多空均衡"
+            axc.set_ylabel("CVD", color=FG, fontsize=8)
+            axc.text(0.01, 0.92, f"CVD 主動買賣淨力：{trend}（斜率 {slope:+.2f}）",
+                     transform=axc.transAxes, color=cvd_color, fontsize=8,
+                     va="top", ha="left")
+
+        # === OI 面板（v30：未平倉量 — 資金進出場）===
+        if has_oi and "oi" in axes:
+            axo = axes["oi"]
+            oi = overlays["oi"][-n:]
+            ox = range(n - len(oi), n)
+            d24 = overlays.get("oi_delta_24h")
+            oi_color = OICOL if (d24 or 0) >= 0 else DOWN
+            axo.plot(list(ox), oi, color=oi_color, linewidth=1.3, zorder=3)
+            axo.fill_between(list(ox), oi, min(oi), color=oi_color, alpha=0.12)
+            axo.set_ylabel("OI", color=FG, fontsize=8)
+            extra = []
+            if d24 is not None:
+                extra.append(f"OI 24h {d24:+.1f}%")
+            if overlays.get("funding") is not None:
+                extra.append(f"資金費率 {overlays['funding']*100:+.3f}%")
+            if overlays.get("ls_ratio") is not None:
+                extra.append(f"多空比 {overlays['ls_ratio']:.2f}")
+            if extra:
+                axo.text(0.01, 0.92, "　".join(extra), transform=axo.transAxes,
+                         color=FG, fontsize=8, va="top", ha="left")
 
         # === 樣式 ===
-        for a in (ax, axv):
+        for a in axes.values():
             a.grid(color=GRID, linewidth=0.4, alpha=0.5)
             a.tick_params(colors=FG, labelsize=8)
             for spine in a.spines.values():
                 spine.set_color(GRID)
-        axv.set_ylabel("成交量", color=FG, fontsize=8)
-        axv.legend(loc="upper left", fontsize=7, facecolor=BG, edgecolor=GRID,
-                   labelcolor=FG)
-        plt.setp(ax.get_xticklabels(), visible=False)
+        # 只有最底面板顯示 x 軸刻度
+        bottom = list(axes.values())[-1]
+        for a in axes.values():
+            if a is not bottom:
+                plt.setp(a.get_xticklabels(), visible=False)
         cur = candles[-1]["close"]
         dir_str = ""
         if plan and plan.get("direction"):
@@ -265,9 +311,45 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
         return None
 
 
+async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
+    """v30: 抓 CoinGlass 可畫序列（CVD / OI）+ 即時指標（資金費率/多空比）。
+    任何失敗都回部分結果，絕不阻斷繪圖。"""
+    out: dict = {"cvd": None, "oi": None, "funding": None, "ls_ratio": None,
+                 "oi_delta_24h": None, "cvd_slope": None}
+    try:
+        from market_intel_mcp.sources import get_source
+        src = get_source()
+        import asyncio as _aio
+
+        async def _safe(coro):
+            try:
+                return await coro
+            except Exception:
+                return None
+        cvd, oi, fund, pos = await _aio.gather(
+            _safe(src.get_cvd_series(symbol, tf, n)),
+            _safe(src.get_oi(symbol, tf, n)),
+            _safe(src.get_funding(symbol)),
+            _safe(src.get_positioning(symbol, "global", tf, n)),
+        )
+        if cvd and not cvd.get("error") and cvd.get("series"):
+            out["cvd"] = [s["value"] for s in cvd["series"]][-n:]
+            out["cvd_slope"] = cvd.get("cvd_slope")
+        if oi and not oi.get("error") and oi.get("series"):
+            out["oi"] = [s["value"] for s in oi["series"]][-n:]
+            out["oi_delta_24h"] = oi.get("delta_pct_24h")
+        if fund and not fund.get("error"):
+            out["funding"] = fund.get("funding") or fund.get("latest")
+        if pos and not pos.get("error"):
+            out["ls_ratio"] = pos.get("ratio") or pos.get("latest")
+    except Exception as e:
+        print(f"[chart] coinglass overlay error: {type(e).__name__}: {e}")
+    return out
+
+
 async def render_symbol_chart(symbol: str, tf: str = "4h", bars: int = 120,
                               plan: dict | None = None) -> Path | None:
-    """抓數據 + 算 SMC + 渲染。失敗回 None（絕不阻塞呼叫端）。"""
+    """抓數據 + 算 SMC + CoinGlass 疊加 + 渲染。失敗回 None（絕不阻塞呼叫端）。"""
     try:
         from market_intel_mcp.smc_levels import compute_smc_levels
         from market_intel_mcp.sources.okx_candles import OkxCandlesSource
@@ -282,7 +364,8 @@ async def render_symbol_chart(symbol: str, tf: str = "4h", bars: int = 120,
         smc = compute_smc_levels(candles)
         if smc.get("error"):
             smc = {}
-        return render_smc_chart(symbol, candles, smc, tf=tf, plan=plan)
+        overlays = await _fetch_coinglass_overlays(symbol, tf, len(candles))
+        return render_smc_chart(symbol, candles, smc, tf=tf, plan=plan, overlays=overlays)
     except Exception as e:
         print(f"[chart] {symbol} error: {type(e).__name__}: {e}")
         return None
