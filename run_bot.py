@@ -224,6 +224,8 @@ async def amain(args: argparse.Namespace) -> int:
     from threads_publisher import run_threads_publisher_loop as _run_threads
     # v22-4: 美股第一線快訊（TradingView 隱藏 API，零成本）
     from news_feed.us_news import run_us_news_loop as _run_us_news
+    # v24: 訊息稽核 Session（路由/重複/明確性自我檢測）
+    from telegram_bot.message_auditor import run_audit_loop as _run_audit
 
     # v14: 每個 worker 用 supervise() 隔離 — 單一 worker 崩潰自動重啟，不再全滅
     # v14.1: run_on_startup 只在首次啟動為 True — supervise 崩潰重啟不重推開機報告
@@ -285,6 +287,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("threads_publisher", lambda: _run_threads(tg_sys)),
         # v22-4: 美股快訊（DJ 終端 flash 優先，AI 過濾+繁中）→ 美股主題
         ("us_news", lambda: _run_us_news(router.client("usstock"))),
+        # v24: 稽核 Session 報告（每小時彙整路由/重複/明確性警示 → 系統主題）
+        ("auditor", lambda: _run_audit(tg_sys)),
     ]
     try:
         await asyncio.gather(*[
