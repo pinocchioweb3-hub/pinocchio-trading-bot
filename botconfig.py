@@ -142,7 +142,7 @@ class BotConfig:
             tp_r_intraday=_tf("TP_R_INTRADAY", (1.0, 1.5, 2.0)),
             tp_r_ambush=_tf("TP_R_AMBUSH", (1.0, 1.5, 2.5)),
             tp_size_split=split,
-            trading_size=_i("TRADING_SIZE", 12, 3, 40),   # v27: 8→12（全市場擴容）
+            trading_size=_i("TRADING_SIZE", 15, 3, 40),   # v29: 12→15（掃描穩定後再擴）
         )
 
     def sl_pct(self, setup: str) -> float:

@@ -100,17 +100,33 @@ def fetch_events(days: int, pushed_only: bool = True, limit: int = 400) -> list[
 
 
 def fetch_econ_events(days: int = 14) -> list[dict]:
-    """經濟數據事件（第 4 層關聯用，先撈起來）。"""
-    cutoff_ms = (int(time.time()) - days * 86400) * 1000
+    """經濟數據事件（第 4 層關聯用）。回近期已公布實際值的事件。"""
     conn = _conn(NEWS_DB)
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(econ_events)").fetchall()]
         if not cols:
             return []
-        rows = conn.execute("SELECT * FROM econ_events ORDER BY rowid DESC LIMIT 50").fetchall()
+        cutoff = int(time.time()) - days * 86400
+        rows = conn.execute(
+            "SELECT * FROM econ_events WHERE ts_utc > ? ORDER BY ts_utc DESC LIMIT 30",
+            (cutoff,)).fetchall()
         return [dict(zip(cols, r)) for r in rows]
     finally:
         conn.close()
+
+
+def _econ_context_lines() -> list[str]:
+    """格式化近期經濟數據（含 實際 vs 預期 vs 前值）給敘事 prompt。"""
+    import datetime as dt
+    out = []
+    for e in fetch_econ_events(14):
+        if not e.get("actual"):
+            continue
+        when = dt.datetime.fromtimestamp(e["ts_utc"]).strftime("%m-%d")
+        out.append(f"[{when}] {e.get('title','')}（{e.get('impact','')}）："
+                   f"實際 {e['actual']} / 預期 {e.get('forecast') or '?'} / "
+                   f"前值 {e.get('previous') or '?'}")
+    return out
 
 
 # ── 第 2+3 層：Claude 敘事聚類 + 因果鏈 ────────────────────────────────────
@@ -123,6 +139,7 @@ NARRATIVE_PROMPT = """你是宏觀事件分析師。下面是過去一段時間�
 3. 每條敘事挑 2-4 個關鍵事件，標其因果角色（trigger 觸發/consequence 後果/escalation 升級/context 背景）
 4. 推論 2-4 條明確的因果鏈（A 導致 B），給信心 1-10
 5. 看似無關但實質有因果的，要點出（這是核心價值）
+6. 若附有經濟數據，將「數據意外（實際 vs 預期）」納入因果鏈（例：CPI 超預期→升息預期升溫→風險資產承壓）
 
 只輸出 JSON（繁中內容）：
 {
@@ -153,7 +170,11 @@ async def build_narratives(timeout_sec: int = 120) -> dict | None:
     for e in events[:300]:
         when = dt.datetime.fromtimestamp(e["ts"]).strftime("%m-%d %H:%M")
         lines.append(f"[{when}] @{e['handle']}: {e['text']}")
-    prompt = NARRATIVE_PROMPT + "\n".join(lines)
+    # v29 第4層：附近期經濟數據（實際 vs 預期），讓敘事能連結「數據→市場反應」
+    econ_lines = _econ_context_lines()
+    econ_block = ("\n\n=== 近期經濟數據（實際/預期/前值）===\n" + "\n".join(econ_lines)
+                  if econ_lines else "")
+    prompt = NARRATIVE_PROMPT + "\n".join(lines) + econ_block
 
     from .llm_filter import _call_claude, _extract_json
     raw = await _call_claude(prompt, timeout_sec=timeout_sec)
@@ -223,6 +244,44 @@ def get_active_narratives() -> list[dict]:
                  "impact": r[3], "assets": r[4], "event_count": r[5]} for r in rows]
     finally:
         conn.close()
+
+
+def narrative_alignment(symbol: str, direction: str) -> str:
+    """v29 第5層：訊號 vs 主導敘事一致性。回一行註記（順敘事加註/逆敘事警示）或空字串。
+    direction: 'bull'/'bear'。比對 active 敘事中影響此 symbol（或 risk_assets/BTC）的方向。"""
+    try:
+        nars = get_active_narratives()
+        if not nars:
+            return ""
+        sym_u = symbol.upper()
+        bull_force = bear_force = 0
+        hits = []
+        for n in nars:
+            assets = (n.get("assets") or "").upper()
+            relevant = (sym_u in assets or "RISK_ASSETS" in assets or "BTC" in assets
+                        or "CRYPTO" in assets)
+            if not relevant:
+                continue
+            imp = n.get("impact")
+            wt = max(1, n.get("event_count", 1))
+            if imp == "bullish":
+                bull_force += wt; hits.append(("🟢", n["title_zh"]))
+            elif imp == "bearish":
+                bear_force += wt; hits.append(("🔴", n["title_zh"]))
+        if not hits:
+            return ""
+        net = bull_force - bear_force
+        lean = "bull" if net > 0 else "bear" if net < 0 else "neutral"
+        top = hits[0][1]
+        if lean == "neutral":
+            return f"\n🧩 <b>敘事</b>：多空敘事拉鋸（{top}…）— 與訊號方向無明顯衝突"
+        aligned = (lean == direction)
+        if aligned:
+            return f"\n🧩 <b>敘事順風</b>：主導敘事偏{'多' if lean=='bull' else '空'}（{top}），與本訊號同向 ✅"
+        return (f"\n🧩 <b>敘事逆風警示</b>：主導敘事偏{'多' if lean=='bull' else '空'}"
+                f"（{top}），與本訊號相反 — 建議降低倉位或等待確認 ⚠️")
+    except Exception:
+        return ""
 
 
 def render_narrative_digest() -> str:

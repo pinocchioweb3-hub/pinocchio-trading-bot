@@ -170,6 +170,13 @@ def render_fire_message(decision_dict: dict[str, Any]) -> tuple[str, list[list[d
 
     text += f"\n❌ <b>失效條件</b>：4h 收盤跌破 <code>${stop}</code>"
 
+    # v29 第5層：訊號 vs 主導敘事一致性（世界因果背景餵回交易）
+    try:
+        from news_feed.narrative_engine import narrative_alignment
+        text += narrative_alignment(sym, direction)
+    except Exception:
+        pass
+
     buttons = [
         [
             {"text": "✅ 已下單", "callback_data": f"filled:{sym}:{setup}"},
