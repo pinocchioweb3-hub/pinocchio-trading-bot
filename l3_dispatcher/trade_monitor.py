@@ -313,7 +313,37 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
 
     v23-2 美股斷層修復：us_breakout 的事件發 tg_us（🇺🇸 美股主題）—
     進場通知在哪、出場事件就在哪；加密事件留 tg（📈 持倉與績效）。"""
-    from .paper_journal import apply_paper_event, get_open_paper, get_paper_stats
+    from .paper_journal import (apply_entry_fill, apply_paper_event,
+                                get_open_paper, get_paper_stats, get_pending_entries)
+
+    # v26: 先檢查分批限價單的進場成交 — 達到某格區間就推「進場進度」到持倉主題
+    pending = get_pending_entries()
+    for pe in pending:
+        sym = pe["symbol"]
+        bars = bars_cache.get(sym)
+        if bars is None:
+            d = await _get_recent_5m_bars(source, sym, n=4)
+            bars = d["candles"] if d and d.get("candles") else None
+            bars_cache[sym] = bars or []
+        if not bars:
+            continue
+        live = bars[-1]["close"]
+        fill = apply_entry_fill(pe["id"], live)
+        if fill and (tg or tg_us) is not None:
+            dir_zh = "做多" if pe["direction"] == "bull" else "做空"
+            filled_pct = int(fill["filled_pct"] * 100)
+            done = "✅ 全部進場完成" if fill["state"] == "full" else f"⏳ 已進場 {filled_pct}%（其餘掛單等待中）"
+            legs = "、".join(f"{int(s['frac']*100)}% @ <code>${s['price']:,.6g}</code>"
+                             for s in fill["newly_filled"])
+            txt = (f"📥 <b>{sym} {dir_zh} 分批進場觸發</b>\n"
+                   f"━━━━━━━━━━━━━━━━\n"
+                   f"本次成交：{legs}\n現價 <code>${live:,.6g}</code>　{done}\n"
+                   f"<i>已轉入持倉追蹤，每 15 分鐘更新進度與損益（紙上）</i>")
+            target = tg_us if (pe.get("setup") == "us_breakout" and tg_us) else tg
+            try:
+                await target.send_message(txt, parse_mode="HTML")
+            except Exception as e:
+                print(f"[trade_monitor] entry-fill push error: {e}")
 
     papers = get_open_paper()
     if not papers:

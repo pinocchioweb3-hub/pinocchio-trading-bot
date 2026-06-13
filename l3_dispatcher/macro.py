@@ -687,9 +687,11 @@ async def run_performance_loop(tg, target_hour_utc: int = 0,
 
             # v16: 紙上驗證進度（引擎期望值）
             # v23-2: Stage 0 門檻只算加密引擎；美股實驗引擎獨立一行
-            from .paper_journal import get_paper_stats, render_paper_summary
-            paper_line = render_paper_summary(
-                get_paper_stats(30, setup_not="us_breakout"))
+            # v26: 訂單漏斗（提出/進場/無效/部分/止盈止損）
+            from .paper_journal import (get_paper_stats, render_paper_summary,
+                                        render_paper_funnel)
+            paper_line = (render_paper_funnel(30, setup_not="us_breakout") + "\n\n" +
+                          render_paper_summary(get_paper_stats(30, setup_not="us_breakout")))
             us = get_paper_stats(30, setup="us_breakout")
             if us["n_closed"] or us["n_open"]:
                 paper_line += (f"\n🧪 美股紙上（實驗）30d：已平 <code>{us['n_closed']}</code> 筆 "

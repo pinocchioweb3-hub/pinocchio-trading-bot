@@ -261,7 +261,7 @@ async def amain(args: argparse.Namespace) -> int:
         ("trade_monitor", lambda: run_trade_monitor_loop(tg_positions, source,
                                                          args.monitor_interval,
                                                          tg_alert=tg_trade,
-                                                         tg_us=router.client("usstock"))),
+                                                         tg_us=router.client("us_positions"))),
         ("position_tracker", lambda: run_position_tracker_loop(tg_positions, source,
                                                                args.position_tracker_interval)),
         # 新聞（已過濾 + 繁中翻譯）→ 新聞快訊主題
@@ -280,7 +280,7 @@ async def amain(args: argparse.Namespace) -> int:
         # v16: 經濟數據日曆（預告 + T-30 預警 + actual 即時判讀 + 訊號靜默期）
         ("econ_calendar", lambda: _run_econ(router.client("econ"))),
         # v17: 美股永續突破訊號（實驗性，僅紙上帳）
-        ("us_signals", lambda: _run_us_sig(router.client("usstock"))),
+        ("us_signals", lambda: _run_us_sig(router.client("us_signals"))),
         # v18-A: 全市場異常掃描器 → v19 改推 ⚡異常警報 主題（不再稀釋交易訊號）
         ("market_scanner", lambda: _run_scanner(router.client("alerts"))),
         # v18-C: 代幣解鎖日曆（事前數週預警，每日刷新+7天預告）

@@ -263,12 +263,14 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
         ), initial_status="signal")
 
         # v16: 同步開紙上倉（Stage 0 — 每筆訊號自動追蹤，驗證引擎期望值）
+        # v26: 分批限價模式 — 進場區拆兩格，價格逐格觸及才計成交，持倉主題顯示進場進度
         from .paper_journal import record_paper_entry
         pid = record_paper_entry(
             symbol=sym, setup=setup, direction=direction,
             entry_price=entry_price, stop_price=stop,
             tp1=tps["tp1"], tp2=tps["tp2"], tp3=tps["tp3"],
             fire_id=fire_id, regime=regime,
+            zone_lo=zone_lo, zone_hi=zone_hi, split_mode=True,
         )
         print(f"[dispatcher] #{fire_id} {sym}/{setup}/{direction} -> sent "
               f"(msg_id={msg_id}, trade_id={tid} signal 等待確認, paper_id={pid} 自動追蹤)")
