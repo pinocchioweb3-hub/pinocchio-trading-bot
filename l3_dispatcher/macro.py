@@ -375,13 +375,15 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
     from market_intel_mcp.smc_levels import compute_smc_levels
 
     # 並行拉所有東西
+    from .chart_render import _fetch_coinglass_overlays
     candles_src = get_okx_candles()
-    pattern, snap, whales, c_4h, c_1d = await asyncio.gather(
+    pattern, snap, whales, c_4h, c_1d, cg_ov = await asyncio.gather(
         mi_get_pattern_analysis(symbol, ["15m", "1h", "4h", "12h", "1d", "1w"]),
         mi_get_snapshot(symbol, "1h", 96),
         mi_get_hyperliquid_whales(50),
         candles_src.get_candles(symbol, "4h", 200),
         candles_src.get_candles(symbol, "1d", 200),
+        _fetch_coinglass_overlays(symbol, "4h", 120),   # v32: CVD/OI/資金費率/多空比佐證
         return_exceptions=True,
     )
 
@@ -401,6 +403,7 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
         "snapshot": _safe(snap),
         "whales": _safe(whales),
         "smc_levels": smc_levels,
+        "coinglass": cg_ov if isinstance(cg_ov, dict) else {},   # v32: CoinGlass 佐證序列
     }
 
     if symbol in ("BTC", "ETH"):

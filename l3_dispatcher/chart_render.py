@@ -315,7 +315,7 @@ async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
     """v30: 抓 CoinGlass 可畫序列（CVD / OI）+ 即時指標（資金費率/多空比）。
     任何失敗都回部分結果，絕不阻斷繪圖。"""
     out: dict = {"cvd": None, "oi": None, "funding": None, "ls_ratio": None,
-                 "oi_delta_24h": None, "cvd_slope": None}
+                 "ls_series": None, "oi_delta_24h": None, "cvd_slope": None}
     try:
         from market_intel_mcp.sources import get_source
         src = get_source()
@@ -326,11 +326,12 @@ async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
                 return await coro
             except Exception:
                 return None
+        # 多空比用大戶帳戶比（top_trader_account）；"global" 非有效 ratio_type
         cvd, oi, fund, pos = await _aio.gather(
             _safe(src.get_cvd_series(symbol, tf, n)),
             _safe(src.get_oi(symbol, tf, n)),
             _safe(src.get_funding(symbol)),
-            _safe(src.get_positioning(symbol, "global", tf, n)),
+            _safe(src.get_positioning(symbol, "top_trader_account", tf, n)),
         )
         if cvd and not cvd.get("error") and cvd.get("series"):
             out["cvd"] = [s["value"] for s in cvd["series"]][-n:]
@@ -341,7 +342,10 @@ async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
         if fund and not fund.get("error"):
             out["funding"] = fund.get("funding") or fund.get("latest")
         if pos and not pos.get("error"):
-            out["ls_ratio"] = pos.get("ratio") or pos.get("latest")
+            pser = pos.get("series") or []
+            out["ls_ratio"] = pos.get("ratio") or pos.get("latest") or (
+                pser[-1]["value"] if pser else None)
+            out["ls_series"] = [s["value"] for s in pser][-n:] if pser else None
     except Exception as e:
         print(f"[chart] coinglass overlay error: {type(e).__name__}: {e}")
     return out

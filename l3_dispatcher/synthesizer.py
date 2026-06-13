@@ -150,13 +150,14 @@ PER_SYMBOL_DEEPDIVE_PROMPT = """你是專業加密貨幣交易計畫師。針對
 - 4h 結構：是否在關鍵 S/R 區？有 Break of Structure 嗎？
 - 1h/15m：進場時機？
 
-<b>2. 數據面確認</b>
-- 大戶 vs 散戶 持倉比：誰偏多誰偏空？背離了嗎？
-- OI 變化：建倉中 / 出清中？
-- Funding rate：負/中/熱？
-- CVD（如有）：吸籌 / 派發？
+<b>2. 數據面確認</b>（**強制：以下每項都必須引用「CoinGlass 數據佐證」區塊的具體數字**，不可只寫「偏多/偏空」這種空話）
+- CVD（累積成交量差）：引用最新值與斜率 → 主動買盤吸籌 / 主動賣盤派發？與價格背離了嗎？
+- OI 變化：引用 24h % → 增倉（趨勢延續）/ 減倉（獲利了結）？OI 升+價漲=健康多頭；OI 升+價跌=空頭加碼
+- Funding rate：引用 %/8h 數字 → 負/中/熱？是否擁擠到反指?
+- 大戶帳戶多空比：引用比值 → 誰偏多？與散裝/價格背離了嗎？
 - 清算：軋空燃料還是多殺多？
 - 鯨魚（Hyperliquid）：壓倒做多/做空/中性？
+（若某項數據缺失=「n/a」，明講「該指標暫無數據」，不可捏造）
 
 <b>3. 三重匯合判定</b>
 - 流派 A（威科夫 / 高時框）方向：？
@@ -509,6 +510,34 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
         parts.append(f"- 強勢分數: {snap.get('strength_score')}")
         parts.append(f"- 7d 結構: ATR%={snap.get('atr_pct_7d')}, 量比={snap.get('vol_24h_vs_30d')}, "
                     f"higher_lows={snap.get('higher_lows_7d')}")
+
+    # === v32: CoinGlass 佐證序列（CVD / OI / 資金費率 / 多空比）===
+    cg = sym_state.get("coinglass", {})
+    if cg and any(cg.get(k) is not None for k in ("cvd", "oi", "funding", "ls_ratio")):
+        parts.append("\n## 📊 CoinGlass 數據佐證（4h，必須在分析中引用具體數字）")
+        cvd = cg.get("cvd") or []
+        if cvd:
+            slope = cg.get("cvd_slope")
+            trend = ("上升=買方主動吸籌" if (slope or 0) > 0
+                     else "下降=賣方主動派發" if (slope or 0) < 0 else "走平")
+            parts.append(f"- CVD（累積成交量差）：最新 {cvd[-1]:,.0f}，"
+                         f"近 24h 斜率 {slope if slope is not None else 'n/a'}（{trend}）")
+        oi = cg.get("oi") or []
+        if oi:
+            d24 = cg.get("oi_delta_24h")
+            oi_trend = ("增倉" if (d24 or 0) > 0 else "減倉" if (d24 or 0) < 0 else "持平")
+            parts.append(f"- OI（未平倉合約）：最新 ${oi[-1]:,.0f}，"
+                         f"24h {d24:+.2f}%（{oi_trend}）" if d24 is not None
+                         else f"- OI：最新 ${oi[-1]:,.0f}")
+        if cg.get("funding") is not None:
+            f = cg["funding"]
+            ftone = ("過熱偏多（軋空風險）" if f > 0.0005 else
+                     "偏空（空頭擁擠）" if f < -0.0005 else "中性")
+            parts.append(f"- 資金費率：{f*100:+.4f}%/8h（{ftone}）")
+        if cg.get("ls_ratio") is not None:
+            ls = cg["ls_ratio"]
+            ltone = "大戶偏多" if ls > 1.05 else "大戶偏空" if ls < 0.95 else "多空均衡"
+            parts.append(f"- 大戶帳戶多空比：{ls:.2f}（{ltone}）")
 
     # Hyperliquid 鯨魚（如果這個 symbol 上榜）
     whales = sym_state.get("whales", {})
