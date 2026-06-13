@@ -125,14 +125,32 @@ async def amain(args: argparse.Namespace) -> int:
     refresh_result = await watchlist.refresh(source)
     print(f"[startup] trading tier: {refresh_result['chosen']}")
 
-    # === 開機訊息 ===
+    # === 開機訊息（v23-6: 30 分鐘內重啟不重推，避免部署期洗版系統主題）===
     if not args.no_startup_msg:
-        startup_text = render_startup(
-            backend=args.backend,
-            watchlist=watchlist.all_symbols,
-            interval_s=args.scan_interval,
-        )
-        await tg_sys.send_message(startup_text, parse_mode="HTML")
+        import json as _json
+        import time as _t
+        from botpaths import data_dir as _dd
+        _su = _dd() / "startup_state.json"
+        _recent = False
+        try:
+            if _su.exists():
+                _last = _json.loads(_su.read_text(encoding="utf-8")).get("ts", 0)
+                _recent = (_t.time() - _last) < 1800
+        except Exception:
+            pass
+        if _recent:
+            print("[startup] 30 分鐘內已發過開機訊息，本次靜默（避免洗版）")
+        else:
+            startup_text = render_startup(
+                backend=args.backend,
+                watchlist=watchlist.all_symbols,
+                interval_s=args.scan_interval,
+            )
+            await tg_sys.send_message(startup_text, parse_mode="HTML")
+            try:
+                _su.write_text(_json.dumps({"ts": _t.time()}), encoding="utf-8")
+            except Exception:
+                pass
         # v14.1: 交易層名單只推一次 — run_refresh_loop 的 initial refresh
         # 會經 on_refresh 推 summary，這裡不再重複推
 
@@ -165,7 +183,14 @@ async def amain(args: argparse.Namespace) -> int:
           f"+ supervisor({args.supervisor_interval}s) + refresh(daily)")
 
     sup_state = SupervisorState()
+    _refresh_seen = {"first": True}
     async def on_refresh(result):
+        # v23-6: 開機訊息已顯示觀察清單 → 跳過啟動時的首次 refresh 摘要（重啟不洗版）；
+        # 只在之後的每日重排推（那才是真正的名單變動）
+        if _refresh_seen["first"]:
+            _refresh_seen["first"] = False
+            print("[refresh-notify] 啟動首次 refresh 靜默（開機訊息已含名單）")
+            return
         try:
             await tg_intel.send_message(render_refresh_summary(result, watchlist), parse_mode="HTML")
         except Exception as e:

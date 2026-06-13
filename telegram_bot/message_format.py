@@ -211,14 +211,28 @@ def render_heartbeat(snapshots: list[dict], fires_this_cycle: int) -> str:
 def render_startup(backend: str, watchlist: list[str], interval_s: int) -> str:
     backend_zh = {"mock": "模擬數據", "coinglass": "CoinGlass 真實",
                   "local": "本地 TimescaleDB", "auto": "自動切換"}.get(backend, backend)
+    # v23-6: 啟用策略與風控參數改讀真實來源（registry + botconfig）
+    try:
+        from l2_trigger.registry import enabled_strategies
+        strat = "、".join(m.display_name_zh for m in enabled_strategies()) or "（無）"
+    except Exception:
+        strat = "日內爆發"
+    try:
+        from botconfig import CONFIG
+        risk_line = (f"   單筆風險：<code>${CONFIG.risk_per_trade_usd:.0f}</code>（1R），"
+                     f"最多 <code>{CONFIG.max_concurrent_trades}</code> 倉位\n")
+    except Exception:
+        risk_line = ""
+    n = len(watchlist)
+    wl = ", ".join(watchlist[:8]) + (f" …等 {n} 檔" if n > 8 else "")
     return (
         "🤖 <b>交易機器人上線</b>\n"
         f"   數據後端：<code>{_esc(backend_zh)}</code>\n"
-        f"   觀察清單：<code>{_esc(', '.join(watchlist))}</code>\n"
+        f"   交易層觀察：<code>{_esc(wl)}</code>\n"
         f"   掃描間隔：<code>{interval_s} 秒</code>\n"
-        f"   啟用策略：<code>日內爆發 + 左側埋伏</code>\n"
-        f"   單筆風險：<code>$100</code>，最多 <code>3</code> 倉位\n"
-        "\n🛰 開始監看市場..."
+        f"   啟用策略：<code>{_esc(strat)}</code>\n"
+        + risk_line +
+        "\n🛰 開始監看市場...（/strategies 看完整策略清單）"
     )
 
 
