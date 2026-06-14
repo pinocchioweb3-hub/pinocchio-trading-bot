@@ -19,6 +19,15 @@ from l2_trigger.types import MarketSnapshot, TriggerAction
 from .fire_queue import enqueue
 
 
+# v34：核心行情欄位（CoinGlass + Binance 雙源皆可補）。只有這些 stale 才代表
+# 真實資料源故障；進階衍生欄（cvd/清算/structure 等）stale 屬可接受降級，
+# 不納入 supervisor 的 data_quality_low 告警口徑（避免每 ~30 分誤報誣指主流幣）。
+CORE_FIELDS = frozenset({
+    "price", "ts", "oi", "oi_delta_pct",
+    "funding", "funding_predicted", "top_trader_ratio", "ls_ratio",
+})
+
+
 @dataclass
 class ScanSummary:
     scanned: int = 0
@@ -102,6 +111,7 @@ async def scan_once(watchlist_or_list, cooldown_seconds: int = 3600,
                 "btc_gate_open": snap.btc_gate_open, "btc_regime": snap.btc_regime,
                 "is_hot": snap.is_hot, "strength_score": snap.strength_score,
                 "stale_count": len(snap.stale_fields),
+                "core_stale_count": len(set(snap.stale_fields) & CORE_FIELDS),
             })
             # v23-5: 策略由註冊表驅動（取代寫死的 intraday）— 用戶可在 .env
             # STRATEGIES_ENABLED 自選；預設只有 intraday 為 live（行為不變）
@@ -156,6 +166,7 @@ async def scan_once(watchlist_or_list, cooldown_seconds: int = 3600,
                 "oi_delta_pct": snap.oi_delta_pct,
                 "btc_gate_open": snap.btc_gate_open,
                 "stale_count": len(snap.stale_fields),
+                "core_stale_count": len(set(snap.stale_fields) & CORE_FIELDS),
             })
         except Exception as e:
             summary.errors += 1

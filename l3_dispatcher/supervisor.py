@@ -101,18 +101,33 @@ async def run_health_checks(state: SupervisorState, source) -> list[HealthCheck]
                 detail={"last_scan_ago_sec": int(elapsed)},
             ))
 
-    # === 4. 資料品質：上次掃 stale_count 大宗 ===
+    # === 4. 資料品質：核心行情欄位多源中斷才告警 ===
+    # 口徑修正（v34）：只在「核心 8 欄」stale 時告警 —— 這些欄位 CoinGlass + Binance
+    # 雙源皆可補，連補值都失敗才代表真實資料源故障。進階衍生欄（cvd/清算/structure
+    # 等）為 CoinGlass 免費層獨有來源，偶發 stale 屬可接受降級，且下游決策對 stale
+    # 免疫（engine 把 STALE→HOLD/不計票），故不再告警，避免每 ~30 分誤報誣指主流幣、
+    # 淹沒真正的 source_down / scheduler_stalled 告警。
     if state.last_scan_summary:
         snapshots = state.last_scan_summary.get("snapshots", [])
         if snapshots:
-            avg_stale = sum(s.get("stale_count", 0) for s in snapshots) / len(snapshots)
-            if avg_stale >= 3:
-                stale_syms = [s["symbol"] for s in snapshots if s.get("stale_count", 0) >= 3]
+            avg_core_stale = sum(
+                s.get("core_stale_count", 0) for s in snapshots
+            ) / len(snapshots)
+            if avg_core_stale >= 2:
+                hit_syms = [
+                    s["symbol"] for s in snapshots
+                    if s.get("core_stale_count", 0) >= 2
+                ]
                 results.append(HealthCheck(
                     kind="data_quality_low",
                     severity="warn",
-                    message=f"上輪掃描平均 {avg_stale:.1f} 個欄位 stale，影響：{', '.join(stale_syms[:5])}",
-                    detail={"avg_stale": round(avg_stale, 1), "symbols": stale_syms},
+                    message=(
+                        f"核心行情多源中斷：平均 {avg_core_stale:.1f} 個核心欄位"
+                        f"連 Binance 補值都失敗"
+                        + (f"（影響 {', '.join(hit_syms[:5])}）" if hit_syms else "")
+                    ),
+                    detail={"avg_core_stale": round(avg_core_stale, 1),
+                            "symbols": hit_syms},
                 ))
 
     return results
