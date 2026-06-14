@@ -61,6 +61,43 @@ def count_open_us_paper() -> int:
         conn.close()
 
 
+async def _binance_us_xcheck(sym: str, okx_price: float | None) -> str:
+    """v33: Binance 美股永續第二來源交叉驗證（免key）。回 HTML 附註；無資料回空。"""
+    try:
+        from market_intel_mcp.sources.binance_perp import get_binance_perp
+        import asyncio as _a
+        src = get_binance_perp()
+
+        async def _s(c):
+            try:
+                return await c
+            except Exception:
+                return None
+        f, pos = await _a.gather(_s(src.get_funding(sym)),
+                                 _s(src.get_positioning(sym, "1h", 5)))
+        bn_price = f.get("mark_price") if isinstance(f, dict) and not f.get("error") else None
+        bn_ls = pos.get("latest") if isinstance(pos, dict) and not pos.get("error") else None
+        if bn_price is None and bn_ls is None:
+            return ""
+        parts = ["\n🔀 <b>跨所對照</b>（Binance 第二來源）"]
+        if bn_price and okx_price:
+            diff = abs(bn_price - okx_price) / okx_price * 100
+            if diff > 15.0:
+                # 差異過大＝兩所合約規格/拆分不同(非真背離)，略過價格對照避免誤導
+                parts.append("  （兩所合約規格不一致，價格不可直接比，略過）")
+            elif diff > 1.5:
+                parts.append(f"  ⚠️ 價格跨所背離 {diff:.1f}%：Binance "
+                             f"<code>{bn_price:,.4g}</code> vs OKX <code>{okx_price:,.4g}</code>（留意）")
+            else:
+                parts.append(f"  ✅ 價格一致：Binance <code>{bn_price:,.4g}</code> "
+                             f"vs OKX <code>{okx_price:,.4g}</code>，訊號較可信")
+        if bn_ls is not None:
+            parts.append(f"  Binance 大戶多空比 <code>{bn_ls:.2f}</code>（比值與規格無關，可參考）")
+        return "\n".join(parts) if len(parts) > 1 else ""
+    except Exception:
+        return ""
+
+
 def render_us_fire(d, sl_pct: float, stop: float, tps: dict,
                    paper_stats: dict) -> str:
     s = d.snapshot
@@ -198,6 +235,11 @@ async def run_us_signal_loop(tg, scan_interval: int = 900):
                                 _astats = await analogue_stats(
                                     sym, d.direction.value, snap.us_vol_mult)
                                 text += render_analogue_line(_astats)
+                            except Exception:
+                                pass
+                            # v33: Binance 美股永續第二來源交叉驗證（免key，OKX 仍主來源）
+                            try:
+                                text += await _binance_us_xcheck(sym, snap.price)
                             except Exception:
                                 pass
                             sig_mid = None
