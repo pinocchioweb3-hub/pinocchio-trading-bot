@@ -150,7 +150,7 @@ PER_SYMBOL_DEEPDIVE_PROMPT = """你是專業加密貨幣交易計畫師。針對
 - 4h 結構：是否在關鍵 S/R 區？有 Break of Structure 嗎？
 - 1h/15m：進場時機？
 
-<b>2. 數據面確認</b>（**強制：以下每項都必須引用「CoinGlass 數據佐證」區塊的具體數字**，不可只寫「偏多/偏空」這種空話）
+<b>2. 數據面確認</b>（**強制：OI／資金費率／多空比／CVD 一律以「CoinGlass 數據佐證」區塊為唯一來源、引用其具體數字**；不可引用其他來源或寫「偏多/偏空」空話。圖表與本文用同一份數據，數字必須一致）
 - CVD（累積成交量差）：引用最新值與斜率 → 主動買盤吸籌 / 主動賣盤派發？與價格背離了嗎？
 - OI 變化：引用 24h % → 增倉（趨勢延續）/ 減倉（獲利了結）？OI 升+價漲=健康多頭；OI 升+價跌=空頭加碼
 - Funding rate：引用 %/8h 數字 → 負/中/熱？是否擁擠到反指?
@@ -525,16 +525,19 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                 res_str = ", ".join(f"${r['price']}({r['distance_pct']}%)" for r in sr["resistances"][:2])
                 parts.append(f"   阻力: {res_str}")
 
-    # 即時數據
+    # 即時數據（v33：OI/資金費率/多空比 一律以下方「CoinGlass 數據佐證」為唯一來源，
+    #          這裡不再印，避免與圖表/佐證區塊數字打架）
     snap = sym_state.get("snapshot", {})
+    _has_cg = bool(sym_state.get("coinglass"))
     if snap and not snap.get("error"):
         parts.append(f"\n## 即時數據")
         parts.append(f"- 現價 ${snap.get('price')}")
-        parts.append(f"- OI: ${snap.get('oi', 0):,.0f}  24h 變化 {snap.get('oi_delta_pct', 0):+.2f}%")
-        funding = snap.get("funding", 0)
-        if funding is not None:
-            parts.append(f"- Funding: {funding*100:+.4f}%/8h")
-        parts.append(f"- 大戶持倉比: {snap.get('top_trader_ratio')}  vs 散戶: {snap.get('ls_ratio')}")
+        if not _has_cg:   # 無 CoinGlass 時才用快照的 OI/funding/多空比（fallback）
+            parts.append(f"- OI: ${snap.get('oi', 0):,.0f}  24h 變化 {snap.get('oi_delta_pct', 0):+.2f}%")
+            funding = snap.get("funding", 0)
+            if funding is not None:
+                parts.append(f"- Funding: {funding*100:+.4f}%/8h")
+            parts.append(f"- 大戶持倉比: {snap.get('top_trader_ratio')}  vs 散戶: {snap.get('ls_ratio')}")
         parts.append(f"- 24h 清算: 多 ${snap.get('liq_long', 0)/1e6:.2f}M  空 ${snap.get('liq_short', 0)/1e6:.2f}M")
         parts.append(f"- BTC 閘: {snap.get('btc_gate_open')}  regime: {snap.get('btc_regime')}")
         parts.append(f"- 強勢分數: {snap.get('strength_score')}")

@@ -99,6 +99,11 @@ def classify_wyckoff(candles: list[dict], cvd_slope: float | None = None,
     if flags:
         narrative += "｜" + "；".join(flags)
 
+    # v33 一致性：未進 Phase D/E 不顯示 SOS/SOW（避免「Phase B 卻標 SOS」自相矛盾；
+    # 那種多半是失敗突破/假 SOS，回到區間內，不應當確認事件呈現）
+    if not phase.startswith("Phase D"):
+        events = [ev for ev in events if ev["type"] not in ("SOS", "SOW")]
+
     return {"box_lo": box_lo, "box_hi": box_hi, "events": events,
             "phase": phase, "bias": bias, "context": context,
             "narrative": narrative, "caveat": "heuristic 推定，需人工複核"}

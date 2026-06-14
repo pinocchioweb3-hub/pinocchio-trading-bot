@@ -626,8 +626,12 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
                             # v18-F: 附 SMC 標記圖（v33 帶計畫線；失敗不阻塞）
                             try:
                                 from .chart_render import render_symbol_chart
+                                # v33: 傳 deepdive 已抓的同一份 CoinGlass+Wyckoff，圖文同源不打架
+                                _ov = dict(sym_state.get("coinglass") or {})
+                                _ov["wyckoff"] = sym_state.get("wyckoff")
                                 chart = await render_symbol_chart(sym, "4h", 120,
-                                                                  plan=chart_plan)
+                                                                  plan=chart_plan,
+                                                                  overlays=_ov)
                                 if chart:
                                     cap = f"📐 {sym} 4H SMC＋全指標結構圖"
                                     if chart_plan:

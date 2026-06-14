@@ -51,7 +51,7 @@ def _vol(c: dict) -> float:
     return 0.0
 
 
-def _compute_snr(candles: list[dict], n_levels: int = 3) -> dict:
+def _compute_snr(candles: list[dict], n_levels: int = 2) -> dict:
     """從近期 swing 高低密集區算支撐壓力『區帶』。
     v33：只保留觸及次數 >=3 的密集區（剔除單次雜訊線；不足則放寬到 >=2）；
     回 {resistance:[(price,cnt,lo,hi)...], support:[...]}（含區帶上下緣供畫 axhspan）。"""
@@ -83,11 +83,11 @@ def _compute_snr(candles: list[dict], n_levels: int = 3) -> dict:
         return clusters
 
     def _pick(clusters, keep, want):
-        # 先取觸及 >=3 的；不足補 >=2；再不足放任何
-        for thr in (3, 2, 1):
+        # v33：只留密集區——先 >=3 次、不足補 >=2 次；單次觸及(雜訊)一律不畫
+        for thr in (3, 2):
             sel = sorted([c for c in clusters if c[1] >= thr and keep(c[0])],
                          key=lambda x: -x[1])
-            if len(sel) >= want or thr == 1:
+            if len(sel) >= want or thr == 2:
                 return [(round(c[0], 10), c[1], c[2], c[3]) for c in sel[:want]]
         return []
 
@@ -619,8 +619,10 @@ async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
 
 
 async def render_symbol_chart(symbol: str, tf: str = "4h", bars: int = 120,
-                              plan: dict | None = None) -> Path | None:
-    """抓數據 + 算 SMC + CoinGlass 疊加 + 渲染。失敗回 None（絕不阻塞呼叫端）。"""
+                              plan: dict | None = None,
+                              overlays: dict | None = None) -> Path | None:
+    """抓數據 + 算 SMC + CoinGlass 疊加 + 渲染。失敗回 None（絕不阻塞呼叫端）。
+    v33：overlays 可由呼叫端傳入（deepdive 已抓的同一份 CoinGlass），避免圖文數據打架。"""
     try:
         from market_intel_mcp.smc_levels import compute_smc_levels
         from market_intel_mcp.sources.okx_candles import OkxCandlesSource
@@ -635,15 +637,20 @@ async def render_symbol_chart(symbol: str, tf: str = "4h", bars: int = 120,
         smc = compute_smc_levels(candles)
         if smc.get("error"):
             smc = {}
-        overlays = await _fetch_coinglass_overlays(symbol, tf, len(candles))
-        # v33: Wyckoff heuristic 階段（用 CVD/OI 做 effort-vs-result 驗證）
-        try:
-            from market_intel_mcp.wyckoff import classify_wyckoff
-            overlays["wyckoff"] = classify_wyckoff(
-                candles, cvd_slope=overlays.get("cvd_slope"),
-                oi_delta_pct=overlays.get("oi_delta_24h"))
-        except Exception:
-            pass
+        # v33: 優先用呼叫端傳入的 overlays（與文章同源）；無才自行抓
+        if overlays is None:
+            overlays = await _fetch_coinglass_overlays(symbol, tf, len(candles))
+        else:
+            overlays = dict(overlays)
+        # v33: Wyckoff heuristic（呼叫端已附就沿用，確保圖文一致；否則自算）
+        if not overlays.get("wyckoff"):
+            try:
+                from market_intel_mcp.wyckoff import classify_wyckoff
+                overlays["wyckoff"] = classify_wyckoff(
+                    candles, cvd_slope=overlays.get("cvd_slope"),
+                    oi_delta_pct=overlays.get("oi_delta_24h"))
+            except Exception:
+                pass
         return render_smc_chart(symbol, candles, smc, tf=tf, plan=plan, overlays=overlays)
     except Exception as e:
         print(f"[chart] {symbol} error: {type(e).__name__}: {e}")
