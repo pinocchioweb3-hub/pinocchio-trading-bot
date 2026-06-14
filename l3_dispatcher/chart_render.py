@@ -110,6 +110,42 @@ def _atr(candles: list[dict], period: int = 14) -> float:
     return sum(trs[-period:]) / min(len(trs), period)
 
 
+def detect_structure_breaks(candles: list[dict], swings: list[dict]) -> list[dict]:
+    """v33 自寫 BOS/CHoCH（smartmoneyconcepts 只給 BOS）。
+    收盤反向突破前一對向 swing 極值=CHoCH(轉勢)；順勢突破=BOS(續勢)。
+    回 [{type:'BOS'|'CHoCH', direction:'bull'|'bear', idx, level}]（最近 6 個）。"""
+    n = len(candles)
+    pts = sorted(
+        [(n - 1 - int(s.get("ago_bars") or 0), s.get("type"), s.get("level"))
+         for s in (swings or [])
+         if s.get("level") is not None
+         and 0 <= n - 1 - int(s.get("ago_bars") or 0) < n],
+        key=lambda x: x[0])
+    if not pts:
+        return []
+    breaks, trend = [], None
+    active_high = active_low = None   # (idx, level)
+    pi = 0
+    for i in range(n):
+        while pi < len(pts) and pts[pi][0] <= i:
+            _idx, _t, _lv = pts[pi]
+            if _t == "high":
+                active_high = (_idx, _lv)
+            else:
+                active_low = (_idx, _lv)
+            pi += 1
+        c = candles[i]["close"]
+        if active_high and i > active_high[0] and c > active_high[1]:
+            breaks.append({"type": "BOS" if trend == "up" else "CHoCH",
+                           "direction": "bull", "idx": i, "level": active_high[1]})
+            trend, active_high = "up", None
+        elif active_low and i > active_low[0] and c < active_low[1]:
+            breaks.append({"type": "BOS" if trend == "down" else "CHoCH",
+                           "direction": "bear", "idx": i, "level": active_low[1]})
+            trend, active_low = "down", None
+    return breaks[-6:]
+
+
 def _detect_sweeps(candles: list[dict], swings: list[dict], n: int,
                    lookahead: int = 6) -> list[dict]:
     """v33：偵測流動性掃單（liquidity sweep）。
@@ -290,18 +326,18 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                     va="bottom", alpha=0.95, zorder=4,
                     bbox=dict(boxstyle="round,pad=0.12", fc=BG, ec=color, lw=0.4, alpha=0.7))
 
-        # === BoS / CHoCH（v33：CHoCH 實線=結構反轉、BOS 點線=趨勢延續，只留最近 3）===
-        for b in (smc.get("bos_choch") or [])[:3]:
-            x0 = max(0, n - 1 - int(b.get("ago_bars") or 0))
-            color = UP if b.get("direction") == "bull" else DOWN
-            typ = (b.get("type") or "BOS").upper()
-            is_choch = "CHOCH" in typ or "CHANGE" in typ
+        # === BoS / CHoCH（v33：自寫偵測；CHoCH 實線=結構反轉、BOS 點線=趨勢延續）===
+        for b in detect_structure_breaks(candles, smc.get("swing_points") or [])[-3:]:
+            x0 = b["idx"]
+            color = UP if b["direction"] == "bull" else DOWN
+            is_choch = b["type"] == "CHoCH"
             ax.plot([x0, min(x0 + 12, n - 1)], [b["level"], b["level"]],
-                    color=color, linewidth=1.1,
+                    color=color, linewidth=1.2,
                     linestyle="-" if is_choch else (0, (1, 2)),
                     alpha=0.9, zorder=2)
-            ax.text(x0, b["level"], "CHoCH" if is_choch else "BOS", color=color,
-                    fontsize=6.8, va="bottom", alpha=0.95, zorder=4)
+            ax.text(x0, b["level"], b["type"], color=color,
+                    fontsize=7, va="bottom",
+                    fontweight="bold" if is_choch else "normal", alpha=0.95, zorder=4)
 
         # === Swing 高低點（v28: 標 HH/HL/LH/LL；v33: 加結構鋸齒連線一眼看懂市場結構）===
         swings = sorted((smc.get("swing_points") or []),

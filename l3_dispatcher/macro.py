@@ -441,6 +441,16 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
     if isinstance(c_4h, dict) and not c_4h.get("error"):
         c4 = c_4h.get("candles", [])
         smc_levels["4h"] = compute_smc_levels(c4, swing_length=10)
+        # v33: 自寫 BOS/CHoCH 取代套件只給 BOS（讓文章也標得出轉勢 CHoCH）
+        try:
+            from .chart_render import detect_structure_breaks
+            _n4 = len(c4)
+            _brs = detect_structure_breaks(c4, smc_levels["4h"].get("swing_points") or [])
+            smc_levels["4h"]["bos_choch"] = [
+                {"type": b["type"], "direction": b["direction"], "level": b["level"],
+                 "ago_bars": _n4 - 1 - b["idx"]} for b in _brs]
+        except Exception:
+            pass
         try:
             from market_intel_mcp.regime import classify_regime
             regime = classify_regime(c4)   # v33: 市場狀態標籤
