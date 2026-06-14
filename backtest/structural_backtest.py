@@ -19,6 +19,7 @@ from statistics import mean, pstdev
 from .data_loader import get_ohlc
 from .simulator import simulate
 from .metrics import aggregate
+from .validation import assess
 
 
 def _gate_from_4h(btc4h: list[dict], period: int = 200) -> list[tuple]:
@@ -125,18 +126,21 @@ async def run_structural_backtest(symbols: list[str] | None = None,
         trades = _replay_structural(sym, candles, gate_series)
         all_trades.extend(trades)
         m = aggregate(trades)
+        va = assess([t.realized_r for t in trades])
         out[sym] = {"n": m.n_trades, "win_rate": round(m.win_rate * 100, 1),
                     "expectancy_r": round(m.expectancy_r, 3),
                     "profit_factor": round(m.profit_factor, 2),
                     "max_consec_losses": m.max_consecutive_losses,
-                    "sharpe_per_trade": round(_sharpe(trades), 3),
+                    "psr": va.get("psr"), "min_trl": va.get("min_trl"),
                     "bars": len(candles)}
     om = aggregate(all_trades)
+    ova = assess([t.realized_r for t in all_trades])
     out["_overall"] = {"n": om.n_trades, "win_rate": round(om.win_rate * 100, 1),
                        "expectancy_r": round(om.expectancy_r, 3),
                        "profit_factor": round(om.profit_factor, 2),
                        "max_consec_losses": om.max_consecutive_losses,
-                       "sharpe_per_trade": round(_sharpe(all_trades), 3)}
+                       "psr": ova.get("psr"), "dsr": ova.get("dsr"),
+                       "min_trl": ova.get("min_trl"), "verdict": ova.get("verdict")}
     return out
 
 
