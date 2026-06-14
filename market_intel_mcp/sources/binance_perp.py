@@ -4,7 +4,10 @@
 - 全部公開端點、免 API key（守住「秘鑰不入聊天室/不餵」紅線）。
 - 限速比 OKX 寬鬆（2400 weight/min）；讀 X-MBX-USED-WEIGHT-1m 退讓。
 - 提供 K線 / mark+funding / funding 歷史 / OI 現值+歷史 / taker 多空量比 / 大戶帳戶多空比。
-- 原生多空比可省 CoinGlass 額度；美股永續 Binance 已無（2021 下架），故只覆蓋加密永續。
+- 原生多空比可省 CoinGlass 額度。
+- v33 更正：Binance **有** 美股永續（contractType=TRADIFI_PERPETUAL，underlyingType
+  EQUITY/PREMARKET/KR_EQUITY，含 NVDA/TSLA/ANTHROPIC 等，免 key，已即時複驗）。
+  本來源同時覆蓋加密永續與美股永續，list_equity_symbols() 可取股票類清單。
 
 注意：base 'BTC' → 'BTCUSDT'。period 端點僅支援 5m/15m/30m/1h/2h/4h/6h/12h/1d。
 """
@@ -196,6 +199,40 @@ class BinancePerpSource:
                 continue
         return {"symbol": symbol, "source": self.name, "series": series,
                 "latest": series[-1]["value"] if series else None}
+
+    async def get_global_positioning(self, symbol: str, interval: str = "4h",
+                                     limit: int = 60) -> dict:
+        """全體（散戶為主）帳戶多空比序列（globalLongShortAccountRatio）。
+        與 get_positioning（大戶）併用，背離＝實證逆勢訊號。"""
+        period = self._stat_period(interval)
+        body = await self._get("/futures/data/globalLongShortAccountRatio",
+                               {"symbol": self._sym(symbol), "period": period,
+                                "limit": min(limit, 500)},
+                               symbol, "mi_get_global_positioning")
+        if isinstance(body, dict) and body.get("error"):
+            return body
+        series = []
+        for d in (body or []):
+            try:
+                series.append({"ts": int(d["timestamp"]),
+                               "value": float(d["longShortRatio"])})
+            except (KeyError, TypeError, ValueError):
+                continue
+        return {"symbol": symbol, "source": self.name, "series": series,
+                "latest": series[-1]["value"] if series else None}
+
+    async def list_equity_symbols(self) -> dict:
+        """v33: 列出 Binance 美股類永續 base symbol（EQUITY/PREMARKET/KR_EQUITY）。"""
+        body = await self._get("/fapi/v1/exchangeInfo", {}, "NVDA", "mi_list_equity")
+        if isinstance(body, dict) and body.get("error"):
+            return body
+        bases = []
+        for s in (body.get("symbols") or []):
+            if (s.get("underlyingType") in ("EQUITY", "PREMARKET", "KR_EQUITY")
+                    and s.get("quoteAsset") == "USDT"
+                    and s.get("status") == "TRADING"):
+                bases.append(s.get("baseAsset"))
+        return {"source": self.name, "count": len(bases), "symbols": bases}
 
     async def get_taker_ratio(self, symbol: str, interval: str = "4h",
                               limit: int = 60) -> dict:
