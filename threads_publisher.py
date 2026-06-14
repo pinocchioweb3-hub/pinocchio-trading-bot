@@ -204,8 +204,8 @@ async def refresh_token_if_needed(force: bool = False) -> str:
 
 # ── 發布 ────────────────────────────────────────────────────────────────
 
-async def publish_text(text: str) -> dict:
-    """兩段式發布。回 {ok, post_id?|error}。"""
+async def publish_text(text: str, reply_to_id: str | None = None) -> dict:
+    """兩段式發布。reply_to_id 非空時發成「回覆」（用於串文鏈接）。回 {ok, post_id?|error}。"""
     text = (text or "").strip()
     if not text:
         return {"ok": False, "error": "empty"}
@@ -220,11 +220,12 @@ async def publish_text(text: str) -> dict:
         if not me:
             return {"ok": False, "error": "token_invalid (whoami failed)"}
         uid = me["id"]
-    # 1) 建立 media container
-    create = await _api_post(f"{API_BASE}/{uid}/threads", {
-        "media_type": "TEXT", "text": text,
-        "access_token": tok["access_token"],
-    })
+    # 1) 建立 media container（reply_to_id → 串文鏈接）
+    _params = {"media_type": "TEXT", "text": text,
+               "access_token": tok["access_token"]}
+    if reply_to_id:
+        _params["reply_to_id"] = reply_to_id
+    create = await _api_post(f"{API_BASE}/{uid}/threads", _params)
     cid = create.get("id")
     if not cid:
         return {"ok": False, "error": f"create: {str(create)[:200]}"}
