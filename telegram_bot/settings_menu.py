@@ -20,6 +20,9 @@ def render_settings() -> tuple[str, list[list[dict]]]:
     from l2_trigger.registry import REGISTRY, enabled_strategies
 
     enabled_ids = {m.id for m in enabled_strategies()}
+    _mode = get_str("SIGNAL_MODE", "balanced")
+    _mode_zh = {"steady": "🛡️ 穩健（低頻高質）", "balanced": "⚖️ 平衡",
+                "aggressive": "🔥 積極（高頻高波動）"}.get(_mode, "⚖️ 平衡")
     if CONFIG.risk_per_trade_pct > 0:
         risk_line = (f"帳戶 <b>{CONFIG.risk_per_trade_pct:g}%</b>"
                      f"（≈ ${CONFIG.risk_per_trade_usd:,.0f}／筆，本金 ${CONFIG.account_balance_usd:,.0f}）")
@@ -31,11 +34,17 @@ def render_settings() -> tuple[str, list[list[dict]]]:
         "━━━━━━━━━━━━━━━━\n"
         f"💰 單筆風險（1R）：{risk_line}\n"
         f"📊 最多同時持倉：<b>{CONFIG.max_concurrent_trades}</b> 倉\n"
+        f"🎚️ 訊號模式：<b>{_mode_zh}</b>\n"
         f"🎯 啟用策略：<b>{len(enabled_ids)}</b> 個\n"
         "\n<i>點按鈕即時調整，立刻套用到下一筆訊號。</i>"
     )
 
     buttons: list[list[dict]] = []
+    # 訊號模式（單選：穩健只在強匯合+regime相符才推；積極放寬+含異常）
+    def _mb(label, val):
+        return _btn(("● " if _mode == val else "") + label, f"set:mode:{val}")
+    buttons.append([_mb("🛡️穩健", "steady"), _mb("⚖️平衡", "balanced"),
+                    _mb("🔥積極", "aggressive")])
     # 風險 % 預設
     buttons.append([_btn("風險 1%", "set:riskpct:1"), _btn("2%", "set:riskpct:2"),
                     _btn("3%", "set:riskpct:3"), _btn("5%", "set:riskpct:5")])
@@ -81,6 +90,11 @@ async def handle_settings_callback(tg, cq: dict) -> bool:
         elif action == "max":
             set_override("MAX_CONCURRENT_TRADES", int(parts[2]))
             note = f"最多持倉改為 {parts[2]} 倉"
+        elif action == "mode":
+            mv = parts[2] if len(parts) > 2 else "balanced"
+            set_override("SIGNAL_MODE", mv)
+            note = "訊號模式改為 " + {"steady": "🛡️穩健", "balanced": "⚖️平衡",
+                                      "aggressive": "🔥積極"}.get(mv, mv)
         elif action == "strat":
             sid = parts[2]
             from l2_trigger.registry import REGISTRY, enabled_strategies

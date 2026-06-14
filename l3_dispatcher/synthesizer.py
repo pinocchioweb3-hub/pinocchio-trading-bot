@@ -469,6 +469,19 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
     """組 per-symbol deep dive 用的單一標的全資料摘要（含 SMC 量化指標 + 帳戶約束）"""
     parts = [f"# {symbol} 完整數據\n"]
 
+    # v33：使用者選的訊號模式 → 調整「可做單」嚴格度（穩健少而精／積極多而廣）
+    try:
+        from botconfig import get_str
+        _mode = get_str("SIGNAL_MODE", "balanced")
+    except Exception:
+        _mode = "balanced"
+    _mode_rule = {
+        "steady": "🛡️ 穩健模式：寧缺勿濫。**只有在 regime 相符 + 真實獨立確認 ≥2 桶 + RR≥1.5 時才 actionable=true**，否則一律觀望。",
+        "balanced": "⚖️ 平衡模式：獨立確認 ≥2 桶且與 regime 相符可做單；邊緣情況偏保守。",
+        "aggressive": "🔥 積極模式：可放寬到獨立確認 ≥1 桶、含逆勢/異常機會，但**必須在文中明確標註風險較高、勝率較低**。",
+    }.get(_mode, "⚖️ 平衡模式")
+    parts.append(f"## 🎚️ 訊號模式：{_mode_rule}\n")
+
     # === 使用者帳戶約束（重要：Claude 算倉位時必須遵守）===
     parts.append("## ⚠️ 帳戶約束（必須遵守）")
     parts.append("- 帳戶實際 margin: $500-800 USDT（小資金，不能超倉）")
