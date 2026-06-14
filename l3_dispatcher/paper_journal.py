@@ -302,6 +302,9 @@ def get_paper_stats(days: int = 30, setup: str | None = None,
         wins = [r for r in closed if (r[2] or 0) > 0]
         total_pnl = sum(r[1] or 0 for r in closed)
         rs = [r[2] or 0 for r in closed]
+        gain = sum(r for r in rs if r > 0)
+        loss = abs(sum(r for r in rs if r < 0))
+        pf = (gain / loss) if loss > 0 else (float("inf") if gain > 0 else 0.0)
         return {
             "window_days": days,
             "n_closed": len(closed),
@@ -310,6 +313,7 @@ def get_paper_stats(days: int = 30, setup: str | None = None,
             "win_rate_pct": round(len(wins) / len(closed) * 100, 1) if closed else 0.0,
             "total_pnl_usd": round(total_pnl, 2),
             "avg_r": round(sum(rs) / len(rs), 3) if rs else 0.0,
+            "profit_factor": round(pf, 2) if pf != float("inf") else None,
             "stage0_progress": f"{len(closed)}/100",  # 自動交易 Stage 1 門檻
         }
     finally:

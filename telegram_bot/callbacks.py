@@ -244,6 +244,41 @@ async def _cmd_stats(args: list[str]) -> str:
     return render_stats_summary(get_stats(days), label=f"📊 績效統計")
 
 
+async def _cmd_profit(args: list[str]) -> str:
+    """/profit [天數] 公開績效卡（紙上驗證階段，誠實版）。"""
+    from l3_dispatcher.paper_journal import get_paper_stats, get_paper_funnel
+    try:
+        days = int(args[0]) if args else 30
+    except ValueError:
+        days = 30
+    days = max(1, min(days, 365))
+
+    def _card(title: str, s: dict) -> str:
+        pf = s.get("profit_factor")
+        pf_s = f"{pf}" if pf is not None else "∞"
+        return (f"{title}：{s['n_closed']} 筆平倉｜勝率 {s['win_rate_pct']}%｜"
+                f"期望值 {s['avg_r']:+.2f}R｜PF {pf_s}｜累計 {s['total_pnl_usd']:+.0f}U"
+                f"（進行中 {s['n_open']}）")
+    crypto = get_paper_stats(days, setup_not="us_breakout")
+    us = get_paper_stats(days, setup="us_breakout")
+    try:
+        funnel = get_paper_funnel(days, setup_not="us_breakout")
+        fline = (f"漏斗（加密）：提出 {funnel.get('proposed', '?')}／真正進場 "
+                 f"{funnel.get('entered', '?')}／未成交 {funnel.get('never_filled', '?')}")
+    except Exception:
+        fline = ""
+    lines = [f"📊 <b>公開績效卡</b>（近 {days} 天・<b>紙上驗證階段、未動真錢</b>）",
+             "━━━━━━━━━━━━━━━━",
+             _card("🪙 加密", crypto),
+             _card("🇺🇸 美股", us)]
+    if fline:
+        lines.append(fline)
+    lines.append(f"Stage1 門檻：{crypto.get('stage0_progress')}"
+                 f"（紙上100筆＋實倉30筆正期望才動真錢）")
+    lines.append("<i>紙上模擬、回測已扣手續費滑點；不保證獲利、連輸的單都公開。</i>")
+    return "\n".join(lines)
+
+
 def _cmd_help() -> str:
     return (
         "🤖 <b>可用指令</b>\n"
@@ -252,6 +287,8 @@ def _cmd_help() -> str:
         "📋 /strategies — 完整策略清單（已驗證/紙上/開發中）\n"
         "/status — 系統儀表板（持倉/待確認/PnL/風控）\n"
         "/stats [天數] — 績效統計（預設 7 天）\n"
+        "📊 /profit [天數] — 公開績效卡（勝率/期望值/PF，加密+美股分開）\n"
+        "/daily ・ /weekly — 當日／本週績效\n"
         "/contrib — 💡 貢獻積分排行榜\n"
         "/myscore — 查自己的積分與占比\n"
         "/help — 本清單\n\n"
@@ -347,6 +384,12 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
         reply = await _cmd_status()
     elif cmd == "stats":
         reply = await _cmd_stats(args)
+    elif cmd == "profit":
+        reply = await _cmd_profit(args)
+    elif cmd == "daily":
+        reply = await _cmd_profit(["1"])
+    elif cmd == "weekly":
+        reply = await _cmd_profit(["7"])
     elif cmd == "contrib":
         from .community import render_leaderboard
         reply = render_leaderboard()
