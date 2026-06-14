@@ -39,7 +39,8 @@ def analyze_setup(setup: str, days: int = 60) -> dict:
     try:
         rows = conn.execute(
             "SELECT realized_r, exit_reason, legs_hit, pnl_usd FROM paper_trades "
-            "WHERE setup=? AND status='closed' AND entry_at>=?", (setup, cutoff)).fetchall()
+            "WHERE setup=? AND status='closed' AND IFNULL(exit_reason,'')!='entry_expired' "
+            "AND entry_at>=?", (setup, cutoff)).fetchall()  # v33: 掛單逾時作廢非真實交易，排除於調參樣本
     finally:
         conn.close()
     n = len(rows)

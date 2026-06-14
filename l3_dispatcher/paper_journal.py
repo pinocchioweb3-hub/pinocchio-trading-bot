@@ -186,6 +186,26 @@ def apply_entry_fill(paper_id: int, live_price: float) -> dict | None:
         conn.close()
 
 
+def expire_pending(paper_id: int) -> bool:
+    """v33: 掛單逾時作廢 — 從未成交（entry_state='pending'，0% filled）的分批限價單
+    超過時限，標記為 status='closed'、exit_reason='entry_expired'、0R，避免未成交掛單
+    永久佔用 open/pending 計數。
+    SQL 內建 entry_state='pending' 護欄：partial/full 一律不碰（交給 TP/SL/timeout 流程）。
+    回 True 表示確實作廢了一筆（找不到或非 pending 則回 False）。"""
+    init_db()
+    conn = _conn()
+    try:
+        now_ms = int(time.time() * 1000)
+        cur = conn.execute(
+            "UPDATE paper_trades SET status='closed', exit_reason='entry_expired', "
+            "realized_r=0, pnl_usd=0, size_remaining=0, exit_at=? "
+            "WHERE id=? AND status='open' AND entry_state='pending'",
+            (now_ms, paper_id))
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def open_paper_symbols(setup: str | None = None) -> set:
     """v33：回目前 open（含 pending 等待觸發）的紙上倉位 symbol 集合，供 deepdive 去重。"""
     init_db()
@@ -288,7 +308,7 @@ def get_paper_stats(days: int = 30, setup: str | None = None,
     conn = _conn()
     try:
         cutoff = int(time.time() * 1000) - days * 86400 * 1000
-        sql = "SELECT status, pnl_usd, realized_r FROM paper_trades WHERE entry_at >= ?"
+        sql = "SELECT status, pnl_usd, realized_r, exit_reason FROM paper_trades WHERE entry_at >= ?"
         args: list = [cutoff]
         if setup:
             sql += " AND setup=?"
@@ -297,7 +317,9 @@ def get_paper_stats(days: int = 30, setup: str | None = None,
             sql += " AND setup != ?"
             args.append(setup_not)
         rows = conn.execute(sql, args).fetchall()
-        closed = [r for r in rows if r[0] == "closed"]
+        # v33: entry_expired（掛單從未成交的逾時作廢）不是真實交易 —
+        #   排除於期望值/勝率/Stage1 門檻；它只該出現在漏斗的 never_filled。
+        closed = [r for r in rows if r[0] == "closed" and (r[3] or "") != "entry_expired"]
         opens = [r for r in rows if r[0] == "open"]
         wins = [r for r in closed if (r[2] or 0) > 0]
         total_pnl = sum(r[1] or 0 for r in closed)
@@ -337,7 +359,8 @@ def get_paper_funnel(days: int = 30, setup_not: str | None = None) -> dict:
         never_filled = sum(1 for r in rows if (r[2] or 0) == 0)      # 掛單從未觸及=無效
         partial = sum(1 for r in rows if 0 < (r[2] or 0) < 0.999)
         in_progress = sum(1 for r in rows if r[0] == "open" and (r[2] or 0) > 0)
-        closed = [r for r in rows if r[0] == "closed"]
+        # v33: entry_expired 已計入 never_filled（filled_pct==0），不重複算進「已平倉」
+        closed = [r for r in rows if r[0] == "closed" and (r[3] or "") != "entry_expired"]
         tp_wins = sum(1 for r in closed if (r[4] or 0) > 0)
         sl_losses = sum(1 for r in closed if (r[4] or 0) < 0)
         timeouts = sum(1 for r in closed if "timeout" in (r[3] or ""))

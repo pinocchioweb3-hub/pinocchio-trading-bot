@@ -43,9 +43,11 @@ def _fetch_closed(n: int) -> list[dict]:
             "SELECT symbol, setup, direction, entry_price, stop_price, "
             "pnl_usd, realized_r, exit_reason, legs_hit, entry_at, exit_at "
             "FROM paper_trades WHERE status='closed' "
+            "AND IFNULL(exit_reason,'')!='entry_expired' "  # v33: 掛單逾時作廢不上成績卡牆／不計 Stage1 門檻
             "ORDER BY exit_at DESC LIMIT ?", (n,)).fetchall()
         total_closed = conn.execute(
-            "SELECT COUNT(*) FROM paper_trades WHERE status='closed'").fetchone()[0]
+            "SELECT COUNT(*) FROM paper_trades WHERE status='closed' "
+            "AND IFNULL(exit_reason,'')!='entry_expired'").fetchone()[0]
     finally:
         conn.close()
     out = []

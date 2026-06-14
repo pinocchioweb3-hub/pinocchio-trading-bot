@@ -38,6 +38,11 @@ DEFAULT_HOLD_MAX_HOURS = int(os.getenv("HOLD_MAX_HOURS", "48"))
 # v17: per-setup 持倉時限（美股突破 24h）
 HOLD_MAX_BY_SETUP = {"us_breakout": 24}
 
+# v33: 分批限價掛單「從未成交（0% filled）」的逾時作廢時限。
+#   超過此時數仍 pending 就取消（紙上，0R），避免未成交掛單永久佔用 open/pending 計數。
+#   partial（已部分成交）不適用此限，改由 HOLD_MAX_* 的 timeout 流程處理。
+PENDING_MAX_HOURS = int(os.getenv("PENDING_MAX_HOURS", "12"))
+
 
 @dataclass
 class MonitorEvent:
@@ -330,11 +335,12 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
 
     v23-2 美股斷層修復：us_breakout 的事件發 tg_us（🇺🇸 美股主題）—
     進場通知在哪、出場事件就在哪；加密事件留 tg（📈 持倉與績效）。"""
-    from .paper_journal import (apply_entry_fill, apply_paper_event,
+    from .paper_journal import (apply_entry_fill, apply_paper_event, expire_pending,
                                 get_open_paper, get_paper_stats, get_pending_entries)
 
     # v26: 先檢查分批限價單的進場成交 — 達到某格區間就推「進場進度」到持倉主題
     pending = get_pending_entries()
+    now_ms = int(time.time() * 1000)
     for pe in pending:
         sym = pe["symbol"]
         bars = bars_cache.get(sym)
@@ -342,25 +348,46 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
             d = await _get_recent_5m_bars(source, sym, n=4)
             bars = d["candles"] if d and d.get("candles") else None
             bars_cache[sym] = bars or []
-        if not bars:
-            continue
-        live = bars[-1]["close"]
-        fill = apply_entry_fill(pe["id"], live)
-        if fill and (tg or tg_us) is not None:
-            dir_zh = "做多" if pe["direction"] == "bull" else "做空"
-            filled_pct = int(fill["filled_pct"] * 100)
-            done = "✅ 全部進場完成" if fill["state"] == "full" else f"⏳ 已進場 {filled_pct}%（其餘掛單等待中）"
-            legs = "、".join(f"{int(s['frac']*100)}% @ <code>${s['price']:,.6g}</code>"
-                             for s in fill["newly_filled"])
-            txt = (f"📥 <b>{sym} {dir_zh} 分批進場觸發</b>\n"
-                   f"━━━━━━━━━━━━━━━━\n"
-                   f"本次成交：{legs}\n現價 <code>${live:,.6g}</code>　{done}\n"
-                   f"<i>已轉入持倉追蹤，每 15 分鐘更新進度與損益（紙上）</i>")
-            target = tg_us if (pe.get("setup") == "us_breakout" and tg_us) else tg
-            try:
-                await target.send_message(txt, parse_mode="HTML")
-            except Exception as e:
-                print(f"[trade_monitor] entry-fill push error: {e}")
+        fill = None
+        if bars:
+            live = bars[-1]["close"]
+            fill = apply_entry_fill(pe["id"], live)
+            if fill and (tg or tg_us) is not None:
+                dir_zh = "做多" if pe["direction"] == "bull" else "做空"
+                filled_pct = int(fill["filled_pct"] * 100)
+                done = "✅ 全部進場完成" if fill["state"] == "full" else f"⏳ 已進場 {filled_pct}%（其餘掛單等待中）"
+                legs = "、".join(f"{int(s['frac']*100)}% @ <code>${s['price']:,.6g}</code>"
+                                 for s in fill["newly_filled"])
+                txt = (f"📥 <b>{sym} {dir_zh} 分批進場觸發</b>\n"
+                       f"━━━━━━━━━━━━━━━━\n"
+                       f"本次成交：{legs}\n現價 <code>${live:,.6g}</code>　{done}\n"
+                       f"<i>已轉入持倉追蹤，每 15 分鐘更新進度與損益（紙上）</i>")
+                target = tg_us if (pe.get("setup") == "us_breakout" and tg_us) else tg
+                try:
+                    await target.send_message(txt, parse_mode="HTML")
+                except Exception as e:
+                    print(f"[trade_monitor] entry-fill push error: {e}")
+
+        # v33: 掛單逾時作廢 — 僅「仍 0% 成交（pending）」且掛單已超過 PENDING_MAX_HOURS。
+        #   時間判定不需現價，故即使抓不到 K 線（下市／無報價）也能作廢，避免永久殘留。
+        #   partial（已部分成交）不在此處作廢，由 get_open_paper 的 timeout 流程處理。
+        state_now = fill["state"] if fill else pe["entry_state"]
+        if state_now == "pending" and (now_ms - pe["entry_at"]) >= PENDING_MAX_HOURS * 3600 * 1000:
+            if expire_pending(pe["id"]):
+                age_h = (now_ms - pe["entry_at"]) / 3_600_000
+                print(f"[trade_monitor] 🗑️ pending expired: {sym} {pe['direction']} "
+                      f"({age_h:.1f}h ≥ {PENDING_MAX_HOURS}h, 0% filled)")
+                if (tg or tg_us) is not None:
+                    dir_zh = "做多" if pe["direction"] == "bull" else "做空"
+                    txt = (f"🗑️ <b>{sym} {dir_zh} 掛單逾時作廢</b>\n"
+                           f"━━━━━━━━━━━━━━━━\n"
+                           f"掛單 {age_h:.0f}h 未觸及進場價（0% 成交），已自動取消（紙上，0R）\n"
+                           f"<i>避免未成交掛單長期佔用持倉計數</i>")
+                    target = tg_us if (pe.get("setup") == "us_breakout" and tg_us) else tg
+                    try:
+                        await target.send_message(txt, parse_mode="HTML")
+                    except Exception as e:
+                        print(f"[trade_monitor] pending-expire push error: {e}")
 
     papers = get_open_paper()
     if not papers:
