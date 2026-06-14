@@ -53,6 +53,9 @@ class HistoryPoint:
 
     # 標記（給 backtest 報告用，不影響 L2 評估）
     event_tag: str = ""    # "squeeze" | "accumulation" | "noise" | ""
+    # v33: 盤中高低（給 simulator 用 high/low 判 stop/tp 觸及，取代只看 close）
+    high: float = 0.0
+    low: float = 0.0
 
 
 # 每幣的基準值（與 mock.py 一致）

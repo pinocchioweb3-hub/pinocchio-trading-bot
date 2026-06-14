@@ -42,6 +42,41 @@ from .report import render_summary, render_trade_log
 from .simulator import simulate
 
 
+_BTC_GATE_SERIES: list | None = None
+
+
+async def _btc_gate_series() -> list:
+    """v33: 取 BTC 4h 200MA 序列當回測 btc_gate 真值（取代寫死 True，那會嚴重高估）。
+    回 [(ts_ms, above_200ma 或 None)] 升序。快取：整批回測只抓一次。"""
+    global _BTC_GATE_SERIES
+    if _BTC_GATE_SERIES is not None:
+        return _BTC_GATE_SERIES
+    try:
+        okx = get_okx_candles()
+        d = await okx.get_candles("BTC", "4h", 300)
+        candles = d.get("candles", []) if isinstance(d, dict) else []
+        closes = [c["close"] for c in candles]
+        out = []
+        for i, c in enumerate(candles):
+            out.append((c["ts"], (c["close"] > sum(closes[i - 199:i + 1]) / 200)
+                        if i >= 199 else None))
+        _BTC_GATE_SERIES = out
+    except Exception:
+        _BTC_GATE_SERIES = []
+    return _BTC_GATE_SERIES
+
+
+def _btc_gate_at(series: list, ts: int) -> bool:
+    """找 ts 之前最近一根 BTC 4h bar 的 above_200ma；無資料保守回 False（不高估）。"""
+    val = None
+    for bts, above in series:
+        if bts > ts:
+            break
+        if above is not None:
+            val = above
+    return bool(val)
+
+
 async def fetch_real_history(
     symbol: str,
     days: int = 30,
@@ -114,9 +149,11 @@ async def fetch_real_history(
         return last
 
     # 組 HistoryPoint
+    btc_gate_series = await _btc_gate_series()   # v33: 真實 BTC 4h 200MA 閘門
     points: list[HistoryPoint] = []
     for i, c in enumerate(candles):
         ts = c["ts"]
+        gate = _btc_gate_at(btc_gate_series, ts)   # v33: 取代寫死 True
         # 從前一根算 oi_delta_pct（24h 變化）
         oi_now = _lookup(oi_series, ts)
         oi_24h_ago = _lookup(oi_series, ts - 24 * 3600 * 1000)
@@ -167,6 +204,7 @@ async def fetch_real_history(
 
         points.append(HistoryPoint(
             ts=ts, symbol=symbol, price=c["close"],
+            high=c["high"], low=c["low"],   # v33: 給 simulator 判盤中觸及
             oi=oi_now or 0, oi_delta_pct=oi_delta,
             funding=_lookup(funding_series, ts) or 0,
             funding_predicted=_lookup(funding_series, ts) or 0,
@@ -174,8 +212,9 @@ async def fetch_real_history(
             top_trader_ratio=_lookup(top_trader_series, ts) or 1.0,
             ls_ratio=_lookup(retail_series, ts) or 1.0,
             liq_long=0, liq_short=0,
-            btc_gate_open=True, btc_regime="trend_up",  # 簡化：歷史回測假設 gate 開
-            above_4h_200ma=True,
+            btc_gate_open=gate,   # v33: 真實 BTC 4h 200MA 閘門（非寫死）
+            btc_regime="trend_up" if gate else "trend_down",
+            above_4h_200ma=gate,
             is_hot=True, strength_score=70,
             atr_pct_7d=atr_pct_7d, vol_24h_vs_30d=vol_ratio,
             cvd_slope_7d=cvd_slope * 5,  # 粗估
@@ -218,7 +257,9 @@ async def replay_real(history: list[HistoryPoint], config, future_window: int = 
         else:
             tps = tuple(entry - sl_dist * r for r in tp_r)
         # 未來價格
-        future = [(history[j].ts, history[j].price)
+        # v33: 傳 OHLC（ts, high, low, close）讓 simulator 用盤中高低判 stop/tp
+        future = [(history[j].ts, history[j].high or history[j].price,
+                   history[j].low or history[j].price, history[j].price)
                   for j in range(idx + 1, min(idx + 1 + future_window, len(history)))]
         outcome = simulate(
             symbol=point.symbol, setup_name=config.setup_name,

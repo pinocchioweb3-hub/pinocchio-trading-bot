@@ -77,17 +77,22 @@ def simulate(
     exit_ts = entry_ts
     bars = 0
 
-    hit_fn = _hit_long if direction == "bull" else _hit_short
+    def _bar(b):
+        # v33: 支援 (ts, close) 舊格式 與 (ts, high, low, close) 新格式
+        if len(b) >= 4:
+            return b[0], b[1], b[2], b[3]
+        return b[0], b[1], b[1], b[1]
 
-    for i, (ts, p) in enumerate(future_prices, start=1):
+    for i, b in enumerate(future_prices, start=1):
+        ts, hi, lo, cl = _bar(b)
         bars = i
         exit_ts = ts
         if i > hold_max_hours:
             break
 
-        # 檢查 stop（含 breakeven 後）
-        is_stop_long = direction == "bull" and p <= effective_stop
-        is_stop_short = direction == "bear" and p >= effective_stop
+        # 檢查 stop（v33：用盤中 low/high 而非 close，看得到插針；保守：同根先判 stop）
+        is_stop_long = direction == "bull" and lo <= effective_stop
+        is_stop_short = direction == "bear" and hi >= effective_stop
         if is_stop_long or is_stop_short:
             # 仍持有的 leg 用 effective_stop 平
             for li, open_ in enumerate(legs_open):
@@ -107,11 +112,11 @@ def simulate(
                 exit_ts=exit_ts, bars_held=bars,
             )
 
-        # 檢查 TP（按順序）
+        # 檢查 TP（v33：用盤中 high/low；按順序）
         for li, tp in enumerate(tps):
             if not legs_open[li]:
                 continue
-            _, hit_tp = hit_fn(p, effective_stop, tp)
+            hit_tp = (hi >= tp) if direction == "bull" else (lo <= tp)
             if hit_tp:
                 # 算這段的 R
                 if direction == "bull":
@@ -135,15 +140,15 @@ def simulate(
                 exit_ts=exit_ts, bars_held=bars,
             )
 
-    # Timeout：剩餘部位以最後價平
+    # Timeout：剩餘部位以最後 close 平
     if future_prices:
-        last_price = future_prices[min(bars, len(future_prices)) - 1][1]
+        _, _, _, last_close = _bar(future_prices[min(bars, len(future_prices)) - 1])
         for li, open_ in enumerate(legs_open):
             if open_:
                 if direction == "bull":
-                    r = (last_price - entry_price) / sl_distance
+                    r = (last_close - entry_price) / sl_distance
                 else:
-                    r = (entry_price - last_price) / sl_distance
+                    r = (entry_price - last_close) / sl_distance
                 realized_r += r * leg_size
 
     return TradeOutcome(
