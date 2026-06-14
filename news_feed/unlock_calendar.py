@@ -175,11 +175,36 @@ def get_week_digest() -> list[dict]:
         conn.close()
 
 
+def _unlock_state_path():
+    from botpaths import data_dir
+    return data_dir() / "unlock_state.json"
+
+
+def _load_unlock_state() -> dict:
+    import json
+    try:
+        return json.loads(_unlock_state_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {"last_push_date": "", "pinned_msg_id": None}
+
+
+def _save_unlock_state(st: dict) -> None:
+    import json
+    try:
+        _unlock_state_path().write_text(json.dumps(st), encoding="utf-8")
+    except Exception:
+        pass
+
+
 async def run_unlock_calendar_loop(tg, refresh_hour_utc: int = 0):
-    """Worker：每日 00:20 UTC 刷新 + 推 7 天解鎖預告（有料才推）。"""
+    """Worker：每日 00:20 UTC 刷新 + 解鎖預告（v33：改『置頂留言』取代重複推播）。
+
+    使用者回饋：解鎖是已知資訊，每日重推佔版面。改為：當日產一則預告→置頂；
+    隔日刷新時先取消舊置頂、再發新預告並置頂；無料則取消置頂不發。
+    狀態持久化（last_push_date + pinned_msg_id），重啟不會重推。"""
     print("[unlock] starting loop")
     await asyncio.sleep(180)
-    last_push_date = ""
+    state = _load_unlock_state()
 
     while True:
         try:
@@ -188,11 +213,19 @@ async def run_unlock_calendar_loop(tg, refresh_hour_utc: int = 0):
                   f"unlocks in {LOOKAHEAD_DAYS}d")
 
             today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-            if today != last_push_date:
+            if today != state.get("last_push_date") and tg is not None:
                 digest = get_week_digest()
-                if digest and tg is not None:
+                # 先取消舊置頂（時效已過 / 即將被新的取代）
+                old_pin = state.get("pinned_msg_id")
+                if old_pin:
+                    try:
+                        await tg.unpin_chat_message(old_pin)
+                    except Exception as e:
+                        print(f"[unlock] unpin error: {e}")
+                    state["pinned_msg_id"] = None
+                if digest:
                     import html as _html
-                    lines = ["🔓 <b>未來 7 天大額解鎖預告</b>（≥5% 流通量）",
+                    lines = ["📌🔓 <b>未來 7 天大額解鎖預告</b>（≥5% 流通量・每日更新）",
                              "━━━━━━━━━━━━━━━━"]
                     for d in digest[:12]:
                         date_str = dt.datetime.fromtimestamp(
@@ -203,13 +236,23 @@ async def run_unlock_calendar_loop(tg, refresh_hour_utc: int = 0):
                             f"（{_html.escape(d['name'] or '')[:18]}）"
                             f" 解鎖 <code>{d['pct']}%</code>")
                     lines.append("\n<i>解鎖前 1-2 週常見搶跑拋售（SAHARA 6/9 案例）"
-                                 "— 持有/做多名單內幣種請留意</i>")
+                                 "— 持有/做多名單內幣種請留意。此則為置頂、每日刷新，不重複洗版。</i>")
                     try:
-                        await tg.send_message("\n".join(lines), parse_mode="HTML")
-                        print(f"[unlock] digest sent ({len(digest)} tokens)")
+                        resp = await tg.send_message("\n".join(lines), parse_mode="HTML")
+                        mid = (resp or {}).get("result", {}).get("message_id")
+                        if mid:
+                            try:
+                                await tg.pin_chat_message(mid)
+                                state["pinned_msg_id"] = mid
+                            except Exception as e:
+                                print(f"[unlock] pin error: {e}")
+                        print(f"[unlock] digest pinned ({len(digest)} tokens, msg={mid})")
                     except Exception as e:
                         print(f"[unlock] push error: {e}")
-                last_push_date = today
+                else:
+                    print("[unlock] no digest today, kept unpinned")
+                state["last_push_date"] = today
+                _save_unlock_state(state)
         except Exception as e:
             print(f"[unlock] loop error: {type(e).__name__}: {e}")
 

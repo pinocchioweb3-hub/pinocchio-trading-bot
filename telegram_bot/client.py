@@ -146,6 +146,20 @@ class TelegramClient:
             body["reply_markup"] = {"inline_keyboard": []}
         return await self._post("editMessageReplyMarkup", body)
 
+    async def pin_chat_message(self, message_id: int,
+                               disable_notification: bool = True) -> dict[str, Any]:
+        """置頂訊息（forum topic 內會顯示於該主題）。"""
+        return await self._post("pinChatMessage", {
+            "chat_id": self.chat_id, "message_id": message_id,
+            "disable_notification": disable_notification})
+
+    async def unpin_chat_message(self, message_id: int | None = None) -> dict[str, Any]:
+        """取消置頂；message_id=None 取消最近一則置頂。"""
+        body: dict[str, Any] = {"chat_id": self.chat_id}
+        if message_id is not None:
+            body["message_id"] = message_id
+        return await self._post("unpinChatMessage", body)
+
     async def _post(self, method: str, body: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{self.base_url}/{method}", json=body)
