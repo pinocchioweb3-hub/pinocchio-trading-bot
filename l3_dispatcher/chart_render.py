@@ -303,14 +303,16 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
             ax.text(x0, b["level"], "CHoCH" if is_choch else "BOS", color=color,
                     fontsize=6.8, va="bottom", alpha=0.95, zorder=4)
 
-        # === Swing 高低點（v28: 標 HH/HL/LH/LL 市場結構）===
+        # === Swing 高低點（v28: 標 HH/HL/LH/LL；v33: 加結構鋸齒連線一眼看懂市場結構）===
         swings = sorted((smc.get("swing_points") or []),
                         key=lambda s: -(int(s.get("ago_bars") or 0)))  # 由舊到新
         prev_high = prev_low = None
+        _zig = []   # (x, level) 由舊到新，畫結構連線
         for s in swings[:14]:
             x0 = max(0, n - 1 - int(s.get("ago_bars") or 0))
             is_high = s.get("type") == "high"
             lvl = s["level"]
+            _zig.append((x0, lvl))
             if is_high:
                 tag = ("HH" if prev_high is not None and lvl > prev_high
                        else "LH" if prev_high is not None else "H")
@@ -323,6 +325,11 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                 prev_low = lvl
                 ax.annotate(f"▁{tag}", (x0, lvl), color=UP, fontsize=7.5,
                             ha="center", va="top", zorder=5)
+        # 結構鋸齒線（淡，連起 swing 序列，讓 HH/HL/LH/LL 的市場結構一目了然）
+        if len(_zig) >= 2:
+            _zig.sort(key=lambda p: p[0])
+            ax.plot([p[0] for p in _zig], [p[1] for p in _zig],
+                    color=FG, linewidth=0.8, alpha=0.35, linestyle="-", zorder=2)
 
         # === 流動性掃單標記（v33：被掃的 swing 極值 ▲▼，與 Wyckoff Spring/UTAD 互證）===
         for sw in _detect_sweeps(candles, swings, n):
