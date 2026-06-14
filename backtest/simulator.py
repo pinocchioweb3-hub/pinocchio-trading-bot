@@ -55,10 +55,12 @@ def simulate(
     entry_price: float,
     stop: float,
     tps: tuple[float, ...],
-    future_prices: list[tuple[int, float]],   # [(ts, price), ...]
+    future_prices: list[tuple[int, float]],   # [(ts, price), ...] 或 [(ts,h,l,c)]
     hold_max_hours: int,
+    taker_fee: float = 0.0005,   # v33: 單邊手續費(分數,0.05%)，預設計入=誠實淨值
+    slippage: float = 0.0005,    # v33: 單邊滑點(分數,0.05%)
 ) -> TradeOutcome:
-    """逐根 bar 模擬。"""
+    """逐根 bar 模擬。v33：realized_r 已扣來回手續費+滑點(淨值)。"""
     assert direction in ("bull", "bear")
     assert len(tps) == 3
 
@@ -67,6 +69,8 @@ def simulate(
         return TradeOutcome(symbol, setup_name, direction, entry_ts,
                             entry_price, stop, tps,
                             exit_reason="invalid_stop", exit_ts=entry_ts)
+    # v33: 來回成本(進+出 全名目)換算成 R：cost_r = 2×(fee+slip)×entry/sl_distance
+    cost_r = 2 * (taker_fee + slippage) * entry_price / sl_distance
 
     # 每根貢獻 1/3 倉位
     leg_size = 1.0 / 3
@@ -106,7 +110,7 @@ def simulate(
             return TradeOutcome(
                 symbol, setup_name, direction, entry_ts, entry_price,
                 stop, tps,
-                realized_r=round(realized_r, 4),
+                realized_r=round(realized_r - cost_r, 4),
                 legs_hit=tuple(legs_hit),
                 exit_reason="stop" if not legs_hit else "stop_after_partial",
                 exit_ts=exit_ts, bars_held=bars,
@@ -134,7 +138,7 @@ def simulate(
             return TradeOutcome(
                 symbol, setup_name, direction, entry_ts, entry_price,
                 stop, tps,
-                realized_r=round(realized_r, 4),
+                realized_r=round(realized_r - cost_r, 4),
                 legs_hit=tuple(legs_hit),
                 exit_reason="tp_all",
                 exit_ts=exit_ts, bars_held=bars,
