@@ -307,6 +307,23 @@ async def _check_waiting_trades(source, tg, bars_cache: dict[str, list],
         print(f"[trade_monitor] ⏳→🔥 waiting triggered: {sym} {w['direction']} @ {live}")
 
 
+def _signal_link(tg, msg_id) -> str:
+    """v33：建回連原始訊號的 t.me 連結（私有超級群 c/ 形式）。無 id 回空字串。"""
+    if not msg_id:
+        return ""
+    try:
+        cid = str(getattr(tg, "chat_id", "") or "")
+        if cid.startswith("-100"):
+            cid = cid[4:]
+        elif cid.startswith("-"):
+            cid = cid[1:]
+        if not cid:
+            return ""
+        return f'　<a href="https://t.me/c/{cid}/{msg_id}">🔗原始訊號</a>'
+    except Exception:
+        return ""
+
+
 async def _monitor_paper(source, tg, bars_cache: dict[str, list],
                          tg_us=None) -> None:
     """紙上倉位 TP/SL/timeout 判定。事件彙整成單則低噪訊息。
@@ -371,7 +388,8 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
             closed_str = "（已平倉）" if r["closed"] else ""
             lines.append(
                 f"{icon} {sym} {pt['direction']} {label.upper()} "
-                f"{r['leg_r']:+.2f}R{closed_str}")
+                f"{r['leg_r']:+.2f}R{closed_str}"
+                f"{_signal_link(tg, pt.get('signal_msg_id'))}")
             pt["legs_hit"].append(label)
             pt["size_remaining"] = round(pt["size_remaining"] - size, 3)
 
@@ -382,7 +400,8 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
             last_close = bars[-1]["close"]
             r = apply_paper_event(pt["id"], "timeout", remain, last_close)
             lines.append(
-                f"⏰ {sym} {pt['direction']} TIMEOUT {r['leg_r']:+.2f}R（已平倉）")
+                f"⏰ {sym} {pt['direction']} TIMEOUT {r['leg_r']:+.2f}R（已平倉）"
+                f"{_signal_link(tg, pt.get('signal_msg_id'))}")
 
     # 加密事件 → 📈 持倉與績效（Stage 0 門檻只算加密引擎）
     if paper_lines and tg is not None:

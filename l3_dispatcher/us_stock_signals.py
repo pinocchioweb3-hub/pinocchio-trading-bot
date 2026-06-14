@@ -200,8 +200,10 @@ async def run_us_signal_loop(tg, scan_interval: int = 900):
                                 text += render_analogue_line(_astats)
                             except Exception:
                                 pass
+                            sig_mid = None
                             try:
-                                await tg.send_message(text, parse_mode="HTML")
+                                _r = await tg.send_message(text, parse_mode="HTML")
+                                sig_mid = (_r or {}).get("result", {}).get("message_id")
                             except Exception as e:
                                 print(f"[us_signals] tg send error: {e}")
 
@@ -211,6 +213,7 @@ async def run_us_signal_loop(tg, scan_interval: int = 900):
                                 entry_price=entry, stop_price=stop,
                                 tp1=tps["tp1"], tp2=tps["tp2"], tp3=tps["tp3"],
                                 fire_id=None, regime=f"us_{snap.us_session}",
+                                signal_msg_id=sig_mid,
                             )
                             store.mark_fired(d)
                             fired += 1

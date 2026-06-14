@@ -543,7 +543,8 @@ async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3
         await asyncio.sleep(interval_seconds)
 
 
-def _record_deepdive_plan(sym: str, plan: dict | None) -> dict | None:
+def _record_deepdive_plan(sym: str, plan: dict | None,
+                          signal_msg_id: int | None = None) -> dict | None:
     """v33：把 deepdive 可執行計畫存進紙上帳（等待觸發），回給圖表用的 plan dict。
     不可做單 / 缺關鍵價位 / 已有同標的 open 倉 → 不重複建單。任何錯誤回 None，不阻塞。"""
     if not plan or not plan.get("actionable"):
@@ -574,7 +575,7 @@ def _record_deepdive_plan(sym: str, plan: dict | None) -> dict | None:
             tp3=tp3 if tp3 is not None else tp1,
             regime="deepdive",
             zone_lo=lo if is_limit else None, zone_hi=hi if is_limit else None,
-            split_mode=is_limit,
+            split_mode=is_limit, signal_msg_id=signal_msg_id,
         )
         print(f"[deepdive] {sym} paper entry recorded ({direction}, "
               f"{'limit' if is_limit else 'market'})")
@@ -614,14 +615,14 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
                         sym_state = await compute_per_symbol_state(source, sym)
                         text, meta = await synthesize_per_symbol(sym, sym_state)
                         if text:
-                            await _send_to_telegram(
+                            sig_mid = await _send_to_telegram(
                                 tg, text,
                                 prefix=f"🎯 <b>{sym} 交易計畫深度分析</b>\n"
                             )
                             # v33: 把可執行計畫接進紙上帳（看得到的報單→可追蹤可算勝率），
-                            #      並把計畫線帶進圖表。失敗不阻塞。
+                            #      存原始訊號 message_id 供持倉回連。失敗不阻塞。
                             plan = meta.get("plan")
-                            chart_plan = _record_deepdive_plan(sym, plan)
+                            chart_plan = _record_deepdive_plan(sym, plan, sig_mid)
                             # v18-F: 附 SMC 標記圖（v33 帶計畫線；失敗不阻塞）
                             try:
                                 from .chart_render import render_symbol_chart
@@ -648,19 +649,21 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
 
 
 async def _send_to_telegram(tg, text: str, prefix: str = "") -> int:
-    """共用 send + auto-split + plain text fallback。回傳成功發送 parts 數。"""
+    """共用 send + auto-split + plain text fallback。
+    v33：回傳第一則訊息的 message_id（>0 代表成功、可當連結錨點；0=失敗）。"""
     import re as _re
     full = f"{prefix}{text}"
 
-    async def _try_send(part: str) -> bool:
+    async def _try_send(part: str) -> int:
         resp = await tg.send_message(part, parse_mode="HTML")
-        if resp.get("ok"): return True
+        if resp.get("ok"):
+            return resp.get("result", {}).get("message_id", 0) or 0
         # HTML 失敗 → 剝標籤改純文字（不傳 parse_mode）
         plain = _re.sub(r"<[^>]+>", "", part)
         resp2 = await tg.send_message(plain, parse_mode=None)
-        return resp2.get("ok", False)
+        return resp2.get("result", {}).get("message_id", 0) or 0 if resp2.get("ok") else 0
 
-    sent = 0
+    first_id = 0
     if len(full) > 4096:
         parts, cur = [], ""
         for line in full.split("\n"):
@@ -670,12 +673,13 @@ async def _send_to_telegram(tg, text: str, prefix: str = "") -> int:
                 cur += ("\n" if cur else "") + line
         if cur: parts.append(cur)
         for i, p in enumerate(parts, 1):
-            ok = await _try_send(f"<b>[{i}/{len(parts)}]</b>\n{p}")
-            if ok: sent += 1
+            mid = await _try_send(f"<b>[{i}/{len(parts)}]</b>\n{p}")
+            if i == 1:
+                first_id = mid
             await asyncio.sleep(0.5)
     else:
-        if await _try_send(full): sent = 1
-    return sent
+        first_id = await _try_send(full)
+    return first_id
 
 
 def _next_daily_run_seconds(target_hour_utc: int = 0) -> float:

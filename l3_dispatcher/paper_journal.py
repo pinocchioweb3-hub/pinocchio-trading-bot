@@ -67,6 +67,8 @@ def init_db() -> None:
             ("entry_filled_pct", "ALTER TABLE paper_trades ADD COLUMN entry_filled_pct REAL NOT NULL DEFAULT 1.0"),
             ("entry_state", "ALTER TABLE paper_trades ADD COLUMN entry_state TEXT NOT NULL DEFAULT 'full'"),
             #   'pending'(掛單未成) / 'partial'(部分成交) / 'full'(全部成交)
+            # v33: 發訊號當下的 Telegram message_id，供持倉訊息回連原始訊號
+            ("signal_msg_id", "ALTER TABLE paper_trades ADD COLUMN signal_msg_id INTEGER"),
         ):
             if col not in existing:
                 conn.execute(ddl)
@@ -97,7 +99,8 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                        regime: str | None = None,
                        zone_lo: float | None = None,
                        zone_hi: float | None = None,
-                       split_mode: bool = False) -> int:
+                       split_mode: bool = False,
+                       signal_msg_id: int | None = None) -> int:
     """v26: split_mode=True 時建分批限價單（entry_state='pending'，等價格逐格成交）；
     否則維持原行為（直接全額成交，entry_state='full'）。"""
     init_db()
@@ -110,19 +113,20 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                 """INSERT INTO paper_trades
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at,
-                    entry_splits, entry_filled_pct, entry_state)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending')""",
+                    entry_splits, entry_filled_pct, entry_state, signal_msg_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
-                 now_ms, fire_id, regime, now_ms, json.dumps(splits)),
+                 now_ms, fire_id, regime, now_ms, json.dumps(splits), signal_msg_id),
             )
         else:
             cur = conn.execute(
                 """INSERT INTO paper_trades
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
-                    entry_at, fire_id, regime, created_at, entry_filled_pct, entry_state)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full')""",
+                    entry_at, fire_id, regime, created_at, entry_filled_pct, entry_state,
+                    signal_msg_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
-                 now_ms, fire_id, regime, now_ms),
+                 now_ms, fire_id, regime, now_ms, signal_msg_id),
             )
         return cur.lastrowid
     finally:
@@ -207,7 +211,8 @@ def get_open_paper() -> list[dict]:
         # v26: 只對「已成交（部分或全部）」的單檢 TP/SL；pending（掛單未成）不檢
         rows = conn.execute(
             "SELECT id, symbol, setup, direction, entry_price, stop_price, "
-            "tp1, tp2, tp3, entry_at, legs_hit, size_remaining, entry_filled_pct "
+            "tp1, tp2, tp3, entry_at, legs_hit, size_remaining, entry_filled_pct, "
+            "signal_msg_id "
             "FROM paper_trades WHERE status='open' AND entry_state != 'pending' ORDER BY entry_at",
         ).fetchall()
         out = []
@@ -222,6 +227,7 @@ def get_open_paper() -> list[dict]:
                 "entry_filled_pct": r[12] if r[12] is not None else 1.0,
                 "risk_usd": RISK_USD,
                 "tg_message_id": None,
+                "signal_msg_id": r[13],
             })
         return out
     finally:
