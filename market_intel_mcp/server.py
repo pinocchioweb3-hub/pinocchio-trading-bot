@@ -151,6 +151,69 @@ async def mi_get_strength_rank(
 
 
 @_tool
+async def _fill_stale_from_binance(sym: str, tf: str, snap: dict,
+                                   stale_fields: list) -> None:
+    """v33：CoinGlass/OKX 欄位 stale 時，用 Binance 永續(免key)補資料，提升資料品質。
+    僅補 Binance 能提供的欄位；補到的從 stale_fields 移除。任何失敗靜默略過。"""
+    fillable = {"price", "ts", "oi", "oi_delta_pct", "funding",
+                "funding_predicted", "top_trader_ratio", "ls_ratio"}
+    need = fillable & set(stale_fields)
+    if not need:
+        return
+    try:
+        from .sources.binance_perp import get_binance_perp
+        src = get_binance_perp()
+
+        async def _s(c):
+            try:
+                return await c
+            except Exception:
+                return None
+        tasks, keys = [], []
+        if {"price", "ts"} & need:
+            tasks.append(_s(src.get_candles(sym, tf, 2))); keys.append("k")
+        if {"oi", "oi_delta_pct"} & need:
+            tasks.append(_s(src.get_oi(sym, tf, 30))); keys.append("oi")
+        if {"funding", "funding_predicted"} & need:
+            tasks.append(_s(src.get_funding(sym))); keys.append("f")
+        if "top_trader_ratio" in need:
+            tasks.append(_s(src.get_positioning(sym, tf, 5))); keys.append("tt")
+        if "ls_ratio" in need:
+            tasks.append(_s(src.get_global_positioning(sym, tf, 5))); keys.append("ls")
+        res = dict(zip(keys, await asyncio.gather(*tasks)))
+
+        def _good(r):
+            return isinstance(r, dict) and not r.get("error")
+        filled = []
+        if "k" in res and _good(res["k"]) and res["k"].get("candles"):
+            c = res["k"]["candles"][-1]
+            if "price" in need:
+                snap["price"] = c["close"]; filled.append("price")
+            if "ts" in need:
+                snap["ts"] = c["ts"]; filled.append("ts")
+        if "oi" in res and _good(res["oi"]) and res["oi"].get("latest") is not None:
+            if "oi" in need:
+                snap["oi"] = res["oi"]["latest"]; filled.append("oi")
+            if "oi_delta_pct" in need:
+                snap["oi_delta_pct"] = res["oi"].get("delta_pct_24h"); filled.append("oi_delta_pct")
+        if "f" in res and _good(res["f"]) and res["f"].get("funding") is not None:
+            if "funding" in need:
+                snap["funding"] = res["f"]["funding"]; filled.append("funding")
+            if "funding_predicted" in need:
+                snap["funding_predicted"] = res["f"]["funding"]; filled.append("funding_predicted")
+        if "tt" in res and _good(res["tt"]) and res["tt"].get("latest") is not None:
+            snap["top_trader_ratio"] = res["tt"]["latest"]; filled.append("top_trader_ratio")
+        if "ls" in res and _good(res["ls"]) and res["ls"].get("latest") is not None:
+            snap["ls_ratio"] = res["ls"]["latest"]; filled.append("ls_ratio")
+        if filled:
+            for fld in filled:
+                if fld in stale_fields:
+                    stale_fields.remove(fld)
+            snap["_binance_filled"] = filled
+    except Exception:
+        pass
+
+
 async def mi_get_snapshot(
     symbol: Annotated[str, Field(description="目標標的（任意命名空間）")],
     tf: Annotated[str, Field(description="主分析時框")] = "1h",
@@ -307,6 +370,12 @@ async def mi_get_snapshot(
         for f in ("atr_pct_7d", "vol_24h_vs_30d", "cvd_slope_7d",
                   "top_trader_slope_7d", "oi_delta_7d_pct", "higher_lows_7d"):
             _stale(f)
+
+    # v33: 有 stale 欄位 → 用 Binance 第二來源補（提升資料品質、減少 stale）
+    if stale_fields:
+        await _fill_stale_from_binance(sym, tf, snap, stale_fields)
+        if snap.get("_binance_filled"):
+            sources_used.add("binance-perp(fallback)")
 
     snap["stale_fields"] = tuple(stale_fields)
     snap["sources_used"] = tuple(sorted(sources_used))
