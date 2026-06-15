@@ -289,6 +289,7 @@ def _cmd_help() -> str:
         "/stats [天數] — 績效統計（預設 7 天）\n"
         "📊 /profit [天數] — 公開績效卡（勝率/期望值/PF，加密+美股分開）\n"
         "🎯 /discipline — 紀律遵守率（決斷率 + 不追高率，系統客觀記錄）\n"
+        "📖 /指標（/glossary）— 指標白話對照表（看不懂術語就查這個；/指標 CVD 查單詞）\n"
         "/daily ・ /weekly — 當日／本週績效\n"
         "/contrib — 💡 貢獻積分排行榜\n"
         "/myscore — 查自己的積分與占比\n"
@@ -519,6 +520,32 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
             reply = render_discipline(discipline_stats(30))
         except Exception as e:
             reply = f"紀律 KPI 產生失敗：{type(e).__name__}: {e}"
+    elif cmd in ("glossary", "terms", "指標", "術語", "名詞"):
+        # v43: 指標白話對照表（雙受眾 #10）— 看不懂術語就查這個。
+        # 直送多則（概覽分卡 / JSON 分段），避開 reply[:4000] 截斷，模仿 /settings。
+        from l3_dispatcher.glossary import (
+            glossary_json, lookup, render_overview_cards,
+        )
+        thread_id = msg.get("message_thread_id")
+        arg = " ".join(args).strip()
+        try:
+            if arg.lower() == "json":
+                # 機器可讀（給 AI Agent／未來信任網頁 #11）：純文字分段直送
+                import json as _json
+                blob = _json.dumps(glossary_json(), ensure_ascii=False, indent=1)
+                for i in range(0, len(blob), 3500):
+                    await tg.send_message(blob[i:i + 3500], parse_mode=None,
+                                          message_thread_id=thread_id)
+            elif arg:
+                await tg.send_message(lookup(arg), parse_mode="HTML",
+                                      message_thread_id=thread_id)
+            else:
+                for card in render_overview_cards():
+                    await tg.send_message(card, parse_mode="HTML",
+                                          message_thread_id=thread_id)
+        except Exception as e:
+            print(f"[callbacks] glossary error: {type(e).__name__}: {e}")
+        return
     elif cmd == "help":
         reply = _cmd_help()
     elif cmd == "setup":
