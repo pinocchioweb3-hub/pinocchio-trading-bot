@@ -705,48 +705,90 @@ def _next_daily_run_seconds(target_hour_utc: int = 0) -> float:
     return (target - now).total_seconds()
 
 
+# v36：持倉資產分類（決定 🪙加密 / 🇺🇸美股 / 🥇商品 標記）
+_COMMODITY_SYMBOLS = {"XAU", "XAG", "XPT", "XPD"}
+
+
+def _asset_kind(symbol: str, setup: str = "") -> tuple[str, str]:
+    """回 (emoji, 中文標籤)。
+
+    美股：白名單命中或 setup=='us_breakout'（deepdive 引擎也會選到美股如 MU，
+    故不能只看 setup）。XAU 等貴金屬歸商品。其餘視為加密。
+    """
+    from .us_stocks import US_STOCK_WATCHLIST
+    sym = (symbol or "").upper()
+    if sym in _COMMODITY_SYMBOLS:
+        return "🥇", "商品"
+    if setup == "us_breakout" or sym in US_STOCK_WATCHLIST:
+        return "🇺🇸", "美股"
+    return "🪙", "加密"
+
+
 async def run_position_tracker_loop(tg, source, interval_seconds: int = 3600):
     """每小時推一份「持倉追蹤快照」。
 
     內容：
-    - 每筆 open trade：標的 / 方向 / 進場時間 / 進場價 / 當前價 / 距 TP1 / 距 SL / 當前 R
-    - 若無 open trades 則不推（避免雜訊）
+    - 每筆持倉：資產別(🪙/🇺🇸/🥇) / 標的 / 方向 / 進場時間 / 進場價 / 當前價 /
+      距 TP1 / 距 SL / 當前 R，並附「🔗原始訊號」回連到當初發單的那一分鐘貼文
+    - 來源：實盤 trades（紅線不下實彈→恆空）+ 紙上驗證 paper_trades（真實追蹤）
+    - 若無持倉則不推（避免雜訊）
     """
     from .trade_journal import get_open_trades
 
     async def _push_snapshot():
-        opens = get_open_trades()
-        if not opens:
+        from .paper_journal import get_open_paper
+        from .trade_monitor import _signal_link
+
+        live = get_open_trades()      # 實盤（紅線：不下實彈 → 目前恆為空）
+        paper = get_open_paper()      # 紙上驗證持倉（真實追蹤標的，已濾掉未成交掛單）
+
+        # 統一形狀：附資產別連結用 msg_id（實盤用 tg_message_id、紙上用 signal_msg_id）
+        positions = []
+        for o in live:
+            positions.append({**o, "_kind": "live",
+                              "_link_id": o.get("tg_message_id")})
+        for o in paper:
+            positions.append({**o, "_kind": "paper",
+                              "_link_id": o.get("signal_msg_id")})
+
+        if not positions:
             return  # 無持倉不推
 
-        # 抓所有 symbol 即時價
-        symbols = list({o["symbol"] for o in opens})
+        # 抓所有 symbol 即時價（單一 OKX client 重用，避免每檔開關連線）
+        symbols = list({o["symbol"] for o in positions})
         prices: dict[str, float] = {}
-        for sym in symbols:
-            try:
-                from market_intel_mcp.sources.okx_candles import OkxCandlesSource
-                okx = OkxCandlesSource()
+        from market_intel_mcp.sources.okx_candles import OkxCandlesSource
+        okx = OkxCandlesSource()
+        try:
+            for sym in symbols:
                 try:
                     d = await okx.get_candles(sym, "5m", 1)
-                finally:
-                    await okx.close()
-                if isinstance(d, dict) and d.get("candles"):
-                    prices[sym] = d["candles"][-1]["close"]
-            except Exception as e:
-                print(f"[position_tracker] price fetch {sym} error: {e}")
+                    if isinstance(d, dict) and d.get("candles"):
+                        prices[sym] = d["candles"][-1]["close"]
+                except Exception as e:
+                    print(f"[position_tracker] price fetch {sym} error: {e}")
+        finally:
+            await okx.close()
 
         if not prices:
             return  # 全失敗 → 不推假快照
 
         # 渲染
         now_ms = int(time.time() * 1000)
-        lines = [f"📊 <b>持倉追蹤快照 ({len(opens)} 筆)</b>",
-                 f"━━━━━━━━━━━━━━━━"]
-        for o in opens:
+        n_paper = sum(1 for o in positions if o["_kind"] == "paper")
+        n_live = len(positions) - n_paper
+        if n_live:
+            head = f"📊 <b>持倉追蹤快照（紙上 {n_paper}　實盤 {n_live}）</b>"
+        else:
+            head = f"📊 <b>持倉追蹤快照（紙上驗證 {n_paper} 筆）</b>"
+        lines = [head, "━━━━━━━━━━━━━━━━"]
+        for o in positions:
             sym = o["symbol"]
+            a_emoji, _ = _asset_kind(sym, o.get("setup", ""))
+            link = _signal_link(tg, o.get("_link_id"))
             cur = prices.get(sym)
             if cur is None:
-                lines.append(f"⚪ <b>{sym} {o['direction']}</b> (價格抓取失敗)")
+                lines.append(f"⚪ {a_emoji}<b>{sym} {o['direction']}</b> (價格抓取失敗){link}")
                 continue
 
             entry = o["entry_price"]; stop = o["stop_price"]; tp1 = o.get("tp1")
@@ -779,18 +821,19 @@ async def run_position_tracker_loop(tg, source, interval_seconds: int = 3600):
             if o["legs_hit"]:
                 legs_str = f"  已過：<code>{','.join(sorted(o['legs_hit']))}</code>"
             lines.append(
-                f"{icon} <b>{sym} {o['direction']}</b> (進場 {age_h:.1f}h 前){legs_str}\n"
+                f"{icon} {a_emoji}<b>{sym} {o['direction']}</b> (進場 {age_h:.1f}h 前){legs_str}{link}\n"
                 f"   進場 <code>${entry:.4f}</code> → 現價 <code>${cur:.4f}</code> "
                 f"(<code>{cur_r:+.2f}R</code>)\n"
                 f"   距 TP1 <code>{to_tp1_pct:+.2f}%</code>  距 SL <code>{to_sl_pct:+.2f}%</code>"
                 if tp1 else
-                f"{icon} <b>{sym} {o['direction']}</b> (進場 {age_h:.1f}h 前)\n"
+                f"{icon} {a_emoji}<b>{sym} {o['direction']}</b> (進場 {age_h:.1f}h 前){link}\n"
                 f"   進場 <code>${entry:.4f}</code> → 現價 <code>${cur:.4f}</code> (<code>{cur_r:+.2f}R</code>)"
             )
 
-        text = "\n\n".join(lines) if False else "\n".join(lines)
+        text = "\n".join(lines)
         await _send_to_telegram(tg, text)
-        print(f"[position_tracker] sent snapshot ({len(opens)} trades)")
+        print(f"[position_tracker] sent snapshot "
+              f"({len(positions)} positions: {n_paper} paper / {n_live} live)")
 
     # 啟動延後
     await asyncio.sleep(30)
