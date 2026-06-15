@@ -408,6 +408,89 @@ def _binance_divergence(cg: dict, bn: dict) -> dict:
     return out
 
 
+def _oi_break_note(direction: str, oi_delta_pct: float | None) -> str | None:
+    """M4：用突破當下 OI 變化判 BOS/CHoCH 真偽（正交確認，業界共識會計關係）。"""
+    if oi_delta_pct is None:
+        return None
+    if abs(oi_delta_pct) <= 1.0:
+        return "OI 持平（突破動能中性）"
+    up = oi_delta_pct > 0
+    if direction == "bull":
+        return "增倉推動（新多進場，真突破）" if up else "空頭回補/減倉（虛漲，留意假突破）"
+    return "增倉推動（新空進場，真跌破）" if up else "多頭止損離場（減倉，跌破動能存疑）"
+
+
+def _oi_sweep_note(oi_delta_pct: float | None) -> str | None:
+    """M4：掃單當下 OI 驟降＝清算離場/良性反轉；OI 增＝新倉（可能延續或陷阱）。"""
+    if oi_delta_pct is None:
+        return None
+    if oi_delta_pct < -1.5:
+        return "OI 驟降＝清算離場／良性反轉（掃單後反轉機率較高）"
+    if oi_delta_pct > 1.5:
+        return "OI 增＝新倉進場（掃單後可能延續或陷阱，須配合 CVD）"
+    return "OI 持平"
+
+
+def _most_recent(bc_list: list | None) -> dict | None:
+    """取最近一個結構事件（依 ago_bars 最小），避免 4h/1d 兩種排序不一致的坑。"""
+    items = [b for b in (bc_list or []) if b.get("direction")]
+    if not items:
+        return None
+    return min(items, key=lambda b: b.get("ago_bars", 1e9))
+
+
+def _compute_htf_alignment(s4: dict, s1d: dict) -> dict:
+    """M2：HTF(1d)→LTF(4h) 對齊驗證。產『已對齊事實』餵 deepdive，
+    不在程式層硬否決（disclaimer #5：閘鬆緊是自由參數，須 OOS 回測校準才可收緊）。"""
+    out = {"ltf_signal": None, "htf_trend": None, "price_1d_zone": None,
+           "direction_aligned": None, "location_favorable": None,
+           "verdict": "unknown", "note": ""}
+    ltf = _most_recent(s4.get("bos_choch"))
+    htf = _most_recent(s1d.get("bos_choch"))
+    out["ltf_signal"] = ltf.get("direction") if ltf else None
+    out["htf_trend"] = htf.get("direction") if htf else None
+    pd1d = s1d.get("premium_discount") or {}
+    out["price_1d_zone"] = pd1d.get("zone")
+
+    if out["ltf_signal"] and out["htf_trend"]:
+        out["direction_aligned"] = (out["ltf_signal"] == out["htf_trend"])
+    if out["ltf_signal"] and out["price_1d_zone"] in ("premium", "discount"):
+        out["location_favorable"] = (
+            (out["ltf_signal"] == "bull" and out["price_1d_zone"] == "discount")
+            or (out["ltf_signal"] == "bear" and out["price_1d_zone"] == "premium"))
+
+    da, lf = out["direction_aligned"], out["location_favorable"]
+    # 只有「方向一致 AND 位置有利」兩者皆 True 才算完全對齊（aligned）。
+    # 修正：原本把『單邊 True、另一邊 None(資料不足/均衡區)』也升級成 aligned，
+    # 會讓 note 謊稱兩者皆有利、在最常見的均衡區系統性高估信心 → 一律降級 partial。
+    if da is None and lf is None:
+        out["verdict"] = "unknown"
+    elif da is True and lf is True:
+        out["verdict"] = "aligned"
+    elif da is False and lf is False:
+        out["verdict"] = "conflict"
+    else:
+        out["verdict"] = "partial"   # 含一個 False，或單邊 True 另一邊 None
+
+    if out["verdict"] == "partial":
+        # 精準文案：區分「其一不利」與「其一資料不足」，不誇大成兩者皆有利
+        if da is True and lf is None:
+            out["note"] = ("⚠️ HTF 部分對齊：方向順勢一致，但 1d 位於均衡區/區位資料不足，"
+                           "未確認折價-溢價有利位置 → 順勢偏置成立但勿放大倉位，等更佳位置")
+        elif lf is True and da is None:
+            out["note"] = ("⚠️ HTF 部分對齊：1d 區位有利，但 1d 趨勢方向未確立（無 1d 結構）"
+                           " → 需 4h 自身結構與獨立數據佐證，勿單據區位進場")
+        else:
+            out["note"] = ("⚠️ HTF 部分對齊：方向或進場位置其一不利，"
+                           "需謹慎、縮小倉位、等更佳位置")
+    else:
+        _v = {"aligned": "✅ HTF 對齊：1d 趨勢與 4h 訊號一致且位置有利，順勢進場勝率較高",
+              "conflict": "⛔ HTF 衝突：4h 訊號與 1d 趨勢/位置相悖（接刀風險），除非有強力獨立確認否則應降權或觀望",
+              "unknown": "ℹ️ HTF 對齊未知：1d 結構或區位資料不足，無法判定"}
+        out["note"] = _v.get(out["verdict"], "")
+    return out
+
+
 async def compute_per_symbol_state(source, symbol: str) -> dict:
     """組單一標的 deep dive 用的完整資料（含 SMC 量化指標）。"""
     from market_intel_mcp.server import (
@@ -441,14 +524,45 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
     if isinstance(c_4h, dict) and not c_4h.get("error"):
         c4 = c_4h.get("candles", [])
         smc_levels["4h"] = compute_smc_levels(c4, swing_length=10)
-        # v33: 自寫 BOS/CHoCH 取代套件只給 BOS（讓文章也標得出轉勢 CHoCH）
+        _n4 = len(c4)
+        _oi_list = _cg.get("oi") or []
+        _oi_ts = _cg.get("oi_ts") or []   # M4: 跨來源 ts 對齊（OI vs K 線不同源，防錯位）
         try:
-            from .chart_render import detect_structure_breaks
-            _n4 = len(c4)
-            _brs = detect_structure_breaks(c4, smc_levels["4h"].get("swing_points") or [])
-            smc_levels["4h"]["bos_choch"] = [
-                {"type": b["type"], "direction": b["direction"], "level": b["level"],
-                 "ago_bars": _n4 - 1 - b["idx"]} for b in _brs]
+            from .chart_render import (
+                detect_structure_breaks, _detect_sweeps,
+                _oi_delta_around, _liq_clusters)
+            _sp4 = smc_levels["4h"].get("swing_points") or []
+
+            def _ev_ts(idx):   # 事件 K 的時間戳（給 _oi_delta_around 做 ts 容差比對）
+                return c4[idx]["ts"] if 0 <= idx < _n4 else None
+
+            # v33: 自寫 BOS/CHoCH 取代套件只給 BOS（讓文章也標得出轉勢 CHoCH）
+            #      + M4: 用突破當下 OI 變化確認真偽（ts 對齊，對不上回 None 不誤標）
+            _bc = []
+            for b in detect_structure_breaks(c4, _sp4):
+                ago = _n4 - 1 - b["idx"]
+                oid = _oi_delta_around(_oi_list, ago, oi_ts=_oi_ts,
+                                       event_ts=_ev_ts(b["idx"]))
+                _bc.append({"type": b["type"], "direction": b["direction"],
+                            "level": b["level"], "ago_bars": ago,
+                            "oi_delta_pct": oid,
+                            "oi_confirm": _oi_break_note(b["direction"], oid)})
+            smc_levels["4h"]["bos_choch"] = _bc
+            # H2: 流動性掃單餵進 deepdive（最有 alpha 的 Spring/UTAD，過去只在圖上）
+            #      + M4: 掃單當下 OI 確認反轉/陷阱（同樣 ts 對齊）
+            _sweeps = []
+            for s in _detect_sweeps(c4, _sp4, _n4):
+                ago = _n4 - 1 - s["x"]
+                oid = _oi_delta_around(_oi_list, ago, oi_ts=_oi_ts,
+                                       event_ts=_ev_ts(s["x"]))
+                _sweeps.append({"dir": s["dir"], "level": s["level"], "ago_bars": ago,
+                                "oi_delta_pct": oid, "oi_confirm": _oi_sweep_note(oid)})
+            smc_levels["4h"]["liquidity_sweeps"] = _sweeps
+            # M1: 清算密集價帶（事後估計分佈，非真實掛單；標『估計』）
+            _lc = _liq_clusters(c4, _cg.get("liq_long_series"),
+                                _cg.get("liq_short_series"))
+            if _lc:
+                _cg["liq_clusters"] = _lc
         except Exception:
             pass
         try:
@@ -465,6 +579,10 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
     if isinstance(c_1d, dict) and not c_1d.get("error"):
         smc_levels["1d"] = compute_smc_levels(c_1d.get("candles", []), swing_length=5)
 
+    # M2: HTF(1d)→LTF(4h) 對齊驗證（餵 deepdive 當已對齊事實，不在程式硬否決）
+    htf_alignment = _compute_htf_alignment(
+        smc_levels.get("4h", {}), smc_levels.get("1d", {}))
+
     result = {
         "symbol": symbol,
         "ts": dt.datetime.now(tz=dt.timezone.utc),
@@ -472,6 +590,7 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
         "snapshot": _safe(snap),
         "whales": _safe(whales),
         "smc_levels": smc_levels,
+        "htf_alignment": htf_alignment,                         # M2: HTF→LTF 對齊驗證
         "regime": regime,                                       # v33: 市場狀態標籤
         "wyckoff": wyckoff,                                      # v33: Wyckoff 階段
         "coinglass": cg_ov if isinstance(cg_ov, dict) else {},   # v32: CoinGlass 佐證序列

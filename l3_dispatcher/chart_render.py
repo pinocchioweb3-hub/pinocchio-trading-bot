@@ -172,6 +172,107 @@ def _detect_sweeps(candles: list[dict], swings: list[dict], n: int,
     return out[-5:]   # 只留最近 5 個避免洗版
 
 
+def _liq_clusters(candles: list[dict], long_series: list | None,
+                  short_series: list | None, bins: int = 12,
+                  top: int = 3) -> list[dict]:
+    """M1：把近期清算規模沿『價格』分桶，找出清算密集價帶（流動性磁吸參考）。
+    用 aggregated-history（非被鎖的熱力圖）→ 屬事後估計分佈，非真實掛單，須標註。
+    long_series/short_series 與 candles 同為 4h、皆以「現在」結尾 → 依位置對齊末段。
+    回 [{low, high, mid, long_usd, short_usd, total, dominant}]（依 total 由大到小）。"""
+    long_series = long_series or []
+    short_series = short_series or []
+    if not candles or not long_series or not short_series:
+        return []
+    L = min(len(candles), len(long_series), len(short_series))
+    if L < 6:
+        return []
+    cs = candles[-L:]
+    ls = long_series[-L:]
+    ss = short_series[-L:]
+    prices = [(c["high"] + c["low"] + c["close"]) / 3.0 for c in cs]
+    pmin, pmax = min(prices), max(prices)
+    if pmax <= pmin:
+        return []
+    width = (pmax - pmin) / bins
+    buckets = [{"long": 0.0, "short": 0.0} for _ in range(bins)]
+    for p, lo_usd, sh_usd in zip(prices, ls, ss):
+        bi = min(bins - 1, int((p - pmin) / width))
+        buckets[bi]["long"] += float(lo_usd or 0)
+        buckets[bi]["short"] += float(sh_usd or 0)
+    out = []
+    for bi, b in enumerate(buckets):
+        tot = b["long"] + b["short"]
+        if tot <= 0:
+            continue
+        dom = ("long" if b["long"] > b["short"] * 1.3 else
+               "short" if b["short"] > b["long"] * 1.3 else "balanced")
+        out.append({
+            "low": round(pmin + bi * width, 6),
+            "high": round(pmin + (bi + 1) * width, 6),
+            "mid": round(pmin + (bi + 0.5) * width, 6),
+            "long_usd": round(b["long"], 0),
+            "short_usd": round(b["short"], 0),
+            "total": round(tot, 0),
+            "dominant": dom,
+        })
+    out.sort(key=lambda x: x["total"], reverse=True)
+    return out[:top]
+
+
+def _ts_sec(ts) -> float | None:
+    """ts 正規化成秒（自動判別毫秒 vs 秒）：>1e11 視為毫秒。跨來源比對防單位坑。"""
+    try:
+        t = float(ts)
+    except (TypeError, ValueError):
+        return None
+    return t / 1000.0 if t > 1e11 else t
+
+
+def _oi_delta_around(oi_list: list | None, ago_bars: int, w: int = 2,
+                     oi_ts: list | None = None, event_ts=None,
+                     tf_sec: int = 14400) -> float | None:
+    """M4：取結構事件當下的 OI 變化%（事件 bar vs 其前 w 根）。對齊不上回 None。
+
+    OI(CoinGlass 聚合) 與 K 線(OKX 單一所) 是兩條獨立抓取的序列。若提供 oi_ts+event_ts，
+    改用『時間戳容差比對』把事件對到正確的 OI 根（容差＝半根時框），對不上→回 None（寧缺勿錯，
+    避免任一來源缺根/末端不同步時把 OI 標到相鄰錯誤事件、使真/假突破標反）。
+    無 ts 時退回原本的『距末端位置』對齊。"""
+    if not oi_list:
+        return None
+    n = len(oi_list)
+    idx_ev = None
+    # 優先：ts 對齊（跨來源防錯位）。oi_ts 須與 oi_list 同切片同長度。
+    if oi_ts and event_ts is not None and len(oi_ts) == n:
+        ev_s = _ts_sec(event_ts)
+        if ev_s is not None:
+            tol = tf_sec / 2.0
+            best = tol
+            for j in range(n):
+                tj = _ts_sec(oi_ts[j])
+                if tj is None:
+                    continue
+                d = abs(tj - ev_s)
+                if d <= best:
+                    best = d
+                    idx_ev = j
+            if idx_ev is None:
+                return None   # 事件落在 OI 序列容差外 → 跨來源對不上，寧缺勿錯
+    if idx_ev is None:
+        # 退回位置對齊（無 ts 可用時）
+        idx_ev = n - 1 - int(ago_bars or 0)
+    idx_prev = idx_ev - w
+    if idx_prev < 0 or idx_ev >= n or idx_ev < 0:
+        return None
+    try:
+        prev = float(oi_list[idx_prev])
+        ev = float(oi_list[idx_ev])
+    except (TypeError, ValueError):
+        return None
+    if not prev:
+        return None
+    return round((ev - prev) / prev * 100, 2)
+
+
 def _prune_old():
     try:
         CHART_DIR.mkdir(parents=True, exist_ok=True)
@@ -598,7 +699,9 @@ async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
                  # v33 新增
                  "funding_series": None, "liq_long_series": None,
                  "liq_short_series": None, "basis": None, "structure": None,
-                 "sentiment": None, "liq_24h": None}
+                 "sentiment": None, "liq_24h": None,
+                 # M5: OI 加權 funding（極端值＝擁擠/反指風險量表，非方向訊號）
+                 "funding_oi_weighted": None}
     try:
         from market_intel_mcp.sources import get_source
         src = get_source()
@@ -611,7 +714,7 @@ async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
                 return None
         # 多空比用大戶帳戶比（top_trader_account）；"global" 非有效 ratio_type
         (cvd, oi, fund, pos, fser, lser,
-         basis, struct, senti) = await _aio.gather(
+         basis, struct, senti, fwt) = await _aio.gather(
             _safe(src.get_cvd_series(symbol, tf, n)),
             _safe(src.get_oi(symbol, tf, n)),
             _safe(src.get_funding(symbol)),
@@ -621,12 +724,14 @@ async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
             _safe(src.get_spot_futures_basis(symbol)),
             _safe(src.get_structure(symbol)),
             _safe(src.get_sentiment()),
+            _safe(src.get_funding_weighted(symbol, "oi", tf, n)),  # M5
         )
         if cvd and not cvd.get("error") and cvd.get("series"):
             out["cvd"] = [s["value"] for s in cvd["series"]][-n:]
             out["cvd_slope"] = cvd.get("cvd_slope")
         if oi and not oi.get("error") and oi.get("series"):
             out["oi"] = [s["value"] for s in oi["series"]][-n:]
+            out["oi_ts"] = [s.get("ts") for s in oi["series"]][-n:]   # M4 ts 對齊用（與 oi 同切片）
             out["oi_delta_24h"] = oi.get("delta_pct_24h")
         if fund and not fund.get("error"):
             out["funding"] = fund.get("funding") or fund.get("latest")
@@ -658,6 +763,8 @@ async def _fetch_coinglass_overlays(symbol: str, tf: str, n: int) -> dict:
                 "fg_label": senti.get("fear_greed_label"),
                 "ahr999": senti.get("ahr999_now"),
                 "ahr999_label": senti.get("ahr999_label")}
+        if fwt and not fwt.get("error"):   # M5
+            out["funding_oi_weighted"] = fwt.get("latest")
     except Exception as e:
         print(f"[chart] coinglass overlay error: {type(e).__name__}: {e}")
     return out

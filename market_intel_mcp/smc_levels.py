@@ -41,6 +41,8 @@ def compute_smc_levels(candles: list[dict], swing_length: int = 10) -> dict:
             "bos_choch": [{type='BOS'|'CHOCH', direction='bull'|'bear', level, ago_bars}],
             "liquidity": [{type, level, ago_bars}, ...],
             "swing_points": [{type='high'|'low', level, ago_bars}, ...],
+            "premium_discount": {swing_high, swing_low, equilibrium, price_position, zone},
+            "ote": {long:{low,high,sweet,in_zone}, short:{low,high,sweet,in_zone}},
             "current_price": float,
             "candle_count": int,
         }
@@ -60,6 +62,9 @@ def compute_smc_levels(candles: list[dict], swing_length: int = 10) -> dict:
     current_price = float(df["close"].iloc[-1])
     n = len(df)
     out = {"current_price": current_price, "candle_count": n}
+    # 共用真實波幅 ATR（與 chart_render._atr 同算法）→ 讓 L_b OB 強度 / H3 FVG 位移
+    # 門檻與圖表的 0.45×ATR 過濾「真正」用同一把尺，兌現 synthesizer「與圖表一致」之承諾。
+    _atr14 = _atr_tr(df)
 
     try:
         # === Swing Highs / Lows ===
@@ -88,6 +93,7 @@ def compute_smc_levels(candles: list[dict], swing_length: int = 10) -> dict:
         if swings is not None:
             ob_df = smc.ob(df, swings, close_mitigation=False)
             order_blocks = []
+            # L_b: OB 強度 = 實體位移(vs ATR) × 新近度衰減（補實 docstring 承諾的 strength）
             for i in range(len(ob_df) - 1, -1, -1):
                 ob_type = ob_df["OB"].iloc[i] if "OB" in ob_df.columns else None
                 if ob_type is not None and not _isnan(ob_type):
@@ -103,6 +109,9 @@ def compute_smc_levels(candles: list[dict], swing_length: int = 10) -> dict:
                             "mitigated": mitigated is not None,
                             "ago_bars": n - 1 - i,
                             "mid_distance_pct": round(((float(top) + float(bot))/2 - current_price) / current_price * 100, 3),
+                            "strength": round(min(100.0,
+                                (abs(float(top) - float(bot)) / _atr14) * 50.0
+                                * (0.5 ** ((n - 1 - i) / 30.0))), 1),
                         })
                 if len(order_blocks) >= 5:
                     break
@@ -114,18 +123,21 @@ def compute_smc_levels(candles: list[dict], swing_length: int = 10) -> dict:
         # === FVG (Fair Value Gap) ===
         fvg_df = smc.fvg(df, join_consecutive=True)
         fvg_list = []
+        # H3: displacement 旗標（與圖表一致：形成 K 實體 ≥0.45×ATR 才算有效 FVG，濾盤整雜訊）
         for i in range(len(fvg_df) - 1, -1, -1):
             f_type = fvg_df["FVG"].iloc[i] if "FVG" in fvg_df.columns else None
             if f_type is not None and not _isnan(f_type):
                 top = fvg_df["Top"].iloc[i] if "Top" in fvg_df.columns else None
                 bot = fvg_df["Bottom"].iloc[i] if "Bottom" in fvg_df.columns else None
                 if top is not None and bot is not None and not _isnan(top) and not _isnan(bot):
+                    _body = abs(float(df["close"].iloc[i]) - float(df["open"].iloc[i]))
                     fvg_list.append({
                         "type": "bullish" if f_type == 1 else "bearish",
                         "top": round(float(top), 6),
                         "bottom": round(float(bot), 6),
                         "ago_bars": n - 1 - i,
                         "mid_distance_pct": round(((float(top) + float(bot))/2 - current_price) / current_price * 100, 3),
+                        "significant": bool(_body >= 0.45 * _atr14),
                     })
             if len(fvg_list) >= 5:
                 break
@@ -184,16 +196,72 @@ def compute_smc_levels(candles: list[dict], swing_length: int = 10) -> dict:
     except Exception as e:
         out["liquidity_error"] = str(e)
 
+    try:
+        # === H4: Premium / Discount / Equilibrium + OTE（純價格幾何，無新數據）===
+        # 用最近 swing 高低界定區間：>均衡=溢價(找空)、<均衡=折價(找多)。
+        # OTE(Optimal Trade Entry)＝0.618–0.79 回撤帶、甜蜜點 0.705。
+        sp = out.get("swing_points") or []
+        highs = [s["level"] for s in sp if s.get("type") == "high"]
+        lows = [s["level"] for s in sp if s.get("type") == "low"]
+        if highs and lows:
+            swing_high = max(highs)
+            swing_low = min(lows)
+            rng = swing_high - swing_low
+            if rng > 0:
+                pos = (current_price - swing_low) / rng   # 0=低 .. 1=高
+                out["premium_discount"] = {
+                    "swing_high": round(swing_high, 6),
+                    "swing_low": round(swing_low, 6),
+                    "equilibrium": round(swing_low + rng * 0.5, 6),
+                    "price_position": round(pos, 4),
+                    "zone": ("premium" if pos > 0.55 else
+                             "discount" if pos < 0.45 else "equilibrium"),
+                }
+                # 多方 OTE：回踩上升腿的折價區（0.618–0.79 回撤＝swing_low+0.21..0.382）
+                long_lo = swing_low + rng * 0.21
+                long_hi = swing_low + rng * 0.382
+                # 空方 OTE：回抽下跌腿的溢價區（swing_low+0.618..0.79）
+                short_lo = swing_low + rng * 0.618
+                short_hi = swing_low + rng * 0.79
+                out["ote"] = {
+                    "long": {"low": round(long_lo, 6), "high": round(long_hi, 6),
+                             "sweet": round(swing_low + rng * 0.295, 6),
+                             "in_zone": long_lo <= current_price <= long_hi},
+                    "short": {"low": round(short_lo, 6), "high": round(short_hi, 6),
+                              "sweet": round(swing_low + rng * 0.705, 6),
+                              "in_zone": short_lo <= current_price <= short_hi},
+                }
+    except Exception as e:
+        out["premium_discount_error"] = str(e)
+
     return out
 
 
 def _isnan(x) -> bool:
-    """安全的 NaN 檢查（dataframe 取值常常是 NaN）"""
+    """安全的 NaN 檢查（dataframe 取值常是 numpy.float64，非 Python float→須先轉 float）"""
+    if x is None:
+        return True
     try:
         import math
-        return x is None or (isinstance(x, float) and math.isnan(x))
+        return math.isnan(float(x))   # numpy NaN 也吃得到（修 liquidity $nan 餵 LLM 的舊 bug）
+    except (TypeError, ValueError):
+        return False
+
+
+def _atr_tr(df, period: int = 14) -> float:
+    """真實波幅 ATR：mean(TR) over 最後 period 根，TR=max(h-l,|h-pc|,|l-pc|)。
+    與 chart_render._atr 同定義，讓 L_b/H3 的位移門檻與圖表 0.45×ATR 過濾用同一把尺。
+    任何異常或 NaN/0 都退回 1e-9（避免除零、且不誤判位移）。"""
+    try:
+        import pandas as pd
+        pc = df["close"].shift(1)
+        tr = pd.concat([(df["high"] - df["low"]).abs(),
+                        (df["high"] - pc).abs(),
+                        (df["low"] - pc).abs()], axis=1).max(axis=1)
+        v = float(tr.tail(period).mean())
+        return v if (v and v == v) else 1e-9   # v==v 過濾 NaN
     except Exception:
-        return x is None
+        return 1e-9
 
 
 def compute_smc_multi_tf(candles_by_tf: dict[str, list[dict]]) -> dict:

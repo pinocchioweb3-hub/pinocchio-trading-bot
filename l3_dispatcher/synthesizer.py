@@ -512,6 +512,23 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
         parts.append("（Wyckoff 定方向偏置與『該不該等』；Spring/UTAD 是高勝率反轉前置，"
                      "但須 CVD/OI 同向驗證避免假突破。）\n")
 
+    # M2：多時框對齊驗證（HTF 1d → LTF 4h）— 高層偏置閘，deepdive 須據此調整信心
+    ha = sym_state.get("htf_alignment") or {}
+    if ha.get("verdict") and ha["verdict"] != "unknown":
+        parts.append(f"## 🎯 多時框對齊（HTF 1d → LTF 4h）：{ha['note']}")
+        seg = []
+        if ha.get("ltf_signal"):
+            seg.append(f"4h 最新結構={ha['ltf_signal']}")
+        if ha.get("htf_trend"):
+            seg.append(f"1d 趨勢={ha['htf_trend']}")
+        if ha.get("price_1d_zone"):
+            seg.append(f"現價在 1d {ha['price_1d_zone']} 區")
+        if seg:
+            parts.append("- " + "／".join(seg))
+        parts.append("（規則：順 1d 趨勢、且在 1d 折價區做多／溢價區做空＝高勝率；"
+                     "逆勢或追高殺低＝接刀。此為輔助偏置非硬性否決——若逆 HTF 仍要做，"
+                     "必須有強力獨立數據確認並在文中標註勝率較低、縮小倉位。）\n")
+
     # 多時框型態
     pattern = sym_state.get("pattern", {})
     if pattern and not pattern.get("error"):
@@ -580,6 +597,11 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
             ftone = ("過熱偏多（軋空風險）" if f > 0.0005 else
                      "偏空（空頭擁擠）" if f < -0.0005 else "中性")
             parts.append(f"- 資金費率：{f*100:+.4f}%/8h（{ftone}）")
+        if cg.get("funding_oi_weighted") is not None:   # M5
+            fw = cg["funding_oi_weighted"]
+            wtone = ("（OI 加權偏高＝大倉位方向擁擠，反指/軋空風險↑）" if fw > 0.0005 else
+                     "（OI 加權偏低＝空方擁擠，反彈風險↑）" if fw < -0.0005 else "")
+            parts.append(f"- 資金費率(OI 加權)：{fw*100:+.4f}%{wtone}")
         if cg.get("ls_ratio") is not None:
             ls = cg["ls_ratio"]
             ltone = "大戶偏多" if ls > 1.05 else "大戶偏空" if ls < 0.95 else "多空均衡"
@@ -591,6 +613,15 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
             fuel = ("空頭被清算較多→軋空燃料" if sh > lo * 1.3 else
                     "多頭被清算較多→下殺燃料" if lo > sh * 1.3 else "多空清算均衡")
             parts.append(f"- 近24h 清算：多 {lo:.2f}M／空 {sh:.2f}M USD（{fuel}）")
+        clusters = cg.get("liq_clusters") or []   # M1
+        if clusters:
+            parts.append("- 清算密集價帶（估計分佈，非真實掛單／非熱力圖，流動性磁吸參考）：")
+            for cl in clusters:
+                dom = {"long": "多單清算為主→下方磁吸/支撐曾被洗",
+                       "short": "空單清算為主→上方磁吸/軋空帶",
+                       "balanced": "多空均衡"}.get(cl["dominant"], "")
+                parts.append(f"  · ${cl['low']:.4g}–${cl['high']:.4g}："
+                             f"${cl['total']/1e6:.1f}M（{dom}）")
         basis = cg.get("basis") or {}
         if basis.get("pct") is not None:
             parts.append(f"- 期現基差：{basis['pct']:+.3f}%"
@@ -663,30 +694,70 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                 for sp in swings:
                     parts.append(f"  - {sp['type']} @ ${sp['level']} ({sp['distance_pct']:+.2f}%, {sp['ago_bars']} 根前)")
 
-            # Order Blocks
-            obs = levels.get("order_blocks", [])
+            # Order Blocks（H3：只取未緩解、依強度排序，與圖一致；L_b：附強度）
+            obs_all = levels.get("order_blocks", [])
+            obs = sorted([o for o in obs_all if not o.get("mitigated")],
+                         key=lambda o: o.get("strength", 0), reverse=True)
             if obs:
-                parts.append(f"**Order Block（最近 {len(obs)} 個）**：")
+                _drop = len(obs_all) - len(obs)
+                parts.append(f"**Order Block（未緩解 {len(obs)} 個，與圖一致"
+                             + (f"；另 {_drop} 個已 mitigated 略過" if _drop else "") + "）**：")
                 for ob in obs:
-                    status = "已 mitigated" if ob['mitigated'] else "✓ 未觸及（有效）"
                     parts.append(f"  - {ob['type']} OB: ${ob['bottom']:.2f} – ${ob['top']:.2f} "
-                               f"({ob['mid_distance_pct']:+.2f}%, {ob['ago_bars']} 根前, {status})")
+                               f"({ob['mid_distance_pct']:+.2f}%, {ob['ago_bars']} 根前, "
+                               f"強度 {ob.get('strength', 0):.0f}/100)")
 
-            # FVG
-            fvgs = levels.get("fvg", [])
+            # FVG（H3：只取位移達標的，與圖表 0.45×ATR 過濾一致）
+            fvgs_all = levels.get("fvg", [])
+            fvgs = [f for f in fvgs_all if f.get("significant", True)]
             if fvgs:
-                parts.append(f"**FVG (Fair Value Gap)**：")
+                _drop = len(fvgs_all) - len(fvgs)
+                parts.append("**FVG (Fair Value Gap，已過位移過濾"
+                             + (f"；另 {_drop} 個位移不足略過" if _drop else "") + ")**：")
                 for f in fvgs:
                     parts.append(f"  - {f['type']} FVG: ${f['bottom']:.2f} – ${f['top']:.2f} "
                                f"({f['mid_distance_pct']:+.2f}%, {f['ago_bars']} 根前)")
 
-            # BoS / CHoCH
+            # BoS / CHoCH（M4：附 OI 確認真偽）
             bcs = levels.get("bos_choch", [])
             if bcs:
                 parts.append(f"**結構變化（BoS / CHoCH）**：")
                 for bc in bcs:
-                    parts.append(f"  - {bc['type']} {bc['direction']} @ ${bc['level']} "
-                               f"({bc['ago_bars']} 根前)")
+                    line = (f"  - {bc['type']} {bc['direction']} @ ${bc['level']} "
+                            f"({bc['ago_bars']} 根前)")
+                    if bc.get("oi_confirm"):
+                        line += f"｜OI：{bc['oi_confirm']}"
+                    parts.append(line)
+
+            # H4：Premium / Discount / Equilibrium + OTE 進場區
+            pd = levels.get("premium_discount") or {}
+            if pd.get("zone"):
+                zmap = {"premium": "溢價區（偏找空、不追多）",
+                        "discount": "折價區（偏找多、不追空）",
+                        "equilibrium": "均衡區（中性）"}
+                parts.append(f"**溢價/折價（{tf}）**：現價位於 {zmap.get(pd['zone'], pd['zone'])}"
+                             f"，區間 ${pd['swing_low']:.4g}–${pd['swing_high']:.4g}"
+                             f"，均衡線 ${pd['equilibrium']:.4g}，位置 {pd['price_position']:.0%}")
+                ote = levels.get("ote") or {}
+                lo, sh = ote.get("long") or {}, ote.get("short") or {}
+                if lo and sh:
+                    parts.append(
+                        f"  - OTE 多方甜蜜帶 ${lo['low']:.4g}–${lo['high']:.4g}"
+                        f"{'（現價在此✓）' if lo.get('in_zone') else ''}；"
+                        f"OTE 空方甜蜜帶 ${sh['low']:.4g}–${sh['high']:.4g}"
+                        f"{'（現價在此✓）' if sh.get('in_zone') else ''}")
+
+            # H2：流動性掃單（Spring/UTAD，最有 alpha 的反轉前置）+ M4 OI 確認
+            sweeps = levels.get("liquidity_sweeps") or []
+            if sweeps:
+                parts.append(f"**流動性掃單（Spring/UTAD，{tf}）**：")
+                for sw in sweeps:
+                    tag = ("▲ 下方掃單(Spring，偏多反轉)" if sw["dir"] == "up"
+                           else "▼ 上方掃單(UTAD，偏空反轉)")
+                    line = f"  - {tag} @ ${sw['level']:.4g}（{sw['ago_bars']} 根前）"
+                    if sw.get("oi_confirm"):
+                        line += f"｜OI：{sw['oi_confirm']}"
+                    parts.append(line)
 
             # Liquidity
             liqs = levels.get("liquidity", [])
