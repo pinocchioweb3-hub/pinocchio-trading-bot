@@ -158,7 +158,9 @@ def simulate(
     return TradeOutcome(
         symbol, setup_name, direction, entry_ts, entry_price,
         stop, tps,
-        realized_r=round(realized_r, 4),
+        # v33 修正(對抗複查 CRITICAL)：timeout 路徑先前漏扣 cost_r，與 stop/tp_all
+        # 兩條路徑及 docstring「已扣來回成本」不一致 → 補上，三條出場路徑一致淨值
+        realized_r=round(realized_r - cost_r, 4),
         legs_hit=tuple(legs_hit),
         exit_reason="timeout" if legs_hit else "timeout_no_partial",
         exit_ts=exit_ts, bars_held=bars,

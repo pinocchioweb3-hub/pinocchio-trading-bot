@@ -24,3 +24,5 @@ real_backtest_output.txt
 deepdive_btc_v2.txt
 charts/
 *.backup_*.db
+backtest/_wf_*_out.txt
+backtest/_cg_conf_cache/
