@@ -54,15 +54,18 @@ FEATURES = [
     {"key": "discipline_kpi", "name": "紀律遵守率 KPI（決斷率+不追高率）", "kind": "risk", "status": "shipped"},
     # 治理 / 對外
     {"key": "decision_registry", "name": "決策佇列（需發起人拍板）", "kind": "gov", "status": "shipped"},
-    {"key": "outbox", "name": "對外內容待審佇列（/approve）", "kind": "gov", "status": "shipped"},
+    {"key": "outbox", "name": "對外內容待審佇列（/approve）", "kind": "gov", "status": "partial",
+     "note": "模組+/approve 已上線；目前 Threads 草稿走 docs/threads 人工佇列，尚未自動餵入 outbox"},
     {"key": "promotion_gate", "name": "Phase 0 達標偵測（AI 不自我宣告）", "kind": "gov", "status": "shipped"},
     {"key": "rebate_tiers", "name": "返佣誠實分級標籤", "kind": "gov", "status": "shipped"},
     # 驗證真實性
     {"key": "okx_paper", "name": "OKX 模擬盤自動下單（驗證持倉真實性）", "kind": "verify", "status": "blocked",
      "note": "等使用者建 OKX Demo 金鑰"},
     # 呈現 / 信任
-    {"key": "dual_audience", "name": "雙受眾呈現層（人話卡+機器JSON）", "kind": "ux", "status": "planned"},
-    {"key": "trust_site", "name": "靜態信任網頁（GitHub Pages）", "kind": "ux", "status": "planned"},
+    {"key": "dual_audience", "name": "雙受眾呈現層（人話卡+機器JSON）", "kind": "ux", "status": "partial",
+     "note": "人話卡(message_format)+機器JSON(intent_format)+白話對照(glossary)已具雛形；新手/專家模式待整合"},
+    {"key": "trust_site", "name": "靜態信任網頁（GitHub Pages）", "kind": "ux", "status": "partial",
+     "note": "docs/trust-site 骨架+設計+資料檔已就緒；尚未部署 Pages、狀態列待接動態 JSON"},
     {"key": "build_log", "name": "建造日誌連載", "kind": "ux", "status": "blocked",
      "note": "使用者說晚點再看，不發布"},
 ]

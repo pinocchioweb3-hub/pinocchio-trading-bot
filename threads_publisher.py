@@ -1,26 +1,32 @@
-"""Threads 自動發布管線（v20）— 建造日誌自動連載的地基。
+"""Threads 發布管線（v20；v47 紅線 2 程式層硬擋）— 建造日誌的地基。
+
+⛔ 紅線 2：AI／背景 daemon **永不自動發文**，發布永遠由人類當下逐則送出。
+   本版把這條線寫死在程式層（不再只靠『沒 token＋沒人寫佇列』的運行態空值）：
+     ① 背景 worker（process_queue_once）物理上不送出，只偵測待送草稿並通知人類。
+     ② 真正送出（publish_text）必須 human_authorized=True（人類當下逐則授權）。
+     ③ 此閘 per-session、不被既往 /approve 覆蓋。詳見 WORKER_AUTOPUBLISH_HARD_BLOCK。
 
 設計：
     1. Token 管理：.env THREADS_ACCESS_TOKEN 為 bootstrap，續期後的新 token
-       存 threads.db（token 永不出現在聊天室/日誌 — 只顯示遮罩尾碼）
+       存 threads.db（token 永不出現在聊天室/日誌 — 只顯示遮罩尾碼）；洩漏 token 黑名單防呆。
     2. 60 天長效 token 自動續期：距到期 <14 天且 token 齡 >24h 時
        GET /refresh_access_token（Threads 續期不需 app secret）
     3. 發文佇列：posts_queue 表（pending→posted/failed），預設每日上限 1 篇
-       — 新帳號穩健起步，避免觸發 Meta 防濫用
     4. 兩段式發布：POST /{uid}/threads（建立容器）→ POST /{uid}/threads_publish
-    5. worker：run_threads_publisher_loop() 每 30 分鐘檢查佇列 + token 健康
-       未設定 token 時優雅 no-op（每小時靜默重查一次 env）
+    5. worker：run_threads_publisher_loop() 每 30 分鐘做 token 健康 + 待送草稿通知
+       （永不自動發文）；未設定 token 時優雅 no-op（每小時靜默重查一次 env）
 
 CLI（手動操作）：
-    python threads_publisher.py status            # token 狀態 + 佇列摘要
-    python threads_publisher.py whoami            # 驗證 token（顯示帳號名）
-    python threads_publisher.py queue "文字"      # 排入佇列（依每日上限自動排程）
-    python threads_publisher.py post-now "文字"   # 立即發布（仍受 500 字限制）
-    python threads_publisher.py refresh           # 手動強制續期
+    python threads_publisher.py status              # token 狀態 + 佇列摘要
+    python threads_publisher.py whoami              # 驗證 token（顯示帳號名）
+    python threads_publisher.py queue "文字"        # 排入佇列（不會自動送出，待人手發）
+    python threads_publisher.py post-now "文字" --yes  # 人類親自立即發布（紅線 2：須 --yes）
+    python threads_publisher.py refresh             # 手動強制續期
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sqlite3
 import sys
@@ -43,7 +49,26 @@ REFRESH_BEFORE_DAYS = 14      # 距到期 <14 天就續期
 TOKEN_MIN_AGE_S = 86400       # Meta 規定 token 滿 24h 才能續期
 TOKEN_TTL_S = 60 * 86400      # 長效 token 60 天
 
+# ⛔⛔ 紅線 2 程式層硬擋（v47）⛔⛔ ─────────────────────────────────────────
+# 永久紅線 2：「AI／背景 daemon 永不自動發文，發布永遠由人類當下逐則送出。」
+# 過去這條線只靠『沒填 token＋沒人寫佇列』這種運行態空值維持（稽核 #1 HIGH）：
+# 一旦有人填了 token、且任何程式或 CLI 把內容寫進 posts_queue，每 30 分的 worker
+# 就會自動發文 —— 與承諾不符。本版把它寫死在程式層，雙層防護：
+#   ① 背景 worker（process_queue_once）物理上不送出，只做 token 健康 + 待送偵測/通知。
+#   ② 真正送出（publish_text）必須由「人類當下、逐則」明確授權（human_authorized=True）；
+#      背景 worker 路徑永不傳此旗標，故即使有 token＋佇列有料，worker 也送不出去。
+#   ③ 此閘 per-session、不被既往 /approve 覆蓋（已核准＝內容過關，≠ 自動送出許可）。
+# 對應記憶：trading-bot-threads-operating-model。
+WORKER_AUTOPUBLISH_HARD_BLOCK = True
+
+# 洩漏 token 黑名單（防呆）：曾外洩作廢的 THREADS_ACCESS_TOKEN 一律拒用。
+# 為免把秘鑰寫進原始碼／日誌，這裡只存 SHA-256 指紋（小寫 hex），不存 token 本體。
+# 使用者若要把舊洩漏 token 列黑：在 Meta 後台重新產生新 token（舊的即在伺服器端失效），
+# 並可選擇性把舊 token 的 sha256 hex 加進下方集合做本地雙保險。
+_BLACKLISTED_TOKEN_SHA256: set[str] = set()
+
 _NOOP_LOGGED = False
+_DRAFT_READY_NOTIFIED = -1   # 上次已通知的「待送草稿數」（避免每 30 分重複洗版）
 
 
 def _conn() -> sqlite3.Connection:
@@ -88,6 +113,14 @@ def _mask(token: str) -> str:
     return f"...{token[-4:]}" if token and len(token) > 8 else "(無)"
 
 
+def _token_blacklisted(token: str) -> bool:
+    """token 是否在洩漏黑名單（比對 SHA-256 指紋，永不回顯 token 本體）。"""
+    if not token or not _BLACKLISTED_TOKEN_SHA256:
+        return False
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return digest in _BLACKLISTED_TOKEN_SHA256
+
+
 # ── Token 管理 ──────────────────────────────────────────────────────────
 
 def load_token() -> dict | None:
@@ -101,9 +134,18 @@ def load_token() -> dict | None:
     finally:
         conn.close()
     env_tok = (os.environ.get("THREADS_ACCESS_TOKEN") or "").strip()
+    # 防呆：.env 若塞了已洩漏作廢的 token，直接拒用（不 seed、不回顯）
+    if env_tok and _token_blacklisted(env_tok):
+        print("[threads] ⛔ .env 的 THREADS_ACCESS_TOKEN 命中洩漏黑名單，拒用 —— "
+              "請到 Meta 後台重新產生新 token")
+        env_tok = ""
     if row:
         tok = {"access_token": row[0], "obtained_ts": row[1], "expires_at": row[2],
                "user_id": row[3], "username": row[4]}
+        # DB 內若是已洩漏 token（理論上不該發生）→ 拒用
+        if _token_blacklisted(tok["access_token"]):
+            print("[threads] ⛔ DB 內 token 命中洩漏黑名單，拒用")
+            return None
         # .env 換了新 token（手動重新產生）→ 以 .env 為準重新 seed
         if env_tok and env_tok != tok["access_token"]:
             return _seed_token(env_tok)
@@ -204,8 +246,18 @@ async def refresh_token_if_needed(force: bool = False) -> str:
 
 # ── 發布 ────────────────────────────────────────────────────────────────
 
-async def publish_text(text: str, reply_to_id: str | None = None) -> dict:
-    """兩段式發布。reply_to_id 非空時發成「回覆」（用於串文鏈接）。回 {ok, post_id?|error}。"""
+async def publish_text(text: str, reply_to_id: str | None = None,
+                       *, human_authorized: bool = False) -> dict:
+    """兩段式發布。reply_to_id 非空時發成「回覆」（用於串文鏈接）。回 {ok, post_id?|error}。
+
+    ⛔ 紅線 2 程式層硬擋：必須 ``human_authorized=True`` 才會真的送出 —— 代表「人類當下、
+    逐則」明確授權（CLI post-now --yes，或未來的 /send 由人在 session 中下達）。
+    背景 worker（process_queue_once）永不傳此旗標，故物理上無法自動發文。
+    """
+    if not human_authorized:
+        return {"ok": False,
+                "error": "blocked_redline2: 需人類當下逐則授權（human_authorized=True）"
+                         "才可發文；背景自動發文已於程式層擋死"}
     text = (text or "").strip()
     if not text:
         return {"ok": False, "error": "empty"}
@@ -270,38 +322,36 @@ def enqueue_post(text: str, scheduled_for: int = 0) -> dict:
         conn.close()
 
 
-async def process_queue_once() -> dict | None:
-    """取一則到期的 pending 發布（尊重每日上限）。回發布結果或 None=本輪無事。"""
+def _count_pending_ready() -> int:
+    """到期、待送的 pending 草稿數（供 worker 通知人類，不送出）。"""
     init_db()
-    if _posted_in_last_24h() >= POSTS_PER_DAY:
-        return None
     now = int(time.time())
     conn = _conn()
     try:
-        row = conn.execute(
-            "SELECT id, text FROM posts_queue WHERE status='pending' "
-            "AND scheduled_for <= ? ORDER BY id LIMIT 1", (now,)).fetchone()
+        return conn.execute(
+            "SELECT COUNT(*) FROM posts_queue WHERE status='pending' "
+            "AND scheduled_for <= ?", (now,)).fetchone()[0]
     finally:
         conn.close()
-    if not row:
+
+
+async def process_queue_once() -> dict | None:
+    """⛔ 紅線 2 程式層硬擋：背景 worker 永不自動發文。
+
+    本函式**不送出任何內容**，只偵測「有無到期、待送的草稿」並回報，讓 worker 能
+    通知人類去手動送出。真正送出永遠要人類當下逐則授權（見 publish_text /
+    CLI post-now --yes / 未來 /send）。
+    回 None＝本輪無待送；回 dict（blocked=True, pending_ready=N）＝有 N 則待人手送出。
+    """
+    if not WORKER_AUTOPUBLISH_HARD_BLOCK:
+        # 安全旗標被關掉是嚴重事故 —— 仍拒絕送出並出聲，絕不悄悄自動發文。
+        print("[threads] ⚠️ WORKER_AUTOPUBLISH_HARD_BLOCK 被關閉，"
+              "仍依紅線 2 拒絕背景自動發文")
+    ready = _count_pending_ready()
+    if ready <= 0:
         return None
-    qid, text = row
-    result = await publish_text(text)
-    conn = _conn()
-    try:
-        if result["ok"]:
-            conn.execute(
-                "UPDATE posts_queue SET status='posted', posted_ts=?, threads_post_id=? "
-                "WHERE id=?", (now, result["post_id"], qid))
-        else:
-            conn.execute(
-                "UPDATE posts_queue SET status='failed', error=? WHERE id=?",
-                (result["error"][:300], qid))
-    finally:
-        conn.close()
-    result["queue_id"] = qid
-    result["text_head"] = text[:60]
-    return result
+    return {"ok": False, "blocked": True, "pending_ready": ready,
+            "error": "redline2_hard_block: 草稿待人手送出，背景永不自動發文"}
 
 
 def queue_summary() -> dict:
@@ -318,8 +368,12 @@ def queue_summary() -> dict:
 # ── Worker（接入 run_bot.py supervise）────────────────────────────────────
 
 async def run_threads_publisher_loop(tg_sys=None, interval_s: int = 1800) -> None:
-    """每 30 分鐘：token 健康檢查 + 佇列發布。無 token 時優雅 no-op。"""
-    global _NOOP_LOGGED
+    """每 30 分鐘：token 健康檢查 + 待送草稿偵測通知。
+
+    ⛔ 紅線 2：本 worker **永不自動發文**（process_queue_once 已程式層擋死），
+    只在有草稿待送時提醒人類去手動送出。無 token 時優雅 no-op。
+    """
+    global _NOOP_LOGGED, _DRAFT_READY_NOTIFIED
     while True:
         try:
             tok = load_token()
@@ -342,21 +396,21 @@ async def run_threads_publisher_loop(tg_sys=None, interval_s: int = 1800) -> Non
                 except Exception:
                     pass
 
+            # ⛔ 紅線 2：偵測待送草稿 → 只通知人類，永不自動發文
             result = await process_queue_once()
-            if result is not None and tg_sys is not None:
-                try:
-                    if result["ok"]:
+            ready = result.get("pending_ready", 0) if result else 0
+            if ready != _DRAFT_READY_NOTIFIED:
+                if ready > 0 and tg_sys is not None:
+                    try:
                         await tg_sys.send_message(
-                            f"🧵 <b>Threads 已發布</b>（佇列 #{result['queue_id']}）\n"
-                            f"<i>{result['text_head']}…</i>",
+                            f"🧵 <b>有 {ready} 則 Threads 草稿待送</b>\n"
+                            "依紅線 2，我<b>不會自動發文</b> —— 請你手動複製貼到 Threads，"
+                            "或用 <code>python threads_publisher.py post-now \"文字\" --yes</code> "
+                            "親自送出。",
                             parse_mode="HTML")
-                    else:
-                        await tg_sys.send_message(
-                            f"⚠️ <b>Threads 發布失敗</b>（佇列 #{result['queue_id']}）\n"
-                            f"<code>{result['error'][:200]}</code>",
-                            parse_mode="HTML")
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+                _DRAFT_READY_NOTIFIED = ready
         except Exception as e:
             print(f"[threads] loop error: {type(e).__name__}: {str(e)[:200]}")
         await asyncio.sleep(interval_s)
@@ -392,8 +446,16 @@ def _cli() -> int:
         r = enqueue_post(args[1])
         print(f"enqueue: {r}")
         return 0 if r["ok"] else 1
-    if cmd == "post-now" and len(args) > 1:
-        r = asyncio.run(publish_text(args[1]))
+    if cmd == "post-now":
+        text_args = [a for a in args[1:] if a != "--yes"]
+        if not text_args:
+            print(__doc__)
+            return 1
+        if "--yes" not in args:
+            print("⛔ 紅線 2：post-now 會真的發到 Threads，需你（人類）當下明確確認。")
+            print('   請改用： python threads_publisher.py post-now "文字" --yes')
+            return 1
+        r = asyncio.run(publish_text(text_args[0], human_authorized=True))
         print(f"post: {r}")
         return 0 if r["ok"] else 1
     print(__doc__)

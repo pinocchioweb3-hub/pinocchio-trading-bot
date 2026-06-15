@@ -3,7 +3,8 @@
 槓桿規則（依使用者偏好）：
     LEVERAGE_OVERRIDES 字典硬寫優先（WLFI=5 永遠 5x）
     否則依 7d ATR/price (%)：
-        <5%  → 15x
+        <5%  → default（低波動用預設槓桿；default 未指定時讀 botconfig
+               的 DEFAULT_LEVERAGE，目前明確為 15x，使用者未拍板前不動）
         5–8% → 10x
         ≥8%  → 5x
     缺料 → 保守用 5x

@@ -156,7 +156,9 @@ async def mi_get_strength_rank(
     }
 
 
-@_tool
+# 注意：這是 mi_get_snapshot 內部的補值輔助函式（底線開頭），
+# **不是**對外 MCP 工具，不可掛 @_tool（否則會把內部 helper 連同 dict/list
+# 參數曝露給外部 MCP 客戶端，且 schema 不完整）。對外工具是下方的 mi_get_snapshot。
 async def _fill_stale_from_binance(sym: str, tf: str, snap: dict,
                                    stale_fields: list) -> None:
     """v33：CoinGlass/OKX 欄位 stale 時，用 Binance 永續(免key)補資料，提升資料品質。
@@ -232,6 +234,7 @@ async def _fill_stale_from_binance(sym: str, tf: str, snap: dict,
         pass
 
 
+@_tool
 async def mi_get_snapshot(
     symbol: Annotated[str, Field(description="目標標的（任意命名空間）")],
     tf: Annotated[str, Field(description="主分析時框")] = "1h",
