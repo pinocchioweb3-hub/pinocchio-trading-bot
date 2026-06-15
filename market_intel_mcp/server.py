@@ -156,7 +156,8 @@ async def _fill_stale_from_binance(sym: str, tf: str, snap: dict,
     """v33：CoinGlass/OKX 欄位 stale 時，用 Binance 永續(免key)補資料，提升資料品質。
     僅補 Binance 能提供的欄位；補到的從 stale_fields 移除。任何失敗靜默略過。"""
     fillable = {"price", "ts", "oi", "oi_delta_pct", "funding",
-                "funding_predicted", "top_trader_ratio", "ls_ratio"}
+                "funding_predicted", "top_trader_ratio", "ls_ratio",
+                "above_4h_200ma"}
     need = fillable & set(stale_fields)
     if not need:
         return
@@ -180,6 +181,9 @@ async def _fill_stale_from_binance(sym: str, tf: str, snap: dict,
             tasks.append(_s(src.get_positioning(sym, tf, 5))); keys.append("tt")
         if "ls_ratio" in need:
             tasks.append(_s(src.get_global_positioning(sym, tf, 5))); keys.append("ls")
+        if "above_4h_200ma" in need:
+            # 真 200MA：免key Binance 4h × 200 K線本地自算（取代 btc_gate 全域代理）
+            tasks.append(_s(src.get_candles(sym, "4h", 200))); keys.append("ma")
         res = dict(zip(keys, await asyncio.gather(*tasks)))
 
         def _good(r):
@@ -205,6 +209,14 @@ async def _fill_stale_from_binance(sym: str, tf: str, snap: dict,
             snap["top_trader_ratio"] = res["tt"]["latest"]; filled.append("top_trader_ratio")
         if "ls" in res and _good(res["ls"]) and res["ls"].get("latest") is not None:
             snap["ls_ratio"] = res["ls"]["latest"]; filled.append("ls_ratio")
+        if "ma" in res and _good(res["ma"]) and res["ma"].get("candles"):
+            closes = [c["close"] for c in res["ma"]["candles"]
+                      if isinstance(c.get("close"), (int, float))]
+            # 必須有滿 200 根才算「真 200MA」；不足則維持 stale（保守 HOLD，不造假）
+            if len(closes) >= 200:
+                ma200 = sum(closes[-200:]) / 200
+                snap["above_4h_200ma"] = closes[-1] > ma200
+                filled.append("above_4h_200ma")
         if filled:
             for fld in filled:
                 if fld in stale_fields:
@@ -337,13 +349,14 @@ async def mi_get_snapshot(
     else:
         _stale("btc_gate_open", "btc_regime")
 
-    # 4h 趨勢 above_4h_200ma：由 structure 算（從 4h × 200 OHLC）
-    # 若 structure 也無法算（資料不足）再 fallback 用 btc gate
+    # 4h 趨勢 above_4h_200ma：由 structure 算（從 4h × 200 OHLC）。
+    # structure 無法算時「不再」用全域 btc_gate 當個股 200MA 代理——那會餵假資料
+    # 給唯一的 live 過濾閘（個股未真站上自身 200MA、僅因 BTC 多頭就誤放多單）。
+    # 改標 stale，交由下方 _fill_stale_from_binance 用免key 4h×200 K線自算真 200MA；
+    # 連 Binance 也湊不滿 200 根 → 維持 stale（過濾閘保守 HOLD，不造假）。
     snap["above_4h_200ma"] = None
     if _ok(structure) and structure.get("above_4h_200ma") is not None:
         snap["above_4h_200ma"] = structure.get("above_4h_200ma")
-    elif _ok(gate) and gate.get("btc_gate_open"):
-        snap["above_4h_200ma"] = True
     if snap["above_4h_200ma"] is None:
         _stale("above_4h_200ma")
 
