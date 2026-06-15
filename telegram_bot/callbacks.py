@@ -288,6 +288,7 @@ def _cmd_help() -> str:
         "/status — 系統儀表板（持倉/待確認/PnL/風控）\n"
         "/stats [天數] — 績效統計（預設 7 天）\n"
         "📊 /profit [天數] — 公開績效卡（勝率/期望值/PF，加密+美股分開）\n"
+        "🎯 /discipline — 紀律遵守率（決斷率 + 不追高率，系統客觀記錄）\n"
         "/daily ・ /weekly — 當日／本週績效\n"
         "/contrib — 💡 貢獻積分排行榜\n"
         "/myscore — 查自己的積分與占比\n"
@@ -511,6 +512,13 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
                 reply = "用法：/reject <編號> [原因]"
         else:
             reply = "此指令僅限管理者"
+    elif cmd in ("discipline", "kpi"):
+        # v41: 紀律遵守率 KPI（決斷率 + 不追高率，皆由系統客觀記錄）
+        try:
+            from l3_dispatcher.trade_journal import discipline_stats, render_discipline
+            reply = render_discipline(discipline_stats(30))
+        except Exception as e:
+            reply = f"紀律 KPI 產生失敗：{type(e).__name__}: {e}"
     elif cmd == "help":
         reply = _cmd_help()
     elif cmd == "setup":

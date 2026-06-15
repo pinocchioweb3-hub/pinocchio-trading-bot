@@ -140,8 +140,12 @@ def _check_timeout(trade: dict, hold_max_hours: int = DEFAULT_HOLD_MAX_HOURS) ->
     return trade["size_remaining"]
 
 
-async def monitor_once(source, tg=None, tg_fire=None, tg_us=None) -> list[MonitorEvent]:
-    """掃一次所有 open trades（實倉 + 紙上）。回實倉觸發事件。"""
+async def monitor_once(source, tg=None, tg_fire=None, tg_us=None,
+                       coach_state=None) -> list[MonitorEvent]:
+    """掃一次所有 open trades（實倉 + 紙上）。回實倉觸發事件。
+
+    coach_state: 由呼叫端維護的 in-memory dict（含 'seen' set）→ 啟用教練層節流。
+                 None = 不跑教練（selftest 路徑保持純粹）。"""
     opens = get_open_trades()
     events: list[MonitorEvent] = []
     bars_cache: dict[str, list] = {}  # v16: 實倉/紙上共用同輪 K 線
@@ -226,7 +230,60 @@ async def monitor_once(source, tg=None, tg_fire=None, tg_us=None) -> list[Monito
     except Exception as e:
         print(f"[trade_monitor] waiting check error: {type(e).__name__}: {e}")
 
+    # === v41: 教練層（task #8 ⑤）— 凹單/追高/重壓/連續開倉的當下踩煞車 ===
+    if coach_state is not None and tg is not None:
+        try:
+            await _run_coach(tg, bars_cache, coach_state)
+        except Exception as e:
+            print(f"[trade_monitor] coach error: {type(e).__name__}: {e}")
+
     return events
+
+
+async def _run_coach(tg, bars_cache: dict[str, list], coach_state: dict) -> None:
+    """教練層：只針對使用者真正下單的實倉（get_open_trades），於紀律破口的當下提醒。
+
+    價格取自本輪已抓的 5m K 線（bars_cache 最後一根 close），不額外發網路請求。
+    節流：coach_state['seen'] 記已推 key；每筆單每型一生一次、帳戶級每日一次。"""
+    from .coach import build_coaching
+    from .risk_manager import get_risk_status
+
+    seen: set = coach_state.setdefault("seen", set())
+    # 重新讀實倉狀態（本輪已平倉的單已從清單移除，避免對已關單的提醒）
+    opens = get_open_trades()
+    if not opens:
+        # 仍要跑帳戶級教練（如「今天別再交易了」即使此刻無持倉）
+        prices: dict[str, float] = {}
+    else:
+        prices = {}
+        for o in opens:
+            bars = bars_cache.get(o["symbol"])
+            if bars:
+                prices[o["symbol"]] = bars[-1]["close"]
+
+    utc_date = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y-%m-%d")
+    try:
+        risk = get_risk_status()
+    except Exception as e:
+        print(f"[trade_monitor] coach risk read error: {e}")
+        risk = {}
+
+    # 節流集合防無限長：清掉非今日的帳戶級 key（位置級 key 無日期，量小不清）
+    for k in [x for x in seen
+              if (x.startswith("daily_stop:") or x.startswith("exposure:"))
+              and not x.endswith(utc_date)]:
+        seen.discard(k)
+
+    msgs = build_coaching(opens, prices, risk, utc_date)
+    for m in msgs:
+        if m.key in seen:
+            continue
+        try:
+            await tg.send_message(m.text, parse_mode="HTML")
+            seen.add(m.key)
+            print(f"[trade_monitor] coach pushed: {m.kind} ({m.key})")
+        except Exception as e:
+            print(f"[trade_monitor] coach push error: {e}")
 
 
 async def _check_waiting_trades(source, tg, bars_cache: dict[str, list],
@@ -541,6 +598,8 @@ async def run_trade_monitor_loop(tg, source, interval_seconds: int = 900,
 
     # v15: 熔斷狀態轉換偵測（False→True 的瞬間推即時警報，只推一次）
     breach_state = {"daily": False, "weekly": False}
+    # v41: 教練層節流狀態（跨迴圈常駐；重啟後重新武裝＝最多重提醒一次，可接受）
+    coach_state: dict = {"seen": set()}
 
     while True:
         try:
@@ -567,7 +626,8 @@ async def run_trade_monitor_loop(tg, source, interval_seconds: int = 900,
                     except Exception:
                         pass
 
-            events = await monitor_once(source, tg=tg, tg_fire=tg_alert, tg_us=tg_us)
+            events = await monitor_once(source, tg=tg, tg_fire=tg_alert, tg_us=tg_us,
+                                        coach_state=coach_state)
             opens_count = len(get_open_trades())
             if events:
                 event_summary = ", ".join(f"{e.symbol}/{e.event}" for e in events)

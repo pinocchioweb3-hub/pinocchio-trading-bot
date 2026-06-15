@@ -49,8 +49,8 @@ FEATURES = [
     {"key": "risk_gates", "name": "風控閘門（總曝險+日開倉上限，%制）", "kind": "risk", "status": "shipped"},
     {"key": "leverage_downshift", "name": "小資降槓桿（15x→3x）", "kind": "risk", "status": "blocked",
      "by": "decision", "note": "等發起人決策（影響實際倉位顯示）"},
-    {"key": "coach_monitor", "name": "教練式持倉提醒（別追高/該止損/今日別再交易）", "kind": "risk", "status": "planned"},
-    {"key": "discipline_kpi", "name": "紀律遵守率 KPI", "kind": "risk", "status": "planned"},
+    {"key": "coach_monitor", "name": "教練式持倉提醒（別追高/該止損/今日別再交易）", "kind": "risk", "status": "shipped"},
+    {"key": "discipline_kpi", "name": "紀律遵守率 KPI（決斷率+不追高率）", "kind": "risk", "status": "shipped"},
     # 治理 / 對外
     {"key": "decision_registry", "name": "決策佇列（需發起人拍板）", "kind": "gov", "status": "shipped"},
     {"key": "outbox", "name": "對外內容待審佇列（/approve）", "kind": "gov", "status": "shipped"},
@@ -180,7 +180,7 @@ def _bar(n: int, target: int, width: int = 10) -> str:
 # ===========================================================================
 def _section_normal() -> str:
     """✅ 一切正常·今日重點。"""
-    from .trade_journal import get_stats
+    from .trade_journal import discipline_stats, get_stats
     from .risk_manager import get_risk_status
 
     lines = ["✅ <b>一切正常 · 今日重點</b>", "━━━━━━━━━━━━━━━━"]
@@ -219,6 +219,21 @@ def _section_normal() -> str:
             f"今日 {rs['today_pnl_pct']:+.1f}%／週 {rs['week_pnl_pct']:+.1f}%")
     except Exception as e:
         lines.append(f"🛡 風控：讀取失敗（{type(e).__name__}）")
+
+    # 3.5) 紀律遵守率（task #8 ⑥）
+    try:
+        dsc = discipline_stats(30)
+        if dsc["overall_pct"] is not None:
+            lines.append(
+                f"🎯 紀律：{dsc['overall_pct']}%"
+                f"（決斷 {dsc['decisiveness_pct'] if dsc['decisiveness_pct'] is not None else '—'}%／"
+                f"不追高 {dsc['no_chase_pct'] if dsc['no_chase_pct'] is not None else '—'}%，近30天）")
+        else:
+            lines.append(
+                f"🎯 紀律：資料累積中（決斷 {dsc['acted']}/{dsc['ghosted']}、"
+                f"進場 {dsc['in_zone']}/{dsc['chased']}）")
+    except Exception:
+        pass
 
     # 4) 驗證進度（Phase 0）
     p = phase0_status()

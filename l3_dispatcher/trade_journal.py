@@ -928,6 +928,100 @@ def count_opens_today() -> int:
 
 
 # ===========================================================================
+# v41: 紀律遵守率 KPI（task #8 ⑥）— 全部來自可觀測欄位，零臆測
+# ===========================================================================
+DISCIPLINE_MIN_SAMPLE = 5   # 每分項至少 N 筆才報百分比，否則「資料累積中」
+
+
+def discipline_stats(days: int = 30) -> dict:
+    """紀律遵守率：兩個客觀指標，皆由 trades 表直接觀測得出（不靠自我感覺）。
+
+    A. 決斷率 decisiveness：對推送並已到終局的訊號，有意識處理（已下單 open/closed
+       或 主動略過 skipped）占 (處理 + 放生過期 expired) 的比例。
+       放生過期 = 看到訊號卻不做任何決定 = 不紀律。
+    B. 不追高率 no_chase：真正成為部位的單（open/closed）中，在計畫進場區內成交
+       （entry_kind direct_fire / wait_trigger）占全部進場（含 market_chase 追高）的比例。
+       market_chase = 成交價落在計畫進場區外 = 追高 = 不紀律。
+
+    分項樣本不足（< DISCIPLINE_MIN_SAMPLE）時對應 *_pct=None（顯示「資料累積中」），
+    絕不用小樣本充當有意義的百分比。
+    """
+    init_db()
+    conn = _conn()
+    try:
+        cutoff_ms = int(time.time() * 1000) - days * 86400 * 1000
+        rows = conn.execute(
+            "SELECT status, COALESCE(entry_kind, 'direct_fire') FROM trades "
+            "WHERE created_at >= ?", (cutoff_ms,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # A. 決斷率
+    acted = sum(1 for s, _ in rows if s in ("open", "closed", "skipped"))
+    ghosted = sum(1 for s, _ in rows if s == "expired")
+    dec_n = acted + ghosted
+    decisiveness = round(acted / dec_n * 100, 1) if dec_n >= DISCIPLINE_MIN_SAMPLE else None
+
+    # B. 不追高率（只看真正成為部位的單）
+    entries = [(s, k) for s, k in rows if s in ("open", "closed")]
+    in_zone = sum(1 for _, k in entries if k in ("direct_fire", "wait_trigger"))
+    chased = sum(1 for _, k in entries if k == "market_chase")
+    nz_n = in_zone + chased
+    no_chase = round(in_zone / nz_n * 100, 1) if nz_n >= DISCIPLINE_MIN_SAMPLE else None
+
+    parts = [r for r in (decisiveness, no_chase) if r is not None]
+    overall = round(sum(parts) / len(parts), 1) if parts else None
+
+    return {
+        "window_days": days,
+        "decisiveness_pct": decisiveness, "acted": acted, "ghosted": ghosted,
+        "no_chase_pct": no_chase, "in_zone": in_zone, "chased": chased,
+        "overall_pct": overall, "min_sample": DISCIPLINE_MIN_SAMPLE,
+    }
+
+
+def _disc_grade(pct: float | None) -> str:
+    if pct is None:
+        return "—"
+    if pct >= 90:
+        return "🟢 優秀"
+    if pct >= 75:
+        return "🟡 良好"
+    if pct >= 60:
+        return "🟠 待加強"
+    return "🔴 需警惕"
+
+
+def render_discipline(d: dict) -> str:
+    """文字化紀律 KPI（給 Telegram /discipline 與 CEO 簡報引用）。"""
+    lines = [f"🎯 <b>紀律遵守率（近 {d['window_days']} 天）</b>",
+             "━━━━━━━━━━━━━━━━"]
+    if d["overall_pct"] is None:
+        lines.append("資料累積中 —— 等你實際處理訊號／進場後才有足夠樣本可評分。")
+        lines.append(f"<i>目前：決斷 {d['acted']} 處理 / {d['ghosted']} 放生　"
+                     f"進場 {d['in_zone']} 區內 / {d['chased']} 追高</i>")
+        lines.append("\n<i>紀律比勝率更早決定小資能不能活下來。</i>")
+        return "\n".join(lines)
+
+    lines.append(f"綜合：<b>{d['overall_pct']}%</b>　{_disc_grade(d['overall_pct'])}")
+    if d["decisiveness_pct"] is not None:
+        lines.append(f"• 決斷率 <code>{d['decisiveness_pct']}%</code>"
+                     f"（{d['acted']} 有意識處理 / {d['ghosted']} 放生過期）"
+                     f"　{_disc_grade(d['decisiveness_pct'])}")
+    else:
+        lines.append(f"• 決斷率：資料累積中（{d['acted']}/{d['ghosted']}）")
+    if d["no_chase_pct"] is not None:
+        lines.append(f"• 不追高率 <code>{d['no_chase_pct']}%</code>"
+                     f"（{d['in_zone']} 區內進場 / {d['chased']} 追高）"
+                     f"　{_disc_grade(d['no_chase_pct'])}")
+    else:
+        lines.append(f"• 不追高率：資料累積中（{d['in_zone']}/{d['chased']}）")
+    lines.append("\n<i>兩項皆由系統客觀記錄，不靠自我感覺。紀律比勝率更早決定小資存活。</i>")
+    return "\n".join(lines)
+
+
+# ===========================================================================
 # 取所有 open trades（給 risk_manager 看當前曝險）
 # ===========================================================================
 def get_open_trades() -> list[dict]:
@@ -937,7 +1031,8 @@ def get_open_trades() -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT id, symbol, setup, direction, entry_price, stop_price, "
-            "tp1, tp2, tp3, risk_usd, leverage, margin_usd, entry_at, tg_message_id "
+            "tp1, tp2, tp3, risk_usd, leverage, margin_usd, entry_at, tg_message_id, "
+            "entry_kind "
             "FROM trades WHERE status='open' ORDER BY entry_at"
         ).fetchall()
         out = []
@@ -955,6 +1050,7 @@ def get_open_trades() -> list[dict]:
                 "tp1": r[6], "tp2": r[7], "tp3": r[8],
                 "risk_usd": r[9], "leverage": r[10], "margin_usd": r[11],
                 "entry_at": r[12], "tg_message_id": r[13],
+                "entry_kind": r[14] or "direct_fire",   # v41: 教練追高偵測用
                 "legs_hit": list(hit_labels),
                 "size_remaining": round(1.0 - total_size_hit, 3),
             })
