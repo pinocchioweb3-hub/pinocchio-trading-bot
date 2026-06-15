@@ -237,6 +237,8 @@ async def amain(args: argparse.Namespace) -> int:
     from backtest.backtest_session import run_backtest_loop as _run_backtest
     # v35: 帳本防竄改錨定（每週 trade_journal 快照 → OpenTimestamps 錨定比特幣，純讀不下單）
     from l3_dispatcher.ledger_anchor import run_anchor_loop as _run_anchor
+    # v40: CEO 監督 Session（每日彙整所有 Session 輸出 → 單一兩段式簡報，解決「埋在細節忘全局」）
+    from l3_dispatcher.ceo_session import run_ceo_loop as _run_ceo
 
     # v14: 每個 worker 用 supervise() 隔離 — 單一 worker 崩潰自動重啟，不再全滅
     # v14.1: run_on_startup 只在首次啟動為 True — supervise 崩潰重啟不重推開機報告
@@ -308,6 +310,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("backtest", lambda: _run_backtest(tg_sys)),
         # v35: 帳本錨定 Session（每週快照 → OpenTimestamps 比特幣防竄改，只送 32B 雜湊）
         ("ledger_anchor", lambda: _run_anchor(tg_sys)),
+        # v40: CEO 監督 Session（每日 09:00 台北彙整簡報 → 系統主題，純讀不下單不發外）
+        ("ceo_session", lambda: _run_ceo(tg_sys)),
     ]
     try:
         await asyncio.gather(*[

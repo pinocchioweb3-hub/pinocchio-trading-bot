@@ -291,6 +291,9 @@ def _cmd_help() -> str:
         "/daily ・ /weekly — 當日／本週績效\n"
         "/contrib — 💡 貢獻積分排行榜\n"
         "/myscore — 查自己的積分與占比\n"
+        "🧭 /ceo — CEO 每日彙整簡報（今日重點 + 需決策）\n"
+        "🧭 /decisions — 待你拍板的事項｜/decided &lt;編號&gt; 標記已決定\n"
+        "📤 /approve — 列出/核准待審對外內容｜/reject &lt;編號&gt; 退回\n"
         "/help — 本清單\n\n"
         "💡 在「意見箱」主題發建議即累積積分（採納實裝才給分）\n"
         "FIRE 訊號按鈕：✅ 已下單 → 計入持倉｜⏭ 略過 → 不記錄"
@@ -454,6 +457,58 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
                                  f"{p['ai_score']}/10）{_html.escape(p['text'][:80])}")
                 lines.append("\n採納：<code>/adopt id 分數 說明</code>")
                 reply = "\n".join(lines)
+        else:
+            reply = "此指令僅限管理者"
+    elif cmd == "ceo":
+        # v40: 隨時拉一份 CEO 彙整簡報（兩段式：今日重點 + 需決策）
+        try:
+            from l3_dispatcher.ceo_session import build_ceo_brief
+            reply = build_ceo_brief()
+        except Exception as e:
+            reply = f"CEO 簡報產生失敗：{type(e).__name__}: {e}"
+    elif cmd in ("decisions", "decision"):
+        # v40: 列出等發起人拍板的事項
+        from l3_dispatcher.decision_registry import render_open
+        reply = "🧭 <b>待決策事項</b>\n━━━━━━━━━━━━━━━━\n" + render_open()
+    elif cmd == "decided":
+        # v40 僅限管理者：/decided <id> [選了什麼說明] — 標記某決策已拍板
+        import os
+        if str((msg.get("from") or {}).get("id", "")) == os.getenv("TELEGRAM_CHAT_ID", ""):
+            from l3_dispatcher.decision_registry import resolve
+            try:
+                did = int(args[0])
+                note = " ".join(args[1:])
+                r = resolve(did, note)
+                reply = ("✅ " if r["ok"] else "⚠️ ") + r["msg"]
+            except (ValueError, IndexError):
+                reply = "用法：/decided <決策編號> [你的決定說明]"
+        else:
+            reply = "此指令僅限管理者"
+    elif cmd == "approve":
+        # v40 僅限管理者：/approve（無參數=列待審）/ /approve <id>=核准對外內容（紅線2）
+        import os
+        if str((msg.get("from") or {}).get("id", "")) == os.getenv("TELEGRAM_CHAT_ID", ""):
+            from l3_dispatcher.outbox import approve, render_pending
+            if not args:
+                reply = render_pending()
+            else:
+                try:
+                    r = approve(int(args[0]), " ".join(args[1:]))
+                    reply = ("✅ " if r["ok"] else "⚠️ ") + r["msg"]
+                except ValueError:
+                    reply = "用法：/approve <編號>（或不帶參數列出待審）"
+        else:
+            reply = "此指令僅限管理者"
+    elif cmd == "reject":
+        # v40 僅限管理者：/reject <id> [原因] — 退回對外內容草稿
+        import os
+        if str((msg.get("from") or {}).get("id", "")) == os.getenv("TELEGRAM_CHAT_ID", ""):
+            from l3_dispatcher.outbox import reject
+            try:
+                r = reject(int(args[0]), " ".join(args[1:]))
+                reply = ("✅ " if r["ok"] else "⚠️ ") + r["msg"]
+            except (ValueError, IndexError):
+                reply = "用法：/reject <編號> [原因]"
         else:
             reply = "此指令僅限管理者"
     elif cmd == "help":
