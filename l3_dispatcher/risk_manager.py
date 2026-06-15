@@ -1,8 +1,10 @@
 """Risk Manager：FIRE 前風控檢查 + 熔斷機制。
 
 規則：
-- 單筆風險上限 $100 (1R)
-- 同時最多 3 筆持倉
+- 單筆風險上限 1R（金額由 botconfig 單一來源；支援帳戶 % 制，3000U 小資友善）
+- 同時最多 N 筆持倉（預設 3）
+- 總曝險上限：所有未平倉風險加總 + 本筆 不得超過 帳戶 × cap%（預設 6%）  ← P0-A 新增
+- 每日最多開倉 N 次（預設 3，防情緒連續開倉）                          ← P0-A 新增
 - BTC family (BTC/ETH/SOL) 同方向最多 2 筆（高相關）
 - 同 symbol 同方向只允許 1 筆
 - 每日 PnL -3% → 暫停新 FIRE 至隔日 UTC 00:00
@@ -21,22 +23,28 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .trade_journal import (
-    get_open_trades, get_today_pnl, get_week_pnl,
+    count_opens_today, get_open_trades, get_today_pnl, get_week_pnl,
 )
 
+# P0-A: 風控金額/帳戶/筆數一律走 botconfig 單一來源（已含「帳戶 %」換算與 clamp），
+# 不再各自 os.getenv 重複讀 → 與實際倉位計算一致，且 3000U 小資的 % 制自動生效。
+from botconfig import CONFIG as _BC
 
-# === 風控參數（可由 env 覆寫）===
+
+# === 風控參數（帳戶/金額/併發走 botconfig；風控專屬閘門可由 env 覆寫）===
 @dataclass(frozen=True)
 class RiskConfig:
-    # 帳戶層（v14: 預設改為使用者實際部署資金 $5000，與 trade_journal 統一）
-    account_balance_usd: float = float(os.getenv("ACCOUNT_BALANCE_USD", "5000"))
-    max_risk_per_trade_usd: float = float(os.getenv("RISK_PER_TRADE_USD", "100"))
+    # 帳戶層（單一來源：botconfig，已含 RISK_PER_TRADE_PCT 帳戶 % 制換算）
+    account_balance_usd: float = _BC.account_balance_usd
+    max_risk_per_trade_usd: float = _BC.risk_per_trade_usd
 
-    # 部位層（v23-2: 雙鍵相容 — 修 .env.example 歷史鍵名 MAX_CONCURRENT_POSITIONS）
-    max_concurrent_trades: int = int(os.getenv("MAX_CONCURRENT_TRADES")
-                                     or os.getenv("MAX_CONCURRENT_POSITIONS")
-                                     or "3")
+    # 部位層
+    max_concurrent_trades: int = _BC.max_concurrent_trades
     max_per_family: int = int(os.getenv("MAX_PER_CORRELATED_FAMILY", "2"))
+
+    # P0-A 新增：總曝險上限（% of 帳戶）+ 每日最多開倉次數
+    total_risk_cap_pct: float = float(os.getenv("TOTAL_RISK_CAP_PCT", "6.0"))
+    daily_max_opens: int = int(os.getenv("DAILY_MAX_OPENS", "3"))
 
     # 熔斷層
     daily_dd_limit_pct: float = float(os.getenv("DAILY_DD_LIMIT_PCT", "-3.0"))
@@ -136,6 +144,32 @@ def should_block(decision: dict | Any,
             "msg": f"已 {len(opens)} 筆持倉，上限 {cfg.max_concurrent_trades}",
         }
 
+    # === Check 3.5: 總曝險上限（P0-A，3000U 小資保護）===
+    # 所有未平倉風險加總 + 本筆 1R，不得超過 帳戶 × cap%。
+    # 這是「$ 金額」層的安全網：即使單筆/併發都合規，總風險也不會失控。
+    open_risk = sum((o.get("risk_usd") or cfg.max_risk_per_trade_usd) for o in opens)
+    prospective_risk = open_risk + cfg.max_risk_per_trade_usd
+    risk_cap_usd = cfg.account_balance_usd * cfg.total_risk_cap_pct / 100
+    details["open_risk_usd"] = round(open_risk, 2)
+    details["prospective_risk_usd"] = round(prospective_risk, 2)
+    details["risk_cap_usd"] = round(risk_cap_usd, 2)
+    if prospective_risk > risk_cap_usd:
+        return True, "total_risk_cap_exceeded", {
+            **details,
+            "msg": f"總曝險 ${open_risk:.0f} + 本筆 ${cfg.max_risk_per_trade_usd:.0f} "
+                   f"= ${prospective_risk:.0f} > 上限 ${risk_cap_usd:.0f} "
+                   f"({cfg.total_risk_cap_pct}% × ${cfg.account_balance_usd:.0f})",
+        }
+
+    # === Check 3.6: 每日最多開倉次數（P0-A，防情緒連續開倉）===
+    opened_today = count_opens_today()
+    details["opened_today"] = opened_today
+    if opened_today >= cfg.daily_max_opens:
+        return True, "daily_max_opens_reached", {
+            **details,
+            "msg": f"今日已開倉 {opened_today} 次，達上限 {cfg.daily_max_opens}（防情緒連續交易）→ 明日 UTC 00:00 重置",
+        }
+
     # === Check 4: 同 symbol 同方向重複 ===
     for o in opens:
         if o["symbol"] == symbol and (o.get("direction") or "") == direction:
@@ -164,6 +198,8 @@ def should_block(decision: dict | Any,
     return False, "ok", {
         **details,
         "msg": f"風控通過 ({len(opens)}/{cfg.max_concurrent_trades} 持倉, "
+               f"曝險 ${prospective_risk:.0f}/${risk_cap_usd:.0f}, "
+               f"今日開倉 {opened_today}/{cfg.daily_max_opens}, "
                f"今日 PnL {today['pnl_pct_of_account']}%, 週 {week['pnl_pct_of_account']}%)",
     }
 
@@ -192,6 +228,8 @@ def get_risk_status(config: RiskConfig | None = None) -> dict:
 
     # 算總曝險（每筆 risk_usd 累加）
     total_risk_open = sum(o.get("risk_usd") or cfg.max_risk_per_trade_usd for o in opens)
+    risk_cap_usd = cfg.account_balance_usd * cfg.total_risk_cap_pct / 100
+    opened_today = count_opens_today()
 
     # 算當前狀態旗標
     daily_breached = today["pnl_pct_of_account"] <= cfg.daily_dd_limit_pct
@@ -206,6 +244,10 @@ def get_risk_status(config: RiskConfig | None = None) -> dict:
         "open_symbols": [o["symbol"] for o in opens],
         "max_concurrent": cfg.max_concurrent_trades,
         "total_risk_open_usd": round(total_risk_open, 2),
+        "risk_cap_usd": round(risk_cap_usd, 2),
+        "total_risk_cap_pct": cfg.total_risk_cap_pct,
+        "opened_today": opened_today,
+        "daily_max_opens": cfg.daily_max_opens,
         "max_risk_per_trade": cfg.max_risk_per_trade_usd,
         "family_breakdown": family_breakdown,
         "today_pnl_usd": today["total_pnl_usd"],
@@ -233,7 +275,14 @@ def render_risk_status(status: dict) -> str:
     ]
     if status["open_symbols"]:
         lines.append(f"標的：<code>{', '.join(status['open_symbols'])}</code>")
-        lines.append(f"曝險：<code>${status['total_risk_open_usd']:.0f}</code>")
+    # P0-A: 總曝險 / 上限 + 今日開倉 / 上限（小資保護兩道閘門，永遠顯示）
+    _cap = status.get("risk_cap_usd")
+    if _cap is not None:
+        lines.append(f"總曝險：<code>${status['total_risk_open_usd']:.0f} / "
+                     f"${_cap:.0f}</code>（上限 {status.get('total_risk_cap_pct')}%）")
+    if status.get("daily_max_opens") is not None:
+        lines.append(f"今日開倉：<code>{status.get('opened_today', 0)} / "
+                     f"{status['daily_max_opens']}</code>")
     if status["family_breakdown"]:
         for fam, syms in status["family_breakdown"].items():
             lines.append(f"  {fam}: {', '.join(syms)} ({len(syms)} 筆)")

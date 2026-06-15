@@ -905,6 +905,28 @@ def get_week_pnl(account_balance_usd: float | None = None) -> dict:
         conn.close()
 
 
+def count_opens_today() -> int:
+    """今日（UTC）實際開倉筆數（status in open/closed，依 entry_at 計）。
+
+    給 risk_manager「每日最多開倉次數」閘門用 — 防情緒性連續開倉。
+    只計真正成為部位的（open/closed）；未確認的 signal / 略過 / 取消不計。
+    """
+    init_db()
+    conn = _conn()
+    try:
+        now = dt.datetime.now(tz=dt.timezone.utc)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_ms = int(start.timestamp() * 1000)
+        row = conn.execute(
+            "SELECT COUNT(*) FROM trades "
+            "WHERE entry_at >= ? AND status IN ('open','closed')",
+            (start_ms,),
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    finally:
+        conn.close()
+
+
 # ===========================================================================
 # 取所有 open trades（給 risk_manager 看當前曝險）
 # ===========================================================================
