@@ -114,6 +114,82 @@ async def _handle_callback(tg: TelegramClient, cq: dict) -> None:
 
 
 # ===========================================================================
+# v45: 通用交易意圖（trade-intent JSON）— /intent 指令與「📋 複製可執行 JSON」按鈕共用
+# ===========================================================================
+async def _send_intent_json(tg: TelegramClient, decision: dict, thread_id,
+                            *, intro: str = "") -> None:
+    """把 decision_dict 編成 trade-intent JSON 後送出（跨所通用、宣告式、永不自動下實盤）。
+    優先用 <pre> 區塊（手機可一鍵複製）；過長則純文字分段直送（避開 4096 截斷）。"""
+    import html as _html
+    import json as _json
+
+    from .intent_format import to_trade_intent, validate_intent
+
+    try:
+        intent = to_trade_intent(decision)
+    except Exception as e:
+        await tg.send_message(f"⚠️ 無法產生 intent：{type(e).__name__}: {e}",
+                              parse_mode="HTML", message_thread_id=thread_id)
+        return
+    problems = validate_intent(intent)
+    blob = _json.dumps(intent, ensure_ascii=False, indent=2)
+
+    if intro:
+        await tg.send_message(intro, parse_mode="HTML", message_thread_id=thread_id)
+    if len(blob) <= 3800:
+        # <pre> 區塊在手機端可一鍵複製，最適合「複製 JSON」需求
+        await tg.send_message(f"<pre>{_html.escape(blob)}</pre>", parse_mode="HTML",
+                              message_thread_id=thread_id)
+    else:
+        for i in range(0, len(blob), 3500):
+            await tg.send_message(blob[i:i + 3500], parse_mode=None,
+                                  message_thread_id=thread_id)
+    if problems:
+        await tg.send_message(
+            "⚠️ intent 結構檢查警告：" + "；".join(problems[:5]),
+            parse_mode="HTML", message_thread_id=thread_id)
+
+
+_INTENT_INTRO = (
+    "📋 <b>通用交易意圖（trade-intent JSON）</b>\n"
+    "<i>宣告式、跨所通用——任何支援的交易所 AI agent 都讀得懂這份意圖（進場區／失效價／"
+    "風險%／R 目標）。⛔ 永不自動下實盤，需由你或你的 agent 人工執行。</i>"
+)
+
+
+async def _handle_intent_callback(tg: TelegramClient, cq: dict) -> None:
+    """📋 複製可執行 JSON 按鈕：callback_data='intent:{fire_id}'。"""
+    from l3_dispatcher.trade_journal import get_signal_for_intent
+
+    cq_id = cq.get("id", "")
+    data = cq.get("data", "") or ""
+    msg = cq.get("message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    if chat_id not in _authorized_chats():
+        await tg.answer_callback_query(cq_id, "未授權")
+        return
+
+    parts = data.split(":")
+    if len(parts) != 2:
+        await tg.answer_callback_query(cq_id, "按鈕資料損壞")
+        return
+    try:
+        fire_id = int(parts[1])
+    except ValueError:
+        await tg.answer_callback_query(cq_id, "按鈕資料損壞")
+        return
+
+    decision = get_signal_for_intent(fire_id=fire_id)
+    if not decision:
+        await tg.answer_callback_query(cq_id, "找不到此訊號的快照（可能早於 v45）",
+                                       show_alert=True)
+        return
+    await tg.answer_callback_query(cq_id, "已產生可執行 JSON ↓")
+    await _send_intent_json(tg, decision, msg.get("message_thread_id"),
+                            intro=_INTENT_INTRO)
+
+
+# ===========================================================================
 # 指令處理
 # ===========================================================================
 async def _cmd_status() -> str:
@@ -290,6 +366,7 @@ def _cmd_help() -> str:
         "📊 /profit [天數] — 公開績效卡（勝率/期望值/PF，加密+美股分開）\n"
         "🎯 /discipline — 紀律遵守率（決斷率 + 不追高率，系統客觀記錄）\n"
         "📖 /指標（/glossary）— 指標白話對照表（看不懂術語就查這個；/指標 CVD 查單詞）\n"
+        "📋 /intent [幣別] — 通用交易意圖 JSON（跨所 AI agent 可讀；不帶參數=最近一筆）\n"
         "/daily ・ /weekly — 當日／本週績效\n"
         "/contrib — 💡 貢獻積分排行榜\n"
         "/myscore — 查自己的積分與占比\n"
@@ -546,6 +623,25 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
         except Exception as e:
             print(f"[callbacks] glossary error: {type(e).__name__}: {e}")
         return
+    elif cmd in ("intent", "json"):
+        # v45（branch②）：通用交易意圖 JSON — 把近期訊號編成跨所可執行 schema。
+        # /intent ＝最近一筆訊號；/intent BTC ＝該幣最近一筆。直送（可能多段），故 return。
+        from l3_dispatcher.trade_journal import get_signal_for_intent
+        thread_id = msg.get("message_thread_id")
+        sym_arg = args[0].upper() if args else None
+        decision = (get_signal_for_intent(symbol=sym_arg) if sym_arg
+                    else get_signal_for_intent())
+        if not decision:
+            who = f"「{sym_arg}」的" if sym_arg else ""
+            reply = (f"找不到{who}近期訊號快照。\n"
+                     "FIRE 訊號發出後即可用 <code>/intent</code> 取得它的可執行 JSON，"
+                     "或直接點訊號卡片上的「📋 複製可執行 JSON」按鈕。")
+        else:
+            try:
+                await _send_intent_json(tg, decision, thread_id, intro=_INTENT_INTRO)
+            except Exception as e:
+                print(f"[callbacks] intent error: {type(e).__name__}: {e}")
+            return
     elif cmd == "help":
         reply = _cmd_help()
     elif cmd == "setup":
@@ -597,6 +693,9 @@ async def run_interactive_listener(tg: TelegramClient, poll_seconds: float = 2.0
                             elif (cq.get("data") or "").startswith("set:"):
                                 from .settings_menu import handle_settings_callback
                                 await handle_settings_callback(tg, cq)
+                            elif (cq.get("data") or "").startswith("intent:"):
+                                # v45: 「📋 複製可執行 JSON」按鈕
+                                await _handle_intent_callback(tg, cq)
                             else:
                                 await _handle_callback(tg, cq)
                         elif "chat_join_request" in upd:

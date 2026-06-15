@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pinocchioweb3-hub/pinocchio-trading-bot/schema/trade-intent.schema.json",
+  "title": "Trade Intent",
+  "description": "通用交易意圖（宣告式，非命令式）。描述進場區/失效/風險%/R 目標，把張數、tick 進位、單向雙向、保證金模式留給交易所 adapter 在執行邊界解。整份 schema 不含張數/contracts，也不綁固定金額（R 去美元化）。⛔ 紅線：本系統永不自動下實盤，execution_policy.mode 只允許 human_gated / demo_only。設計依據：docs/research/v44-通用下單指令schema研究.md。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "version", "intent_id", "created_at", "asset_class",
+    "symbol_canonical", "side", "order_type", "entry_zone", "invalidation",
+    "risk", "acceptance", "execution_policy"
+  ],
+  "properties": {
+    "schema": { "const": "trade-intent" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+(\\.\\d+)?$", "description": "semver；語意版本化" },
+    "intent_id": { "type": "string", "minLength": 1, "description": "唯一 ID（FIX ClOrdID 角色），去重/對帳" },
+    "created_at": { "type": "string", "format": "date-time", "description": "ISO8601 UTC" },
+    "asset_class": { "enum": ["crypto_perp", "crypto_spot", "equity_signal"] },
+    "symbol_canonical": { "type": "string", "minLength": 1, "description": "規範形 BASE-QUOTE（如 BTC-USDT）；adapter 負責轉成各所拼法" },
+    "venue_hint": { "type": ["string", "null"], "description": "偏好交易所，null=任意（呼應 UniswapX 不綁場所）" },
+    "side": { "enum": ["long", "short"], "description": "用 long/short 而非 buy/sell，避開 Gate 號位/Bitget 雙欄分歧" },
+    "order_type": { "enum": ["limit", "market"] },
+    "time_in_force": { "enum": ["gtc", "ioc", "fok"], "default": "gtc" },
+    "post_only": { "type": "boolean", "default": false },
+    "reduce_only": { "type": "boolean", "default": false },
+    "margin_mode": { "enum": ["cross", "isolated", null], "description": "選填提示，非必填核心" },
+    "entry_zone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["low", "high", "reference"],
+      "properties": {
+        "low": { "type": "number", "description": "報價幣計價" },
+        "high": { "type": "number" },
+        "reference": { "type": "number", "description": "訊號參考價" }
+      }
+    },
+    "invalidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["price", "rule"],
+      "properties": {
+        "price": { "type": "number", "description": "失效價＝1R 止損位" },
+        "rule": { "type": "string", "description": "人話失效規則（論點結構失效）" }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pct_of_account", "suggested_leverage", "max_slippage_pct"],
+      "properties": {
+        "pct_of_account": { "type": ["number", "null"], "minimum": 0, "description": "以帳戶% 表風險（不放張數/金額）；null＝交易員自設" },
+        "suggested_leverage": { "type": "integer", "minimum": 1, "maximum": 50, "description": "建議值（六家都靠獨立端點設槓桿）；交易員可自選，工具不強制" },
+        "max_slippage_pct": { "type": "number", "minimum": 0 }
+      }
+    },
+    "take_profits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["r_multiple", "price"],
+        "properties": {
+          "r_multiple": { "type": "number" },
+          "price": { "type": "number" },
+          "size_pct": { "type": ["number", "null"], "minimum": 0, "maximum": 100 },
+          "action": { "type": "string" }
+        }
+      },
+      "description": "多段分批；adapter 決定 inline 帶或拆獨立 algo 單"
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["price_band_pct", "deadline", "max_slippage_pct"],
+      "properties": {
+        "price_band_pct": { "type": "number", "minimum": 0, "description": "機器可校驗：成交須落在此價帶內（事後一致性檢查）" },
+        "deadline": { "type": "string", "format": "date-time" },
+        "max_slippage_pct": { "type": "number", "minimum": 0 }
+      }
+    },
+    "rationale": {
+      "type": "object",
+      "description": "給人/LLM 上下文，不影響執行",
+      "properties": {
+        "composite_score": { "type": ["number", "null"] },
+        "strength_score": { "type": ["number", "null"] },
+        "signals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "state": { "type": "string" },
+              "note": { "type": "string" }
+            }
+          }
+        },
+        "narrative": { "type": "string" }
+      }
+    },
+    "execution_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "enum": ["human_gated", "demo_only"],
+          "description": "⛔ 紅線：永不允許 auto_live。本系統不自動下實盤。"
+        }
+      }
+    }
+  }
+}

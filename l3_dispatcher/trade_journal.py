@@ -214,6 +214,67 @@ def find_trade_by_fire(fire_id: int) -> dict | None:
         conn.close()
 
 
+def get_signal_for_intent(fire_id: int | None = None,
+                          symbol: str | None = None) -> dict | None:
+    """給 /intent 指令與「📋 複製可執行 JSON」按鈕：回一個可直接餵
+    telegram_bot.intent_format.to_trade_intent 的 decision_dict。
+
+    優先用 record_entry 當下存的「完整 decision 快照」（v45 起 dispatcher 存全量）；
+    舊訊號快照不完整（只有 {snapshot, reason}）時，用 trades 欄位重建最小可用版——
+    rationale 會較空，但進場區/止損/止盈/槓桿等「可執行欄位」仍完整。
+
+    查找順序：fire_id 優先 → 否則 symbol 取最近一筆 → 都沒給則全表最近一筆。查無回 None。
+    """
+    init_db()
+    conn = _conn()
+    try:
+        cols = ("decision_snapshot, symbol, setup, direction, entry_price, "
+                "stop_price, entry_at")
+        if fire_id is not None:
+            row = conn.execute(
+                f"SELECT {cols} FROM trades WHERE fire_id=? ORDER BY id DESC LIMIT 1",
+                (fire_id,)).fetchone()
+        elif symbol is not None:
+            row = conn.execute(
+                f"SELECT {cols} FROM trades WHERE symbol=? ORDER BY id DESC LIMIT 1",
+                (symbol.upper(),)).fetchone()
+        else:
+            row = conn.execute(
+                f"SELECT {cols} FROM trades ORDER BY id DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        snap_json, sym, setup, direction, entry_price, stop_price, entry_at = row
+
+        blob = None
+        if snap_json:
+            try:
+                blob = json.loads(snap_json)
+            except Exception:
+                blob = None
+
+        # 完整 decision（v45 起）：忠實照用
+        if (isinstance(blob, dict) and blob.get("direction") and blob.get("setup_name")
+                and isinstance(blob.get("snapshot"), dict)):
+            return blob
+
+        # 退化：用 trades 欄位 +（可能存在的）部分快照重建最小可用 decision
+        snap = (blob or {}).get("snapshot") if isinstance(blob, dict) else None
+        if not isinstance(snap, dict):
+            snap = {}
+        snap.setdefault("symbol", sym)
+        snap.setdefault("price", entry_price)
+        snap.setdefault("ts", entry_at)
+        return {
+            "direction": direction,
+            "setup_name": setup,
+            "composite_score": None,
+            "confirmed": [],
+            "snapshot": snap,
+        }
+    finally:
+        conn.close()
+
+
 def confirm_trade(trade_id: int, fill_price: float | None = None) -> dict:
     """使用者確認已下單：signal → open。
 

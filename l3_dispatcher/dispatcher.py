@@ -166,7 +166,7 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
                 risk_usd=CONFIG.risk_per_trade_usd, leverage=lev,
                 margin_usd=pos["margin_usd"], notional_usd=pos["notional_usd"],
                 fire_id=fire_id, tg_message_id=msg_id,
-                decision_snapshot={"snapshot": snap, "reason": decision.get("reason", "")},
+                decision_snapshot=decision,    # v45: 存完整 decision（供 /intent 與「複製 JSON」忠實重建意圖）
                 cross_check_confidence=cc.get("confidence") if cc else None,
                 tags=[f"regime:{regime}"],
                 entry_kind="wait_trigger",                      # v23-3
@@ -191,10 +191,16 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
         text, buttons = render_fire_message(decision)
 
     # v15: 按鈕改帶 fire_id（callback listener 用它找到對應 trade 做確認/略過）
-    buttons = [[
-        {"text": "✅ 已下單", "callback_data": f"fill:{fire_id}"},
-        {"text": "⏭ 略過", "callback_data": f"skip:{fire_id}"},
-    ]]
+    # v45: 加「📋 複製可執行 JSON」→ intent:{fire_id}（通用 trade-intent，跨所 AI agent 可讀）
+    buttons = [
+        [
+            {"text": "✅ 已下單", "callback_data": f"fill:{fire_id}"},
+            {"text": "⏭ 略過", "callback_data": f"skip:{fire_id}"},
+        ],
+        [
+            {"text": "📋 複製可執行 JSON", "callback_data": f"intent:{fire_id}"},
+        ],
+    ]
     # v18-C: 做多訊號附解鎖警告（解鎖前搶跑拋壓）
     if direction == "bull":
         try:
