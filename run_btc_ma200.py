@@ -359,7 +359,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--demo", action="store_true", default=True,
                    help="使用 OKX 模擬盤（預設）")
     p.add_argument("--live", action="store_true",
-                   help="使用實盤（需要 OKX_TRADE_API_KEY）")
+                   help="（已停用）實盤需另行明確拍板；傳入會直接拒絕退出")
     p.add_argument("--once", action="store_true",
                    help="單次掃描後退出")
     p.add_argument("--long-only", action="store_true",
@@ -383,13 +383,14 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
+    # 防禦縱深（2026-06-15 對抗式審查 finding #1）：實盤路徑永久停用。
+    # 真錢執行需使用者另行明確拍板；自動下單一律走 l4_execution.demo_trader
+    # （過 demo_guard 模擬盤正向證明）。傳入 --live 一律拒絕退出，不再讀 OKX_TRADE_API_KEY。
     if not args.demo:
-        trade_key = os.getenv("OKX_TRADE_API_KEY", "")
-        if not trade_key:
-            print("❌ 實盤模式需要 OKX_TRADE_API_KEY。請在 .env 中設定。")
-            sys.exit(1)
-        print("⚠️  即將以實盤模式啟動！5 秒後開始...")
-        time.sleep(5)
+        print("⛔ 實盤模式已停用：真錢執行需另行明確拍板。")
+        print("   自動下單只走 demo_trader（demo_guard 正向證明模擬盤）。")
+        print("   請移除 --live；模擬盤測試請設定 OKX_DEMO_* 金鑰。")
+        sys.exit(1)
 
     asyncio.run(run_loop(args))
 

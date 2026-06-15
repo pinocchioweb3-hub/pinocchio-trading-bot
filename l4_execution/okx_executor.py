@@ -47,39 +47,32 @@ class OKXExecutor:
     def __init__(self, demo: bool = True):
         """
         Args:
-            demo: True = 模擬盤（安全測試），False = 實盤
+            demo: True = 模擬盤（唯一允許）；False = 實盤（已停用，直接 raise）
+
+        安全鐵律（2026-06-15 對抗式審查後強化）：
+        - **實盤模式永久停用**：真錢執行需使用者另行明確拍板，且自動下單一律走
+          l4_execution.demo_trader（過 demo_guard 正向證明）。本類別不再提供任何實盤路徑。
+        - 模擬盤一律經 demo_guard.make_demo_exchange 建立（set_sandbox_mode + 斷言
+          x-simulated-trading 標頭），並移除舊的「唯讀金鑰退路」（避免誤用實盤金鑰）。
+        - 下單前再以 confirm_okx_demo 執行期正向證明（見 _ensure_init）。
         """
-        self.demo = demo
-        api_key = os.getenv("OKX_TRADE_API_KEY", "")
-        api_secret = os.getenv("OKX_TRADE_API_SECRET", "")
-        passphrase = os.getenv("OKX_TRADE_API_PASSPHRASE", "")
-
-        if not all([api_key, api_secret, passphrase]):
-            # 如果沒有交易 key，嘗試用唯讀 key（僅模擬盤可用）
-            if demo:
-                api_key = api_key or os.getenv("OKX_API_KEY", "")
-                api_secret = api_secret or os.getenv("OKX_API_SECRET", "")
-                passphrase = passphrase or os.getenv("OKX_API_PASSPHRASE", "")
-            else:
-                raise ValueError(
-                    "實盤交易需要 OKX_TRADE_API_KEY / OKX_TRADE_API_SECRET / "
-                    "OKX_TRADE_API_PASSPHRASE 環境變數。請在 .env 中設定。"
-                )
-
-        self._exchange = ccxt.okx({
-            "apiKey": api_key,
-            "secret": api_secret,
-            "password": passphrase,
-            "options": {"defaultType": "swap"},
-        })
-
-        if demo:
-            self._exchange.set_sandbox_mode(True)
-
+        if not demo:
+            raise RuntimeError(
+                "OKXExecutor 實盤模式已停用。真錢執行需使用者明確拍板；"
+                "自動下單一律走 l4_execution.demo_trader（過 demo_guard 模擬盤正向證明）。"
+            )
+        # 模擬盤：強制走 demo_guard 設定層閘（OKX_TRADE_* 須空 + OKX_DEMO_* 齊備
+        # + OKX_DEMO_TRADING_ENABLED=1），不再有唯讀金鑰退路。
+        from l4_execution.demo_guard import make_demo_exchange
+        self.demo = True
+        self._exchange = make_demo_exchange()   # 內含 set_sandbox_mode(True)+標頭斷言
         self._initialized = False
 
     async def _ensure_init(self) -> None:
         if not self._initialized:
+            # 執行期正向證明：發一個只有模擬盤金鑰能過的簽名呼叫，證不出即 raise
+            from l4_execution.demo_guard import confirm_okx_demo
+            await confirm_okx_demo(self._exchange)
             await self._exchange.load_markets()
             self._initialized = True
 
