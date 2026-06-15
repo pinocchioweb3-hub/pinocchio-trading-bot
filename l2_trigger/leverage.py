@@ -8,7 +8,7 @@
         ≥8%  → 5x
     缺料 → 保守用 5x
 
-倉位算法（與「100 U 風險 = 1R」對齊）：
+倉位算法（R = 風險單位，金額由交易員自設，不綁死固定 U 數）：
     notional_usd = risk_usd / |entry - stop| × entry
     margin_usd   = notional_usd / leverage
 """

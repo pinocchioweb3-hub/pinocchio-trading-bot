@@ -176,11 +176,11 @@ PER_SYMBOL_DEEPDIVE_PROMPT = """你是專業加密貨幣交易計畫師。針對
 - **止損**：具體價位 — **必須基於結構**（OB 邊界、Swing 之上/下、Liquidity 區之外），不是固定 % 距離
 - **止盈分批**：TP1 / TP2 / TP3 — **目標是下一個 Liquidity / OB / Swing**，不是固定 R 倍數
 - **倉位計算（必算！）**：
-  - 1R 價差 = |entry - stop|
-  - **一律依資料中「## ⚠️ 帳戶約束」區塊給的 1R(USD)、margin 上限、槓桿上限計算 —— 不要自行假設金額**
+  - 1R 價差 = |entry - stop|（R 就是這個風險單位，不是固定金額）
+  - **依資料中「## ⚠️ 帳戶約束」區塊給的 1R(USD) 與使用者自選槓桿計算 —— 不要自行假設金額、也不要替使用者改槓桿**
   - position_notional = 1R(USD) / 1R價差(%) × entry；margin = notional / leverage
-  - **驗證 margin ≤ 帳戶約束給的上限**；在槓桿上限內選「能達標的最低槓桿」（槓桿越低越安全）
-- **建議槓桿**：經上述驗算後決定，**不得超過帳戶約束的槓桿上限**
+  - 用使用者設定的槓桿算 margin；**若 margin > 帳戶約束的安全上限，只「提示保證金偏重、注意爆倉」，不主動建議調低槓桿**
+- **槓桿**：使用使用者自己設定的值（1–50x 由他決定），**不做「你應該用幾倍」這類個人化建議**；只在風險偏高時誠實提示
 - **R:R 報酬比**：TP2 至少 1.5R，TP3 至少 2R，否則 setup 不值得
 - **持倉時長預估**：日內 / 1-3 日 / 1 週
 - **失效條件**：什麼價位或數據變化 = 立即出場（要基於 SMC 結構）
@@ -466,26 +466,27 @@ def _format_pulse_data(pulse_state: dict) -> str:
 
 
 def _account_constraints_block() -> list[str]:
-    """依 botconfig 動態產生「帳戶約束」段（v42：取代舊的寫死 $500/$100/15x）。
+    """依 botconfig 動態產生「帳戶約束」段（v42 動態化；v44 改 R 制＋尊重使用者自選槓桿）。
 
-    這段是給 LLM 算倉位/槓桿的護欄；實際風控仍由 leverage/risk_manager 把關。
-    所有數字都從 CONFIG 來 → 每個自架者用自己的預算，數字自動跟著走，不再脫鉤。"""
+    這段是給 LLM 算倉位的護欄；實際風控仍由 leverage/risk_manager 把關。
+    v44：R 就是 R（金額由使用者自設，不綁死固定 U 數）；槓桿尊重使用者設定（不主動建議調高或調低），
+    只在 margin 超過安全上限時「提示風險」而非替他決定（紅線②：不做個人化投資建議）。"""
     from botconfig import CONFIG
     bal = CONFIG.account_balance_usd
     risk_1r = CONFIG.risk_per_trade_usd
-    max_lev = CONFIG.default_leverage
-    alt_lev = min(max_lev, 5)
-    # 單筆 margin 上限 = 帳戶 10%（與 max_concurrent 併用後總鎖倉仍留充足緩衝）；
-    # 現行 $5000 → $500，與升級前一致。
+    lev = CONFIG.default_leverage
+    # 單筆 margin 上限 = 帳戶 10%（避免單筆壓太重）；現行 $5000 → $500，與升級前一致。
     margin_cap = round(bal * 0.10)
     return [
-        "## ⚠️ 帳戶約束（必須遵守）",
-        f"- 帳戶本金：約 ${bal:,.0f} USDT（{CONFIG.tier.label}級；依本金分級的保守護欄，不可超倉）",
-        f"- 單筆風險上限：${risk_1r:,.0f} USDT（= 1R）",
-        f"- 倉位公式：position_notional = ${risk_1r:,.0f} / 1R價差(%) × entry；margin = notional / leverage",
-        f"- 單筆 margin 必須 ≤ ${margin_cap:,.0f}（帳戶 10%）才安全",
-        f"- 選槓桿：用「能讓 margin ≤ ${margin_cap:,.0f} 的最低槓桿」，但**不得超過上限 {max_lev}x**",
-        f"- 槓桿上限：主流（BTC/ETH/SOL）最多 {max_lev}x；低流通/小幣最多 {alt_lev}x\n",
+        "## ⚠️ 帳戶約束（護欄，非投資建議）",
+        f"- 本金：約 ${bal:,.0f} USDT（{CONFIG.tier.label}級保守護欄，不可超倉）",
+        f"- 1R＝「一個風險單位」＝|entry − stop| 的價差；此帳戶單筆 1R 設為 ${risk_1r:,.0f} USDT"
+        "（使用者自設值，可在 /settings 改；R 不是固定金額）",
+        "- 倉位公式：position_notional = 1R(USD) / 1R價差(%) × entry；margin = notional / leverage",
+        f"- 使用者自選槓桿：{lev}x（1–50x 由使用者自己定；**尊重此設定，不要主動建議調高或調低**）",
+        f"- 唯一護欄：單筆 margin 宜 ≤ ${margin_cap:,.0f}（帳戶 10%）。若按使用者槓桿算出的 margin 超過此線，"
+        "**只提示「保證金偏重、注意爆倉風險」，不替他改槓桿**",
+        "- 誠實提醒：槓桿越高、離爆倉越近；但用多少是交易員自己的決定（紅線②：不做個人化投資建議）\n",
     ]
 
 

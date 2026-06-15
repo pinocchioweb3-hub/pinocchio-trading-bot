@@ -34,6 +34,7 @@ def render_settings() -> tuple[str, list[list[dict]]]:
         "━━━━━━━━━━━━━━━━\n"
         f"💰 單筆風險（1R）：{risk_line}\n"
         f"📊 最多同時持倉：<b>{CONFIG.max_concurrent_trades}</b> 倉\n"
+        f"⚡ 槓桿：<b>{CONFIG.default_leverage}x</b>（1–50x 自己定；高槓桿放大盈虧、也更接近爆倉）\n"
         f"🎚️ 訊號模式：<b>{_mode_zh}</b>\n"
         f"🎯 啟用策略：<b>{len(enabled_ids)}</b> 個\n"
         "\n<i>點按鈕即時調整，立刻套用到下一筆訊號。</i>"
@@ -53,6 +54,10 @@ def render_settings() -> tuple[str, list[list[dict]]]:
     # 最多持倉
     buttons.append([_btn("倉位 3", "set:max:3"), _btn("5", "set:max:5"),
                     _btn("10", "set:max:10"), _btn("20", "set:max:20")])
+    # 槓桿（1–50x 自己定；本工具不建議倍數，只尊重你的選擇）
+    buttons.append([_btn("⚡5x", "set:lev:5"), _btn("10x", "set:lev:10"),
+                    _btn("15x", "set:lev:15"), _btn("20x", "set:lev:20")])
+    buttons.append([_btn("30x", "set:lev:30"), _btn("50x", "set:lev:50")])
     # 策略開關（每列一個，含勾選狀態）
     mat = {"live": "🟢", "paper": "🧪", "experimental": "🔬"}
     for m in REGISTRY.values():
@@ -90,6 +95,9 @@ async def handle_settings_callback(tg, cq: dict) -> bool:
         elif action == "max":
             set_override("MAX_CONCURRENT_TRADES", int(parts[2]))
             note = f"最多持倉改為 {parts[2]} 倉"
+        elif action == "lev":
+            set_override("DEFAULT_LEVERAGE", int(parts[2]))
+            note = f"槓桿改為 {parts[2]}x（由你自己決定；高槓桿風險自負）"
         elif action == "mode":
             mv = parts[2] if len(parts) > 2 else "balanced"
             set_override("SIGNAL_MODE", mv)
