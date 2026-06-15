@@ -135,12 +135,14 @@ def detect_structure_breaks(candles: list[dict], swings: list[dict]) -> list[dic
                 active_low = (_idx, _lv)
             pi += 1
         c = candles[i]["close"]
+        # 首次突破(trend=None)無前向「性格」可轉，依突破方向確立趨勢→標 BOS；
+        # 僅當收盤突破「明確反向」既有趨勢時才是 CHoCH(轉勢)。
         if active_high and i > active_high[0] and c > active_high[1]:
-            breaks.append({"type": "BOS" if trend == "up" else "CHoCH",
+            breaks.append({"type": "CHoCH" if trend == "down" else "BOS",
                            "direction": "bull", "idx": i, "level": active_high[1]})
             trend, active_high = "up", None
         elif active_low and i > active_low[0] and c < active_low[1]:
-            breaks.append({"type": "BOS" if trend == "down" else "CHoCH",
+            breaks.append({"type": "CHoCH" if trend == "up" else "BOS",
                            "direction": "bear", "idx": i, "level": active_low[1]})
             trend, active_low = "down", None
     return breaks[-6:]
