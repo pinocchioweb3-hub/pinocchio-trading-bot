@@ -15,6 +15,7 @@ Envelope：{code: "0", msg, data}
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any
 
@@ -48,6 +49,55 @@ class _RateLimiter:
 
 
 # ===========================================================================
+# Short-TTL 成功快取（v34-2）：跨幣/跨 worker 去重 + 吸收瞬時節流
+# ---------------------------------------------------------------------------
+# 真因（實測 _snap_burst）：每幣快照 ~13 個 CoinGlass 呼叫，其中 btc_gate /
+# strength_universe 為「全域」(每幣完全相同卻每幣重打)、structure 又重抓
+# price/cvd/liq/funding（與頂層重複）；一輪掃描 ~150+ 呼叫撞 75/80-per-min
+# 上限，且 _get 零重試零快取 → 瞬時 429/timeout 直接標 stale。
+# 對策：同 (path,params) 在 TTL 內回上次「成功」值，自動吃掉全域重複與快照內
+# 重複；TTL（90s，<< 掃描間隔 900s）確保跨輪仍是新鮮抓取。錯誤永不入快取。
+_CACHE_TTL = float(os.getenv("CG_CACHE_TTL_SEC", "90"))
+_MAX_RETRIES = int(os.getenv("CG_MAX_RETRIES", "3"))
+_RETRY_BASE = float(os.getenv("CG_RETRY_BASE_SEC", "0.5"))
+
+
+class _TTLCache:
+    def __init__(self, ttl: float):
+        self.ttl = ttl
+        self._store: dict[str, tuple[float, dict]] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _key(path: str, params: dict | None) -> str:
+        items = sorted((params or {}).items())
+        return path + "?" + "&".join(f"{k}={v}" for k, v in items)
+
+    async def get(self, path: str, params: dict | None) -> dict | None:
+        if self.ttl <= 0:
+            return None
+        k = self._key(path, params)
+        async with self._lock:
+            hit = self._store.get(k)
+            if hit and (time.time() - hit[0]) < self.ttl:
+                return hit[1]
+            if hit:
+                del self._store[k]
+        return None
+
+    async def put(self, path: str, params: dict | None, value: dict) -> None:
+        if self.ttl <= 0:
+            return
+        k = self._key(path, params)
+        async with self._lock:
+            self._store[k] = (time.time(), value)
+            if len(self._store) > 2000:          # 輕量修剪，防無限長
+                now = time.time()
+                self._store = {kk: vv for kk, vv in self._store.items()
+                               if now - vv[0] < self.ttl}
+
+
+# ===========================================================================
 # Client
 # ===========================================================================
 class CoinGlassSource:
@@ -77,6 +127,7 @@ class CoinGlassSource:
         self.api_key = SETTINGS.coinglass_api_key
         self.timeout = SETTINGS.http_timeout_sec
         self.limiter = _RateLimiter(SETTINGS.rate_limit_per_min)
+        self._cache = _TTLCache(_CACHE_TTL)
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -109,66 +160,83 @@ class CoinGlassSource:
                 message="COINGLASS_API_KEY env not set",
                 suggestion="Put your key in .env then restart",
             )
-        await self.limiter.acquire()
-        try:
-            r = await self.client.get(path, params=params or {})
-        except httpx.TimeoutException as e:
-            return make_error(
-                tool=tool, symbol=symbol, source="coinglass",
-                code="TIMEOUT",
-                message=f"HTTP timeout after {self.timeout}s: {e}",
-                suggestion="Retry; if persistent increase HTTP_TIMEOUT_SEC",
-            )
-        except httpx.HTTPError as e:
-            return make_error(
-                tool=tool, symbol=symbol, source="coinglass",
-                code="NETWORK_ERROR",
-                message=str(e),
-            )
 
-        if r.status_code == 429:
-            return make_error(
-                tool=tool, symbol=symbol, source="coinglass",
-                code="RATE_LIMITED",
-                message="CoinGlass rate limit hit",
-                suggestion=f"Reduce RATE_LIMIT_PER_MIN (now {SETTINGS.rate_limit_per_min})",
-                upstream_status=r.status_code, upstream_body=r.text,
-            )
-        if r.status_code in (401, 403):
-            return make_error(
-                tool=tool, symbol=symbol, source="coinglass",
-                code="AUTH_FAILED",
-                message="API key invalid or expired",
-                suggestion="Verify .env COINGLASS_API_KEY; rotate in CG dashboard if leaked",
-                upstream_status=r.status_code, upstream_body=r.text,
-            )
-        if r.status_code >= 400:
-            return make_error(
-                tool=tool, symbol=symbol, source="coinglass",
-                code="HTTP_ERROR",
-                message=f"HTTP {r.status_code}",
-                upstream_status=r.status_code, upstream_body=r.text,
-            )
+        # 短 TTL 成功快取：同 (path,params) 在 TTL 內直接回上次成功值
+        # → 吃掉全域重複(btc_gate/strength_universe) 與快照內重複(structure)
+        cached = await self._cache.get(path, params)
+        if cached is not None:
+            return cached
 
-        try:
-            body = r.json()
-        except Exception as e:
-            return make_error(
-                tool=tool, symbol=symbol, source="coinglass",
-                code="PARSE_ERROR",
-                message=f"non-JSON: {e}", upstream_body=r.text,
-            )
+        # 只對「瞬時」錯誤（timeout / network / 429 / 5xx）退避重試；
+        # 終局錯誤（401/403/4xx/業務碼/解析）立刻回，不浪費 rate budget。
+        last_err: dict = make_error(
+            tool=tool, symbol=symbol, source="coinglass",
+            code="UNKNOWN", message="no attempt made")
+        for attempt in range(_MAX_RETRIES + 1):
+            await self.limiter.acquire()
+            transient = False
+            try:
+                r = await self.client.get(path, params=params or {})
+            except httpx.TimeoutException as e:
+                last_err = make_error(
+                    tool=tool, symbol=symbol, source="coinglass", code="TIMEOUT",
+                    message=f"HTTP timeout after {self.timeout}s: {e}",
+                    suggestion="Retry; if persistent increase HTTP_TIMEOUT_SEC")
+                transient = True
+            except httpx.HTTPError as e:
+                last_err = make_error(
+                    tool=tool, symbol=symbol, source="coinglass",
+                    code="NETWORK_ERROR", message=str(e))
+                transient = True
+            else:
+                if r.status_code == 429:
+                    last_err = make_error(
+                        tool=tool, symbol=symbol, source="coinglass",
+                        code="RATE_LIMITED", message="CoinGlass rate limit hit",
+                        suggestion=f"Reduce RATE_LIMIT_PER_MIN (now {SETTINGS.rate_limit_per_min})",
+                        upstream_status=r.status_code, upstream_body=r.text)
+                    transient = True
+                elif r.status_code in (401, 403):
+                    return make_error(
+                        tool=tool, symbol=symbol, source="coinglass",
+                        code="AUTH_FAILED", message="API key invalid or expired",
+                        suggestion="Verify .env COINGLASS_API_KEY; rotate in CG dashboard if leaked",
+                        upstream_status=r.status_code, upstream_body=r.text)
+                elif r.status_code >= 500:
+                    last_err = make_error(
+                        tool=tool, symbol=symbol, source="coinglass",
+                        code="HTTP_ERROR", message=f"HTTP {r.status_code}",
+                        upstream_status=r.status_code, upstream_body=r.text)
+                    transient = True
+                elif r.status_code >= 400:
+                    return make_error(
+                        tool=tool, symbol=symbol, source="coinglass",
+                        code="HTTP_ERROR", message=f"HTTP {r.status_code}",
+                        upstream_status=r.status_code, upstream_body=r.text)
+                else:
+                    try:
+                        body = r.json()
+                    except Exception as e:
+                        return make_error(
+                            tool=tool, symbol=symbol, source="coinglass",
+                            code="PARSE_ERROR",
+                            message=f"non-JSON: {e}", upstream_body=r.text)
+                    code = body.get("code")
+                    if code not in ("0", 0, "success", "SUCCESS"):
+                        return make_error(
+                            tool=tool, symbol=symbol, source="coinglass",
+                            code="API_ERROR",
+                            message=str(body.get("msg") or "unknown"),
+                            upstream_body=str(body)[:600])
+                    out = {"data": body.get("data"), "source": "coinglass"}
+                    await self._cache.put(path, params, out)
+                    return out
 
-        code = body.get("code")
-        if code not in ("0", 0, "success", "SUCCESS"):
-            return make_error(
-                tool=tool, symbol=symbol, source="coinglass",
-                code="API_ERROR",
-                message=str(body.get("msg") or "unknown"),
-                upstream_body=str(body)[:600],
-            )
-
-        return {"data": body.get("data"), "source": "coinglass"}
+            if transient and attempt < _MAX_RETRIES:
+                await asyncio.sleep(min(_RETRY_BASE * (2 ** attempt), 8.0))
+            else:
+                break
+        return last_err
 
     # ---------------------------------------------------------------------
     # 解析 helper
