@@ -37,8 +37,8 @@ DEFAULT_MODEL = MODEL_SONNET
 DAILY_MACRO_PROMPT = """你是一位資深加密貨幣宏觀策略分析師，正在為一位專業期貨交易者撰寫深度市場簡報。
 
 交易者背景：
-- 帳戶 $10K USDT 永續期貨
-- 目標每天 +$100，月 5-10% 報酬
+- 加密貨幣永續期貨交易者（本金大小依各自設定，不要假設特定金額或報酬目標）
+- 追求穩健的正期望值與嚴格風控，不是賭單一暴利（不承諾任何固定報酬）
 - 用 Wyckoff 吸籌、軋空、左側埋伏策略
 - 不要泛泛建議，要具體數字、因果脈絡、可監控訊號
 
@@ -177,10 +177,10 @@ PER_SYMBOL_DEEPDIVE_PROMPT = """你是專業加密貨幣交易計畫師。針對
 - **止盈分批**：TP1 / TP2 / TP3 — **目標是下一個 Liquidity / OB / Swing**，不是固定 R 倍數
 - **倉位計算（必算！）**：
   - 1R 價差 = |entry - stop|
-  - position_notional = $100 / 1R × entry
-  - margin = notional / leverage
-  - **驗證 margin ≤ $500**，超出就調高槓桿（最多 15x for BTC/ETH/SOL）
-- **建議槓桿**：經上述驗算後決定（5x / 10x / 15x）
+  - **一律依資料中「## ⚠️ 帳戶約束」區塊給的 1R(USD)、margin 上限、槓桿上限計算 —— 不要自行假設金額**
+  - position_notional = 1R(USD) / 1R價差(%) × entry；margin = notional / leverage
+  - **驗證 margin ≤ 帳戶約束給的上限**；在槓桿上限內選「能達標的最低槓桿」（槓桿越低越安全）
+- **建議槓桿**：經上述驗算後決定，**不得超過帳戶約束的槓桿上限**
 - **R:R 報酬比**：TP2 至少 1.5R，TP3 至少 2R，否則 setup 不值得
 - **持倉時長預估**：日內 / 1-3 日 / 1 週
 - **失效條件**：什麼價位或數據變化 = 立即出場（要基於 SMC 結構）
@@ -465,6 +465,30 @@ def _format_pulse_data(pulse_state: dict) -> str:
     return "\n".join(parts)
 
 
+def _account_constraints_block() -> list[str]:
+    """依 botconfig 動態產生「帳戶約束」段（v42：取代舊的寫死 $500/$100/15x）。
+
+    這段是給 LLM 算倉位/槓桿的護欄；實際風控仍由 leverage/risk_manager 把關。
+    所有數字都從 CONFIG 來 → 每個自架者用自己的預算，數字自動跟著走，不再脫鉤。"""
+    from botconfig import CONFIG
+    bal = CONFIG.account_balance_usd
+    risk_1r = CONFIG.risk_per_trade_usd
+    max_lev = CONFIG.default_leverage
+    alt_lev = min(max_lev, 5)
+    # 單筆 margin 上限 = 帳戶 10%（與 max_concurrent 併用後總鎖倉仍留充足緩衝）；
+    # 現行 $5000 → $500，與升級前一致。
+    margin_cap = round(bal * 0.10)
+    return [
+        "## ⚠️ 帳戶約束（必須遵守）",
+        f"- 帳戶本金：約 ${bal:,.0f} USDT（{CONFIG.tier.label}級；依本金分級的保守護欄，不可超倉）",
+        f"- 單筆風險上限：${risk_1r:,.0f} USDT（= 1R）",
+        f"- 倉位公式：position_notional = ${risk_1r:,.0f} / 1R價差(%) × entry；margin = notional / leverage",
+        f"- 單筆 margin 必須 ≤ ${margin_cap:,.0f}（帳戶 10%）才安全",
+        f"- 選槓桿：用「能讓 margin ≤ ${margin_cap:,.0f} 的最低槓桿」，但**不得超過上限 {max_lev}x**",
+        f"- 槓桿上限：主流（BTC/ETH/SOL）最多 {max_lev}x；低流通/小幣最多 {alt_lev}x\n",
+    ]
+
+
 def _format_symbol_data(symbol: str, sym_state: dict) -> str:
     """組 per-symbol deep dive 用的單一標的全資料摘要（含 SMC 量化指標 + 帳戶約束）"""
     parts = [f"# {symbol} 完整數據\n"]
@@ -482,14 +506,8 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
     }.get(_mode, "⚖️ 平衡模式")
     parts.append(f"## 🎚️ 訊號模式：{_mode_rule}\n")
 
-    # === 使用者帳戶約束（重要：Claude 算倉位時必須遵守）===
-    parts.append("## ⚠️ 帳戶約束（必須遵守）")
-    parts.append("- 帳戶實際 margin: $500-800 USDT（小資金，不能超倉）")
-    parts.append("- 單筆風險上限: $100 USDT (1R)")
-    parts.append("- 計算公式：position_notional = $100 / |entry - SL| × entry")
-    parts.append("- margin = notional / leverage，必須 ≤ $500 才安全")
-    parts.append("- 若計算後 5x 槓桿超出 $500 margin → 必須建議 10-15x 才塞得進")
-    parts.append("- WLFI 等低流通幣最多 5x，BTC/ETH/SOL 主流可達 15x\n")
+    # === 使用者帳戶約束（v42：動態依 botconfig，不再寫死）===
+    parts.extend(_account_constraints_block())
 
     # v33：市場狀態（regime）— 策略-狀態適配的前提
     rg = sym_state.get("regime") or {}

@@ -846,10 +846,10 @@ def _update_daily_pnl(conn, exit_at_ms: int, pnl: float, is_win: bool) -> None:
 
 
 def get_today_pnl(account_balance_usd: float | None = None) -> dict:
-    if account_balance_usd is None:
-        import os
-        account_balance_usd = float(os.getenv("ACCOUNT_BALANCE_USD", "5000"))
     """拿今日 PnL（給熔斷判斷用）"""
+    if account_balance_usd is None:
+        from botconfig import CONFIG  # v42: 單一來源（含 override、依預算分級）
+        account_balance_usd = CONFIG.account_balance_usd
     init_db()
     conn = _conn()
     try:
@@ -876,10 +876,10 @@ def get_today_pnl(account_balance_usd: float | None = None) -> dict:
 
 
 def get_week_pnl(account_balance_usd: float | None = None) -> dict:
-    if account_balance_usd is None:
-        import os
-        account_balance_usd = float(os.getenv("ACCOUNT_BALANCE_USD", "5000"))
     """拿本週累計 PnL"""
+    if account_balance_usd is None:
+        from botconfig import CONFIG  # v42: 單一來源（含 override、依預算分級）
+        account_balance_usd = CONFIG.account_balance_usd
     init_db()
     conn = _conn()
     try:

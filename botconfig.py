@@ -81,6 +81,16 @@ def _i(key: str, default: int, lo: int, hi: int) -> int:
     return int(_f(key, float(default), float(lo), float(hi)))
 
 
+def _is_set(key: str) -> bool:
+    """該鍵是否被使用者「明確」設定（override 或 env 且非空）。
+
+    用來區分「使用者沒設 → 套用預算分級的保守預設」與「使用者明確設值 →
+    一律以使用者為準（紅線②可覆寫）」。``_f``/``_i`` 的預設值替換看不出這個差別，
+    故需要本函式。"""
+    raw = _raw(key)
+    return raw is not None and raw.strip() != ""
+
+
 def _tf(key: str, default: tuple[float, ...], lo: float = 0.1,
         hi: float = 20.0) -> tuple[float, ...]:
     """逗號分隔浮點數列（如 TP_R_INTRADAY=1.0,1.5,2.0）。強制遞增、長度=3。"""
@@ -98,6 +108,46 @@ def _tf(key: str, default: tuple[float, ...], lo: float = 0.1,
         return default
 
 
+# ===========================================================================
+# v42: 依預算自適應的風控分級（budget-adaptive tiering）
+# ---------------------------------------------------------------------------
+# 開源後每個自架者本金不同，原本「3000U 陪跑」太死。改成：本金是可設定參數，
+# 風控護欄依本金分級。分級只提供「使用者沒設定時的保守預設」；任何明確設定的
+# env/override 一律優先（紅線②可覆寫）。設計原則：本金越小、保護越嚴，且小本金
+# 永遠不會比大本金更激進（單調保守）—— 這不是投資建議，是工具的安全預設。
+# ===========================================================================
+@dataclass(frozen=True)
+class TierBand:
+    name: str               # 分級代號（micro/small/standard/large）
+    label: str              # 繁中標籤
+    min_usd: float          # 本金下界（含）
+    leverage_cap: int       # 未設 DEFAULT_LEVERAGE 時的預設槓桿（保守；可被明確 env 覆寫）
+    risk_pct_default: float # 未明確設定風險時，1R = 帳戶 × 此 %
+    total_risk_cap_pct: float  # 總曝險上限（帳戶 %）
+    daily_max_opens: int    # 每日最多開倉次數
+    spot_unlocked: bool     # 是否解鎖獨立現貨策略（小本金期貨手續費佔比過重 → 先不開）
+
+
+# 由大到小排列；budget_tier 由上而下找第一個 balance >= min_usd
+_TIERS: tuple[TierBand, ...] = (
+    #          name        label    min_usd  lev  risk%  cap%  opens  spot
+    TierBand("large",    "大資本",  10_000.0,   5,   1.0,  6.0,    3,  True),
+    TierBand("standard", "標準",     5_000.0,   5,   1.0,  6.0,    3,  True),
+    TierBand("small",    "小資本",   1_000.0,   5,   1.0,  6.0,    3,  False),
+    TierBand("micro",    "微型",         0.0,   3,   1.0,  5.0,    2,  False),
+)
+
+
+def budget_tier(balance_usd: float) -> TierBand:
+    """依帳戶本金回傳風控分級（純函式、無副作用、可離線測試）。
+
+    分級只決定「未設定鍵」的保守預設值；明確設定的 env/override 一律優先。"""
+    for t in _TIERS:
+        if balance_usd >= t.min_usd:
+            return t
+    return _TIERS[-1]   # micro（min_usd=0），理論上不會落到這
+
+
 @dataclass(frozen=True)
 class BotConfig:
     # === 帳戶與風險（用戶最常自訂的三個）===
@@ -106,6 +156,8 @@ class BotConfig:
     risk_per_trade_pct: float        # v27: >0 時改用「帳戶 %」計算 1R（覆蓋固定 USD）
     max_concurrent_trades: int       # 最多同時持倉數
     default_leverage: int
+    total_risk_cap_pct: float        # v42: 總曝險上限（帳戶 %）— 單一來源（原在 risk_manager）
+    daily_max_opens: int             # v42: 每日最多開倉 — 單一來源（原在 risk_manager）
     # === 交易計畫 ===
     sl_pct_intraday: float
     sl_pct_ambush: float
@@ -126,17 +178,31 @@ class BotConfig:
             _WARNINGS.append(f"TP_SIZE_SPLIT 總和 {sum(split)} ≠ 1.0，回退預設")
             split = (0.5, 0.3, 0.2)
 
-        # v27: 風險百分比模式 — RISK_PER_TRADE_PCT>0 時，1R = 帳戶 × %
+        # v42: 依預算分級。tier 只填「使用者沒設定」的鍵；明確 env/override 永遠優先。
         bal = _f("ACCOUNT_BALANCE_USD", 5000, 100, 10_000_000)
+        tier = budget_tier(bal)
+
+        # 風險（1R）優先序：明確 RISK_PER_TRADE_PCT>0 ＞ 明確 RISK_PER_TRADE_USD
+        #                  ＞ 兩者皆未設 → 落 tier 保守 %（小本金永不更激進）
         pct = _f("RISK_PER_TRADE_PCT", 0.0, 0.0, 20.0)
-        risk_usd = round(bal * pct / 100, 2) if pct > 0 else _f("RISK_PER_TRADE_USD", 100, 1, 10_000)
+        if pct > 0:
+            risk_usd = round(bal * pct / 100, 2)
+        elif _is_set("RISK_PER_TRADE_USD"):
+            risk_usd = _f("RISK_PER_TRADE_USD", 100, 1, 10_000)
+        else:
+            pct = tier.risk_pct_default
+            risk_usd = round(bal * pct / 100, 2)
 
         return cls(
             account_balance_usd=bal,
             risk_per_trade_usd=risk_usd,
             risk_per_trade_pct=pct,
             max_concurrent_trades=_i("MAX_CONCURRENT_TRADES", 3, 1, 20),
-            default_leverage=_i("DEFAULT_LEVERAGE", 15, 1, 50),
+            # 未設 DEFAULT_LEVERAGE → tier 保守槓桿；明確設值一律優先（紅線②）
+            default_leverage=_i("DEFAULT_LEVERAGE", tier.leverage_cap, 1, 50),
+            # 未設則落 tier 預設（_f 的 default 即 tier 值 → 明確設值優先）
+            total_risk_cap_pct=_f("TOTAL_RISK_CAP_PCT", tier.total_risk_cap_pct, 1.0, 50.0),
+            daily_max_opens=_i("DAILY_MAX_OPENS", tier.daily_max_opens, 1, 50),
             sl_pct_intraday=_f("SL_PCT_INTRADAY", 4.0, 0.5, 15.0),
             sl_pct_ambush=_f("SL_PCT_AMBUSH", 5.0, 0.5, 20.0),
             tp_r_intraday=_tf("TP_R_INTRADAY", (1.0, 1.5, 2.0)),
@@ -150,6 +216,11 @@ class BotConfig:
 
     def tp_r(self, setup: str) -> tuple[float, ...]:
         return self.tp_r_intraday if setup == "intraday" else self.tp_r_ambush
+
+    @property
+    def tier(self) -> TierBand:
+        """目前本金對應的風控分級（含 spot_unlocked 等旗標）。"""
+        return budget_tier(self.account_balance_usd)
 
 
 CONFIG = BotConfig.from_env()
@@ -179,8 +250,66 @@ if __name__ == "__main__":
     from pathlib import Path
     load_dotenv(Path(__file__).resolve().parent / ".env")
     c = reload()
-    print(f"risk_per_trade  = ${c.risk_per_trade_usd}")
+    print(f"account_balance = ${c.account_balance_usd:,.0f}  → tier={c.tier.name}（{c.tier.label}）")
+    print(f"risk_per_trade  = ${c.risk_per_trade_usd}  (pct={c.risk_per_trade_pct}%)")
     print(f"max_trades      = {c.max_concurrent_trades}")
     print(f"leverage        = {c.default_leverage}x")
+    print(f"total_risk_cap  = {c.total_risk_cap_pct}%   daily_max_opens = {c.daily_max_opens}")
+    print(f"spot_unlocked   = {c.tier.spot_unlocked}")
     print(f"SL intraday/ambush = {c.sl_pct_intraday}% / {c.sl_pct_ambush}%")
     print(f"TP intraday     = {c.tp_r_intraday}  split={c.tp_size_split}")
+
+    # ===================================================================
+    # 安全不變量自測（不依賴實際 .env / bot_settings.json）
+    # 證明：現行 $5000 明確設定 → 零行為改變；清掉明確值 → 落 tier 保守預設。
+    # ===================================================================
+    print("\n--- v42 不變量自測 ---")
+    _SETTINGS_FILE = None          # 停用 override 檔，讓自測純由 env 決定
+
+    def _set(k, v):
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+    # 不變量①：現行部署（明確 USD/槓桿、未設 PCT/CAP/OPENS）→ 與升級前完全一致
+    for k in ("RISK_PER_TRADE_PCT", "TOTAL_RISK_CAP_PCT", "DAILY_MAX_OPENS"):
+        _set(k, None)
+    _set("ACCOUNT_BALANCE_USD", "5000")
+    _set("RISK_PER_TRADE_USD", "100")
+    _set("DEFAULT_LEVERAGE", "15")
+    c = reload()
+    assert c.risk_per_trade_usd == 100, c.risk_per_trade_usd
+    assert c.default_leverage == 15, c.default_leverage
+    assert c.total_risk_cap_pct == 6.0, c.total_risk_cap_pct
+    assert c.daily_max_opens == 3, c.daily_max_opens
+    assert c.tier.name == "standard", c.tier.name
+    assert c.risk_per_trade_pct == 0.0, c.risk_per_trade_pct
+    print("✓ ①現行 $5000 明確設定 → 1R=$100 / 15x / 6% / 3 opens（零行為改變）")
+
+    # 不變量②：清掉明確 USD 與槓桿 → 落 Standard tier 預設（1.0%＝$50、5x）
+    _set("RISK_PER_TRADE_USD", None)
+    _set("DEFAULT_LEVERAGE", None)
+    c = reload()
+    assert c.risk_per_trade_usd == 50.0, c.risk_per_trade_usd   # 5000 × 1.0%
+    assert c.default_leverage == 5, c.default_leverage
+    assert c.risk_per_trade_pct == 1.0, c.risk_per_trade_pct
+    print("✓ ②清掉明確值 → Standard 1.0%＝$50 / 5x")
+
+    # 不變量③：micro 帳戶（$800）→ 最嚴護欄、現貨未解鎖
+    _set("ACCOUNT_BALANCE_USD", "800")
+    c = reload()
+    assert c.tier.name == "micro", c.tier.name
+    assert c.default_leverage == 3, c.default_leverage
+    assert c.daily_max_opens == 2, c.daily_max_opens
+    assert c.total_risk_cap_pct == 5.0, c.total_risk_cap_pct
+    assert c.tier.spot_unlocked is False
+    print("✓ ③$800 → micro 3x / 2 opens / 5% cap / 現貨未解鎖")
+
+    # 不變量④：明確設定一律優先 — micro 帳戶仍可被使用者明確覆寫成 10x
+    _set("DEFAULT_LEVERAGE", "10")
+    c = reload()
+    assert c.default_leverage == 10, c.default_leverage
+    print("✓ ④明確 env 覆寫優先 — micro 帳戶仍可手動設 10x（紅線②可覆寫）")
+
+    print("--- 全部不變量通過 ---")

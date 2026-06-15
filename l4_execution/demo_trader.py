@@ -45,13 +45,16 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Optional
 
+from botconfig import CONFIG as _BC
 from l2_trigger.leverage import choose_leverage, compute_position, compute_tp_prices
 
 # ---------------------------------------------------------------------------
 # 規格常數（research spec 定案；可由 .env / RiskConfig 覆寫處標註）
 # ---------------------------------------------------------------------------
-RISK_PER_TRADE_USD = 100.0          # 1R（與 risk_manager.RiskConfig 一致）
-BUCKET_RISK_CAP_USD = 200.0         # 相關桶風險上限 = 2R（第 3 筆相關單拒）
+# v42: 1R 走 botconfig 單一來源（依預算分級；明確 env 優先）。與 risk_manager 一致，
+#      不再各自硬編碼 100.0。（本層尚未接 daemon，零在倉影響，但先正源以防未來接線。）
+RISK_PER_TRADE_USD = _BC.risk_per_trade_usd          # 1R
+BUCKET_RISK_CAP_USD = round(_BC.risk_per_trade_usd * 2, 2)   # 相關桶上限 = 2R（第 3 筆相關單拒）
 TP_WEIGHTS = (0.40, 0.30, 0.30)     # TP1/TP2/TP3 分腿比例（最後一腿吃餘數）
 TP_R_MULTIPLES = (1.0, 1.5, 2.0)    # 與 types.TriggerConfig 一致
 SL_PAD_PCT = 0.5                    # 止損觸發價緩衝（快市才填得到）

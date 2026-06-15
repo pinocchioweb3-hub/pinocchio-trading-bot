@@ -43,8 +43,9 @@ class RiskConfig:
     max_per_family: int = int(os.getenv("MAX_PER_CORRELATED_FAMILY", "2"))
 
     # P0-A 新增：總曝險上限（% of 帳戶）+ 每日最多開倉次數
-    total_risk_cap_pct: float = float(os.getenv("TOTAL_RISK_CAP_PCT", "6.0"))
-    daily_max_opens: int = int(os.getenv("DAILY_MAX_OPENS", "3"))
+    # v42: 改走 botconfig 單一來源（依預算分級；明確 env 仍優先，tier 只填未設值）
+    total_risk_cap_pct: float = _BC.total_risk_cap_pct
+    daily_max_opens: int = _BC.daily_max_opens
 
     # 熔斷層
     daily_dd_limit_pct: float = float(os.getenv("DAILY_DD_LIMIT_PCT", "-3.0"))

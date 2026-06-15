@@ -47,9 +47,10 @@ FEATURES = [
     {"key": "ceo_session", "name": "CEO 監督 Session（本簡報）", "kind": "session", "status": "shipped"},
     # 風控
     {"key": "risk_gates", "name": "風控閘門（總曝險+日開倉上限，%制）", "kind": "risk", "status": "shipped"},
-    {"key": "leverage_downshift", "name": "小資降槓桿（15x→3x）", "kind": "risk", "status": "blocked",
-     "by": "decision", "note": "等發起人決策（影響實際倉位顯示）"},
-    {"key": "coach_monitor", "name": "教練式持倉提醒（別追高/該止損/今日別再交易）", "kind": "risk", "status": "shipped"},
+    {"key": "budget_tiering", "name": "依預算自適應風控分級（本金→槓桿/風險/曝險護欄）", "kind": "risk", "status": "shipped"},
+    {"key": "leverage_tier", "name": "你這台是否改吃 tier 槓桿預設（現行明確 15x 不動）", "kind": "risk", "status": "blocked",
+     "by": "decision", "note": "等發起人決策；框架已上線且零行為改變，僅你本機是否改設"},
+    {"key": "coach_monitor", "name": "教練式持倉提醒（追高/止損/熔斷/手續費侵蝕/降檔）", "kind": "risk", "status": "shipped"},
     {"key": "discipline_kpi", "name": "紀律遵守率 KPI（決斷率+不追高率）", "kind": "risk", "status": "shipped"},
     # 治理 / 對外
     {"key": "decision_registry", "name": "決策佇列（需發起人拍板）", "kind": "gov", "status": "shipped"},
