@@ -41,6 +41,12 @@ from .symbol_mapping import (
 # 共用：source 單例 + ToolAnnotations
 # ===========================================================================
 SOURCE = get_source()
+
+# Hyperliquid 原生盤面（公開、免金鑰、唯讀）獨立於主後端的確認來源。
+# 不論 MARKET_INTEL_BACKEND 是哪個都可用（HL info API 不需 CoinGlass 金鑰）。
+from .sources.hyperliquid import HyperliquidSource  # noqa: E402
+HL = HyperliquidSource()
+
 _READONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True) if _MCP_AVAILABLE else None
 
 if _MCP_AVAILABLE:
@@ -520,6 +526,50 @@ async def mi_get_hyperliquid_whales(
     return make_error(tool="mi_get_hyperliquid_whales", symbol=None,
                       source=SOURCE.name, code="NOT_AVAILABLE",
                       message=f"backend={SOURCE.name} does not support whale data")
+
+
+# ===========================================================================
+# Hyperliquid 原生盤面（公開 info API，免金鑰）：與 CEX 獨立的確認來源
+# ===========================================================================
+@_tool
+async def mi_get_hl_market(
+    symbol: Annotated[str, Field(description="BTC / BTC-USDT-SWAP / BTCUSDT 皆可，自動正規化為 HL 幣名")],
+) -> dict:
+    """Hyperliquid 單幣盤面（鏈上永續，免金鑰）：
+    標記/預言/中價、24h 漲跌%、資金費率（hourly／8h%／年化%）、未平倉(USD)、24h 名目量、最大槓桿。
+    與 Binance/OKX 獨立，可作為 funding/OI confluence 的第三方確認。
+    """
+    return await HL.get_market(symbol)
+
+
+@_tool
+async def mi_get_hl_funding(
+    symbol: Annotated[str, Field(description="BTC / BTC-USDT-SWAP / BTCUSDT 皆可")],
+) -> dict:
+    """Hyperliquid 資金費率（每小時收）。回 hourly／8h%（對齊 CEX 慣例）／年化%。
+    HL funding 為正＝多方付空方（多頭過熱）；負＝空方付多方（軋空燃料）。
+    """
+    return await HL.get_funding(symbol)
+
+
+@_tool
+async def mi_get_hl_candles(
+    symbol: Annotated[str, Field(description="BTC / BTC-USDT-SWAP / BTCUSDT 皆可")],
+    interval: Annotated[str, Field(description="1m|5m|15m|30m|1h|4h|1d 等；預設 1h")] = "1h",
+    limit: Annotated[int, Field(ge=1, le=1000, description="K 線根數")] = 100,
+) -> dict:
+    """Hyperliquid K 線（OHLCV + 成交筆數）。鏈上撮合的價量，與 CEX 獨立。"""
+    return await HL.get_candles(symbol, interval, limit)
+
+
+@_tool
+async def mi_get_hl_overview(
+    top_n: Annotated[int, Field(ge=1, le=50, description="依未平倉(USD) 排序前 N 幣")] = 20,
+) -> dict:
+    """全 Hyperliquid 永續市場一覽（一次呼叫涵蓋全部永續）：
+    全市場總 OI(USD)／總 24h 量、OI 前 N 幣、funding 最熱/最冷各 5（過熱做空候選／過冷做多候選）。
+    """
+    return await HL.get_overview(top_n)
 
 
 @_tool
