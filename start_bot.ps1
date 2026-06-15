@@ -1,4 +1,4 @@
-# TradingBot daemon 啟動腳本（v14）
+﻿# TradingBot daemon 啟動腳本（v14）
 # - 冪等：先殺掉既有的 run_bot 程序再啟動，不會出現重複 daemon
 # - 給 Windows Task Scheduler 開機自啟用，也可手動跑
 $cwd = "C:\Users\user\OneDrive\桌面\交易機器人"
