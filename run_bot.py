@@ -235,6 +235,8 @@ async def amain(args: argparse.Namespace) -> int:
     from l3_dispatcher.auto_tuner import run_auto_tuner_loop as _run_tuner
     # v32: 回測 Session（每週真實歷史回放，驗證啟用策略期望值 → 系統主題 + 供 auto_tuner 參照）
     from backtest.backtest_session import run_backtest_loop as _run_backtest
+    # v35: 帳本防竄改錨定（每週 trade_journal 快照 → OpenTimestamps 錨定比特幣，純讀不下單）
+    from l3_dispatcher.ledger_anchor import run_anchor_loop as _run_anchor
 
     # v14: 每個 worker 用 supervise() 隔離 — 單一 worker 崩潰自動重啟，不再全滅
     # v14.1: run_on_startup 只在首次啟動為 True — supervise 崩潰重啟不重推開機報告
@@ -304,6 +306,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("auto_tuner", lambda: _run_tuner(tg_sys)),
         # v32: 回測 Session（每週歷史回放驗證期望值 → 系統主題，純讀不下單）
         ("backtest", lambda: _run_backtest(tg_sys)),
+        # v35: 帳本錨定 Session（每週快照 → OpenTimestamps 比特幣防竄改，只送 32B 雜湊）
+        ("ledger_anchor", lambda: _run_anchor(tg_sys)),
     ]
     try:
         await asyncio.gather(*[

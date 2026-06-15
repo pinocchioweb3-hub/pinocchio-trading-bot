@@ -20,6 +20,11 @@ anthropic>=0.40.0
 # === Telegram 機器人 ===
 python-telegram-bot>=21.6
 
+# === v35: 帳本防竄改錨定（OpenTimestamps → 比特幣）===
+# 只需此 lib 產生 .ots 證明（自動帶 python-bitcoinlib，僅用 bitcoin.core 免 OpenSSL）。
+# 第三方驗證另裝 opentimestamps-client 或上 https://opentimestamps.org。
+opentimestamps>=0.4.5
+
 # === 測試 ===
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
