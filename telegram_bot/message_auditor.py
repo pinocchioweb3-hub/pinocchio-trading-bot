@@ -112,21 +112,23 @@ KIND_SIGNATURES = [
     ("news",     ("truth social", "realdonaldtrump")),
 ]
 
+# v36: 群組精簡 12→6（保留 trade/positions/intel/news/system/ideas；
+#      美股訊號併 trade、美股持倉併 positions、pulse/econ/alerts 併 intel、美股新聞/行情併 news）
 KIND_TO_TOPICS = {
-    "fire":      {"trade", "us_signals"},
-    "waiting":   {"trade", "us_signals"},
-    "order_card": {"positions", "us_positions"},
-    "tp_sl":     {"positions", "us_positions"},
-    "position":  {"positions", "us_positions"},
-    "paper":     {"positions", "us_positions"},
+    "fire":      {"trade"},
+    "waiting":   {"trade"},
+    "order_card": {"positions"},
+    "tp_sl":     {"positions"},
+    "position":  {"positions"},
+    "paper":     {"positions"},
     "perf":      {"positions"},
     "macro":     {"intel"},
     "narrative": {"intel"},
-    "pulse":     {"pulse"},
-    "usnews":    {"usstock"},
-    "news":      {"news", "usstock"},
-    "econ":      {"econ"},
-    "alert":     {"alerts", "trade"},   # 熔斷可進 trade
+    "pulse":     {"intel"},
+    "usnews":    {"news"},
+    "news":      {"news"},
+    "econ":      {"intel"},
+    "alert":     {"intel", "trade"},   # 掃描警報→intel；熔斷可進 trade
     "system":    {"system", None},
     "invite":    {None},                # 私訊
     "suggestion": {"ideas", None},

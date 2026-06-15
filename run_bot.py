@@ -255,8 +255,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("daily_macro", lambda: run_daily_macro_loop(tg_intel, source, watchlist,
                                                      target_hour_utc=args.daily_macro_hour_utc,
                                                      run_on_startup=_consume_startup("daily_macro"))),
-        # v23: pulse 獨立主題（市場情報只留 Daily Macro，避免堆疊）
-        ("hourly_pulse", lambda: run_hourly_pulse_loop(router.client("pulse"),
+        # v36: 群組精簡 12→6，pulse 併回 📊市場情報（與 Daily Macro/DeepDive/掃描/經濟同群）
+        ("hourly_pulse", lambda: run_hourly_pulse_loop(router.client("intel"),
                                                        source, watchlist,
                                                        args.pulse_interval)),
         # v16: deepdive 是具體交易計畫（報單）→ 改推交易訊號主題（使用者明確要求）
@@ -270,34 +270,34 @@ async def amain(args: argparse.Namespace) -> int:
         ("trade_monitor", lambda: run_trade_monitor_loop(tg_positions, source,
                                                          args.monitor_interval,
                                                          tg_alert=tg_trade,
-                                                         tg_us=router.client("us_positions"))),
+                                                         tg_us=router.client("positions"))),  # v36: 美股持倉併入 📈持倉與績效
         ("position_tracker", lambda: run_position_tracker_loop(tg_positions, source,
                                                                args.position_tracker_interval)),
         # 新聞（已過濾 + 繁中翻譯）→ 新聞快訊主題
         ("truth_social", lambda: run_truth_social_loop(tg_news, args.truth_social_interval)),
         ("twitter_apify", lambda: run_twitter_apify_loop(
             tg_news, args.twitter_interval,
-            tg_us=router.client("usstock"))),   # v22: 美股類帳號分流
+            tg_us=router.client("news"))),   # v36: 美股類帳號併入 📰新聞快訊
         ("watchlist_refresh", lambda: run_refresh_loop(watchlist, source, callback=on_refresh)),
         ("supervisor", lambda: run_supervisor_loop(tg_sys, source, sup_state,
                                                    args.supervisor_interval)),
         # v15: 互動 listener（FIRE 按鈕 + /status /stats 指令；唯一 getUpdates consumer）
         ("interactive", lambda: _run_interactive(tg)),
-        # v16: 美股永續行情（開盤前瞻 13:25 UTC + 收盤總結 20:05 UTC）
-        ("us_stocks", lambda: _run_us_stocks(router.client("usstock"),
+        # v16: 美股永續行情（開盤前瞻 13:25 UTC + 收盤總結 20:05 UTC）→ v36 併入 📰新聞快訊
+        ("us_stocks", lambda: _run_us_stocks(router.client("news"),
                                              run_on_startup=_consume_startup("us_stocks"))),
-        # v16: 經濟數據日曆（預告 + T-30 預警 + actual 即時判讀 + 訊號靜默期）
-        ("econ_calendar", lambda: _run_econ(router.client("econ"))),
-        # v17: 美股永續突破訊號（實驗性，僅紙上帳）
-        ("us_signals", lambda: _run_us_sig(router.client("us_signals"))),
-        # v18-A: 全市場異常掃描器 → v19 改推 ⚡異常警報 主題（不再稀釋交易訊號）
-        ("market_scanner", lambda: _run_scanner(router.client("alerts"))),
-        # v18-C: 代幣解鎖日曆（事前數週預警，每日刷新+7天預告）
-        ("unlock_calendar", lambda: _run_unlock(router.client("econ"))),
+        # v16: 經濟數據日曆 → v36 併入 📊市場情報
+        ("econ_calendar", lambda: _run_econ(router.client("intel"))),
+        # v17: 美股永續突破訊號（實驗性，僅紙上帳）→ v36 併入 🎯交易訊號（加密+美股 FIRE 同群）
+        ("us_signals", lambda: _run_us_sig(router.client("trade"))),
+        # v18-A: 全市場異常掃描器 → v36 併入 📊市場情報
+        ("market_scanner", lambda: _run_scanner(router.client("intel"))),
+        # v18-C: 代幣解鎖日曆 → v36 併入 📊市場情報
+        ("unlock_calendar", lambda: _run_unlock(router.client("intel"))),
         # v20: Threads 自動發布（token 未設定時 no-op 待命）
         ("threads_publisher", lambda: _run_threads(tg_sys)),
-        # v22-4: 美股快訊（DJ 終端 flash 優先，AI 過濾+繁中）→ 美股主題
-        ("us_news", lambda: _run_us_news(router.client("usstock"))),
+        # v22-4: 美股快訊（DJ 終端 flash 優先，AI 過濾+繁中）→ v36 併入 📰新聞快訊
+        ("us_news", lambda: _run_us_news(router.client("news"))),
         # v24: 稽核 Session 報告（每小時彙整路由/重複/明確性警示 → 系統主題）
         ("auditor", lambda: _run_audit(tg_sys)),
         # v25: 敘事引擎（每日聚類事件因果脈絡 → 市場情報主題）

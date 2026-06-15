@@ -25,20 +25,27 @@ from .client import TelegramClient
 
 TOPICS_FILE = data_dir() / "telegram_topics.json"
 
+# v36: 群組精簡 12→6（按「功能」分；資產別在訊息內以 🪙加密/🇺🇸美股/🥇商品 標記區分）。
+# 保留這 6 個 key（已有 thread_id）；其餘 6 個（usstock/econ/alerts/pulse/us_signals/
+# us_positions）由 migrate_topics_v36.py 改名收尾並關閉(close)封存——不刪除、不丟歷史。
 TOPIC_DEFS = [
-    ("trade",     "🎯 交易訊號"),     # v15: 只放 FIRE + 熔斷警報（高價值低頻）
-    ("positions", "📈 持倉與績效"),   # v15 新增：TP/SL 事件、持倉快照、績效、風控阻擋
-    ("intel",     "📊 市場情報"),
-    ("news",      "📰 新聞快訊"),
-    ("usstock",   "🇺🇸 美股"),
-    ("system",    "🛠 系統狀態"),     # v15 新增：開關機、worker 警報、supervisor
-    ("econ",      "📅 經濟數據"),     # v16 新增：CPI/PPI/FOMC 預告與即時判讀
-    ("alerts",    "⚡ 異常警報"),     # v19：全市場掃描器警報（非交易訊號，獨立出來）
-    ("ideas",     "💡 意見箱"),       # v19：社群建議 + 貢獻積分（累積制）
-    ("pulse",     "📡 即時動態"),     # v23：每小時 pulse 獨立（市場情報只留 Daily Macro）
-    ("us_signals","🇺🇸 美股訊號"),    # v26：美股交易訊號獨立（與美股快訊/行情分開）
-    ("us_positions","🇺🇸 美股持倉與績效"),  # v26：美股持倉追蹤獨立帳
+    ("trade",     "🎯 交易訊號"),     # 加密+美股 FIRE 進場 + 熔斷警報（高價值低頻）
+    ("positions", "📈 持倉與績效"),   # 加密+美股 持倉快照(含回連)/TP·SL/績效/風控阻擋
+    ("intel",     "📊 市場情報"),     # Daily Macro / 每小時 Pulse / Deep Dive / 全市場掃描警報 / 經濟數據 / 解鎖日曆
+    ("news",      "📰 新聞快訊"),     # Trump·X 推文 / 美股新聞 / 美股行情總覽
+    ("system",    "🛠 系統狀態"),     # 開關機 / worker 警報 / supervisor / 版本通知 / 帳本錨定報告
+    ("ideas",     "💡 意見箱"),       # 社群建議 + 貢獻積分（開源共建互動入口）
 ]
+
+# v36 已退役（migrate 後關閉封存）的舊 key → 內容去向：
+RETIRED_TOPIC_KEYS_V36 = {
+    "usstock":      "news",       # 美股行情總覽 → 📰新聞快訊
+    "econ":         "intel",      # 經濟數據 → 📊市場情報
+    "alerts":       "intel",      # 全市場掃描警報 → 📊市場情報
+    "pulse":        "intel",      # 每小時 pulse → 📊市場情報
+    "us_signals":   "trade",      # 美股交易訊號 → 🎯交易訊號
+    "us_positions": "positions",  # 美股持倉追蹤 → 📈持倉與績效
+}
 
 
 def load_topics_config() -> dict | None:
