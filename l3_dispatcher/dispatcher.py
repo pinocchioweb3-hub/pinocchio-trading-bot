@@ -19,6 +19,7 @@ from telegram_bot.message_format import (
     render_fire_with_checks,
 )
 
+from . import symbol_gate
 from .fire_queue import dequeue_one, mark_failed, mark_sent
 from .risk_manager import should_block
 from .trade_journal import EntryRecord, record_entry
@@ -100,6 +101,14 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
                   f"(open trade #{open_t['id']} opposite direction)")
         return True
 
+    # === v47: 跨來源 per-symbol 收斂閘（唯讀檢查）===
+    # 若同 (symbol, direction) 近期已被任一 FIRE 來源（scheduler/deepdive/us）推到 🎯 →
+    # 靜默略過，避免短時間同幣重複單。標記只在「真正送出 🎯」後才寫（見下方 symbol_gate.mark_sent）。
+    if not symbol_gate.should_send(sym, direction):
+        mark_failed(fire_id, "suppressed: symbol_gate cooldown")
+        print(f"[dispatcher] #{fire_id} {sym}/{direction} SUPPRESSED (symbol_gate 跨來源冷卻)")
+        return True
+
     # === 風控前置檢查 ===
     blocked, reason, details = should_block(decision)
     if blocked:
@@ -158,6 +167,7 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
         except Exception:
             msg_id = None
         mark_sent(fire_id, tg_message_id=msg_id)
+        symbol_gate.mark_sent(sym, direction)   # v47: 已推 🎯（等待觸發也算）
         try:
             tid = record_entry(EntryRecord(
                 symbol=sym, setup=setup, direction=direction,
@@ -238,6 +248,7 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
 
     msg_id = resp.get("result", {}).get("message_id")
     mark_sent(fire_id, tg_message_id=msg_id)
+    symbol_gate.mark_sent(sym, direction)   # v47: 已推 🎯（正式 FIRE）
 
     # v18-F: FIRE 附 SMC 標記圖（4h 結構 + 交易計畫線；失敗不阻塞）
     try:

@@ -212,6 +212,16 @@ async def run_us_signal_loop(tg, scan_interval: int = 900):
                                 continue
                             if not store.should_emit(d):
                                 continue
+                            # v47: 跨來源持久化收斂閘——同 (幣,向) 窗內已推過就跳過。
+                            #      also 修 H5：US 冷卻改為持久化，進程重啟後不再「失憶秒重發」。
+                            from . import symbol_gate
+                            if not symbol_gate.should_send(
+                                sym, d.direction.value,
+                                window_s=US_BREAKOUT_DEFAULT.cooldown_seconds,
+                            ):
+                                print(f"[us_signals] {sym} {d.direction.value} skipped: "
+                                      f"symbol_gate cooldown (持久化跨來源冷卻)")
+                                continue
 
                             # === 算價位 → 推播 → 開紙上倉 ===
                             entry = snap.price
@@ -258,6 +268,7 @@ async def run_us_signal_loop(tg, scan_interval: int = 900):
                                 signal_msg_id=sig_mid,
                             )
                             store.mark_fired(d)
+                            symbol_gate.mark_sent(sym, d.direction.value)   # v47: 已推 🎯（持久化）
                             fired += 1
                             print(f"[us_signals] 🧪 FIRE {sym} {d.direction.value} "
                                   f"@{entry} (paper_id={pid}, score={d.composite_score})")
