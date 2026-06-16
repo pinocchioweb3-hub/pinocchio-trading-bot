@@ -124,7 +124,10 @@ def test_leverage_wlfi_always_5x():
 
 
 def test_leverage_atr_tiers():
-    assert choose_leverage("ETH", atr_pct_7d=2.5) == 15   # 低波動
+    # 低波動 → 回傳「傳入的 default」。顯式帶 default=15 讓本測試不依賴 .env 的
+    # DEFAULT_LEVERAGE（v42 後未設定時的保守 tier 預設是 5x；正式部署 .env 設 15
+    # 仍得 15x，行為未變）。這裡驗的是「低波動走 default 分支」這條 tier 邏輯。
+    assert choose_leverage("ETH", atr_pct_7d=2.5, default=15) == 15   # 低波動 → default
     assert choose_leverage("SOL", atr_pct_7d=6.0) == 10   # 中波動
     assert choose_leverage("SUI", atr_pct_7d=9.5) == 5    # 高波動
     assert choose_leverage("UNKNOWN", atr_pct_7d=None) == 5  # 缺料保守
