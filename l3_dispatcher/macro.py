@@ -1043,6 +1043,44 @@ async def run_daily_macro_loop(tg, source, watchlist, target_hour_utc: int = 0,
     from telegram_bot.message_format import render_macro_report
     from .synthesizer import synthesize_via_claude_code
 
+    async def _compute_and_send(prefix: str) -> bool:
+        """算宏觀狀態 → Claude 敘事化推送；回傳是否真的送出了東西。
+
+        v49 修復：舊版若 Claude 敘事引擎（CLI）離線 → text=None → 整篇 daily macro
+        **靜默消失**，使用者那天什麼都收不到、也不知道為何。現在比照 run_macro_loop
+        的既有設計，敘事失敗時降級為 render_macro_report 模板版，使用者仍收得到當日
+        宏觀數據，並誠實標示「非 AI 解讀」（紅線③：不假裝模板是 AI 寫的）。
+        """
+        state = await compute_macro_state(source, watchlist)
+        tradfi = None
+        try:
+            from market_intel_mcp.sources.tradfi import get_tradfi
+            tradfi = await get_tradfi().get_full_snapshot()
+        except Exception:
+            pass
+        text, meta = await synthesize_via_claude_code(state, tradfi, watchlist)
+        if text:
+            await _send_to_telegram(tg, text, prefix=prefix)
+            print(f"[daily-macro] sent ({meta.get('output_chars')} chars)")
+            return True
+        # 敘事引擎離線/失敗 → 降級模板版（不再靜默消失）
+        err = (meta or {}).get("error", "unknown")
+        print(f"[daily-macro] LLM 敘事失敗（{err}）→ 降級模板版")
+        try:
+            tmpl = render_macro_report(state, watchlist)
+        except Exception as e:
+            print(f"[daily-macro] 模板版也失敗，今日無法推送：{type(e).__name__}: {e}")
+            return False
+        if not tmpl:
+            print("[daily-macro] 模板版為空，今日無法推送")
+            return False
+        await _send_to_telegram(
+            tg, tmpl,
+            prefix="📅 <b>每日宏觀分析（精簡模板版）</b>\n"
+                   "<i>⚠️ AI 敘事引擎暫時離線，以下為數據模板版（非 AI 解讀）。</i>\n")
+        print(f"[daily-macro] 模板降級版已送出（{len(tmpl)} chars）")
+        return True
+
     # 啟動時可選跑一次（避免等到隔天）
     # v23-2: 6 小時內已發過就跳過 — 重啟頻繁時不再轟炸完整 Daily Macro
     if run_on_startup:
@@ -1062,17 +1100,7 @@ async def run_daily_macro_loop(tg, source, watchlist, target_hour_utc: int = 0,
     if run_on_startup:
         await asyncio.sleep(60)
         try:
-            state = await compute_macro_state(source, watchlist)
-            tradfi = None
-            try:
-                from market_intel_mcp.sources.tradfi import get_tradfi
-                tradfi = await get_tradfi().get_full_snapshot()
-            except Exception:
-                pass
-            text, meta = await synthesize_via_claude_code(state, tradfi, watchlist)
-            if text:
-                await _send_to_telegram(tg, text, prefix="📅 <b>Daily Macro 啟動版</b>\n")
-                print(f"[daily-macro] startup sent ({meta.get('output_chars')} chars)")
+            if await _compute_and_send("📅 <b>Daily Macro 啟動版</b>\n"):
                 _mark_daily_macro_sent()
         except Exception as e:
             print(f"[daily-macro] startup error: {e}")
@@ -1084,20 +1112,8 @@ async def run_daily_macro_loop(tg, source, watchlist, target_hour_utc: int = 0,
         print(f"[daily-macro] next run at {next_run_at.strftime('%Y-%m-%d %H:%M UTC')} (in {wait/3600:.1f}h)")
         await asyncio.sleep(wait)
         try:
-            state = await compute_macro_state(source, watchlist)
-            tradfi = None
-            try:
-                from market_intel_mcp.sources.tradfi import get_tradfi
-                tradfi = await get_tradfi().get_full_snapshot()
-            except Exception:
-                pass
-            text, meta = await synthesize_via_claude_code(state, tradfi, watchlist)
-            if text:
-                await _send_to_telegram(tg, text, prefix="📅 <b>每日宏觀分析 (08:00 台北)</b>\n")
-                print(f"[daily-macro] sent ({meta.get('output_chars')} chars)")
+            if await _compute_and_send("📅 <b>每日宏觀分析 (08:00 台北)</b>\n"):
                 _mark_daily_macro_sent()
-            else:
-                print(f"[daily-macro] synth failed: {meta.get('error')}")
         except Exception as e:
             print(f"[daily-macro] error: {type(e).__name__}: {e}")
 

@@ -217,7 +217,7 @@ def render_heartbeat(snapshots: list[dict], fires_this_cycle: int) -> str:
 
 def render_startup(backend: str, watchlist: list[str], interval_s: int) -> str:
     backend_zh = {"mock": "模擬數據", "coinglass": "CoinGlass 真實",
-                  "local": "本地 TimescaleDB", "auto": "自動切換"}.get(backend, backend)
+                  "local": "本地 TimescaleDB"}.get(backend, backend)
     # v23-6: 啟用策略與風控參數改讀真實來源（registry + botconfig）
     try:
         from l2_trigger.registry import enabled_strategies

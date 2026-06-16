@@ -128,6 +128,67 @@ def mark_sent(symbol: str, direction: str, *, now: int | None = None) -> None:
         pass
 
 
+def claim(symbol: str, direction: str, *,
+          window_s: int | None = None, now: int | None = None) -> bool:
+    """原子『檢查並標記』：搶到送出權回 True（並寫入 last_sent）；窗內已有近期推送回 False。
+
+    v48：合併 should_send + mark_sent 為單一 SQLite 條件式 UPSERT，消除「檢查 → await 送 TG
+    → 標記」之間的 TOCTOU 競態窗。deepdive 與 scheduler 常同輪喚醒，原本兩者可能各自通過
+    唯讀檢查、雙雙送出同幣同向 → 重複單。改用 claim() 在送出前一刻原子搶槽，只有一個來源搶得到。
+
+    語意：搶到（True）才送 🎯；沒搶到（False）跳過。送出『失敗』時可呼叫 release() 歸還。
+    任何 DB 錯誤 → 回 True（fail-open，絕不因閘故障漏單）。window_s 同 should_send。
+    """
+    win = window_s if window_s is not None else _window_default()
+    t = int(now if now is not None else time.time())
+    try:
+        conn = _conn()
+        try:
+            _init(conn)
+            # 反向節流（可選，預設關）：開啟時若反向在窗內已推 → 不搶。
+            if _block_reversal():
+                opp = "bear" if direction == "bull" else "bull" if direction == "bear" else None
+                if opp is not None:
+                    last_opp = _last_sent(conn, symbol, opp)
+                    if last_opp is not None and (t - last_opp) < win:
+                        return False
+            # 條件式 UPSERT：無紀錄 → INSERT(改 1 列)；有紀錄但窗已過 → UPDATE(改 1 列)；
+            # 窗內 → WHERE 為偽，DO UPDATE 不執行(改 0 列)。用 total_changes 差判定是否搶到，
+            # 避免不同 sqlite 版本 rowcount 對 upsert 的歧義。
+            before = conn.total_changes
+            conn.execute(
+                "INSERT INTO symbol_sends(symbol, direction, last_sent) VALUES(?,?,?) "
+                "ON CONFLICT(symbol, direction) DO UPDATE SET last_sent=excluded.last_sent "
+                "WHERE excluded.last_sent - symbol_sends.last_sent >= ?",
+                (symbol, direction, t, win),
+            )
+            return (conn.total_changes - before) == 1
+        finally:
+            conn.close()
+    except Exception:
+        return True
+
+
+def release(symbol: str, direction: str) -> None:
+    """歸還 claim（送出『失敗』時呼叫）：刪掉剛寫入的 last_sent，讓下一輪可重試、不靜默漏單。
+
+    僅由「claim 成功但隨後送 TG 失敗」的那個來源呼叫——送失敗代表這筆未真正推到 🎯，
+    歸還是正確的。DB 錯誤靜默吞（不阻塞推播）。
+    """
+    try:
+        conn = _conn()
+        try:
+            _init(conn)
+            conn.execute(
+                "DELETE FROM symbol_sends WHERE symbol=? AND direction=?",
+                (symbol, direction),
+            )
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
 def last_sent_age(symbol: str, direction: str, *, now: int | None = None) -> int | None:
     """距上次推送的秒數（診斷用）；從未推過回 None。"""
     t = int(now if now is not None else time.time())

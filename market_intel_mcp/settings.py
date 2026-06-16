@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Settings:
-    backend: str            # "mock" | "coinglass" | "local" | "auto"
+    backend: str            # "mock" | "coinglass" | "local"
     coinglass_api_key: str | None
     db_dsn: str | None
     http_timeout_sec: float

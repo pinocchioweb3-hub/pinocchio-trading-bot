@@ -1,8 +1,14 @@
-"""Backtest runner：一鍵跑多個情境並輸出報告。
+"""Backtest runner（⚠️ 已被取代 / DEPRECATED — 僅供管線冒煙測試）。
 
-用法：
-    python -m backtest.run                          # 跑全部預設情境
-    python -m backtest.run --symbol SUI --days 60   # 自訂
+    這支用的是 **合成 mock 歷史**（historical.generate + seed），數字**不是真實績效**，
+    只能拿來驗「回測管線本身跑不跑得起來」。請**勿**把這裡的勝率/R 當成真實成果（紅線③）。
+
+    要看「真實歷史走查回測」（每週自動跑、餵 CEO 簡報與 auto_tuner）請用：
+        backtest/backtest_session.py（worker：run_backtest_loop；真實 K 線、walk-forward）
+
+用法（僅冒煙測試）：
+    python -m backtest.run                          # 跑全部預設情境（mock）
+    python -m backtest.run --symbol SUI --days 60   # 自訂（mock）
 """
 from __future__ import annotations
 
@@ -68,8 +74,9 @@ def main() -> int:
     args = parser.parse_args()
 
     print(f"\n{'═' * 72}")
-    print(f"  Backtest run — mock history, {args.days} days, seed={args.seed}")
-    print(f"  ⚠️  v0 用 mock 歷史；真實 hit rate 待 Task 9 接 CoinGlass 後才有意義")
+    print(f"  ⚠️  DEPRECATED 回測器 — 合成 mock 歷史，{args.days} 天，seed={args.seed}")
+    print(f"  ⚠️  數字非真實績效、勿當成果（紅線③）。真實走查回測請用 "
+          f"backtest.backtest_session")
     print(f"{'═' * 72}\n")
 
     if args.symbol:

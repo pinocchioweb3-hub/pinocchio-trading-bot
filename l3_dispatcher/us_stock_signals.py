@@ -259,19 +259,25 @@ async def run_us_signal_loop(tg, scan_interval: int = 900):
                             except Exception as e:
                                 print(f"[us_signals] tg send error: {e}")
 
-                            pid = record_paper_entry(
-                                symbol=sym, setup="us_breakout",
-                                direction=d.direction.value,
-                                entry_price=entry, stop_price=stop,
-                                tp1=tps["tp1"], tp2=tps["tp2"], tp3=tps["tp3"],
-                                fire_id=None, regime=f"us_{snap.us_session}",
-                                signal_msg_id=sig_mid,
-                            )
-                            store.mark_fired(d)
-                            symbol_gate.mark_sent(sym, d.direction.value)   # v47: 已推 🎯（持久化）
-                            fired += 1
-                            print(f"[us_signals] 🧪 FIRE {sym} {d.direction.value} "
-                                  f"@{entry} (paper_id={pid}, score={d.composite_score})")
+                            # v48: 只有送出確認成功（拿到 message_id）才寫紙上帳並標記已送/冷卻。
+                            # 過去無論成敗都標記 → 一次網路抖動就吃掉一個美股訊號，且 4h 內被去重閘
+                            # 擋住不補。加密路徑早已做對（失敗不標記），此處對齊。
+                            if sig_mid is not None:
+                                pid = record_paper_entry(
+                                    symbol=sym, setup="us_breakout",
+                                    direction=d.direction.value,
+                                    entry_price=entry, stop_price=stop,
+                                    tp1=tps["tp1"], tp2=tps["tp2"], tp3=tps["tp3"],
+                                    fire_id=None, regime=f"us_{snap.us_session}",
+                                    signal_msg_id=sig_mid,
+                                )
+                                store.mark_fired(d)
+                                symbol_gate.mark_sent(sym, d.direction.value)   # v47: 已推 🎯（持久化）
+                                fired += 1
+                                print(f"[us_signals] 🧪 FIRE {sym} {d.direction.value} "
+                                      f"@{entry} (paper_id={pid}, score={d.composite_score})")
+                            else:
+                                print(f"[us_signals] {sym} {d.direction.value} 送出失敗 → 不標記，下一輪可重試")
                         except Exception as e:
                             print(f"[us_signals] {sym} error: {type(e).__name__}: {e}")
                     if fired:

@@ -86,7 +86,8 @@ async def amain(args: argparse.Namespace) -> int:
     # 延遲 import 確保 env 已設
     from l3_dispatcher.dispatcher import dispatch_once, run_dispatcher
     from l3_dispatcher.fire_queue import stats
-    from l3_dispatcher.macro import compute_macro_state, run_macro_loop
+    from l3_dispatcher.macro import compute_macro_state
+    from l3_dispatcher import liveness
     from l3_dispatcher.scheduler import run_scheduler, scan_once
     from l3_dispatcher.watchlist import WatchlistManager, run_refresh_loop
     from market_intel_mcp.sources import get_source
@@ -186,6 +187,22 @@ async def amain(args: argparse.Namespace) -> int:
           f"+ supervisor({args.supervisor_interval}s) + refresh(daily)")
 
     sup_state = SupervisorState()
+
+    # === v49: 啟動斷層偵測 — 若上次存活戳記距今過久，daemon 曾斷線 → 推一則告警 ===
+    # 純本地、只在真有斷層時出聲（高訊號），正常重啟靜默。
+    try:
+        _gap = liveness.check_gap()
+        if _gap["gap"]:
+            await tg_sys.send_message(
+                liveness.render_gap_alert(_gap["last_ts"], _gap["gap_sec"]),
+                parse_mode="HTML",
+            )
+            print(f"[liveness] offline-gap alert sent (gap={_gap['gap_sec']:.0f}s)")
+        else:
+            print(f"[liveness] no gap ({_gap['reason']})")
+    except Exception as e:
+        print(f"[liveness] gap check error: {type(e).__name__}: {e}")
+
     _refresh_seen = {"first": True}
     async def on_refresh(result):
         # v23-6: 開機訊息已顯示觀察清單 → 跳過啟動時的首次 refresh 摘要（重啟不洗版）；
@@ -204,6 +221,8 @@ async def amain(args: argparse.Namespace) -> int:
         import time as _t
         sup_state.last_scan_ts = _t.time()
         sup_state.last_scan_summary = {"snapshots": summary.snapshots}
+        # v49: 每輪掃描寫存活戳記（純本地、不發 Telegram）。下次啟動用它偵測斷層。
+        liveness.stamp({"scanned": summary.scanned, "fires": summary.fires_enqueued})
 
     from l3_dispatcher.macro import (
         run_daily_macro_loop,
@@ -321,6 +340,7 @@ async def amain(args: argparse.Namespace) -> int:
         # v14.1: Ctrl+C 在 asyncio 內實際拋 CancelledError，原本只接 KeyboardInterrupt 是死碼
         print("\n[shutdown] interrupted")
     finally:
+        liveness.stamp({"shutdown": True})  # v49: 乾淨關閉也補一筆戳記
         try:
             await tg_sys.send_message(render_shutdown(stats()), parse_mode="HTML")
         except Exception:
@@ -331,7 +351,7 @@ async def amain(args: argparse.Namespace) -> int:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--backend", default="coinglass",
-                   choices=["mock", "coinglass", "local", "auto"])
+                   choices=["mock", "coinglass", "local"])
     p.add_argument("--scan-interval", type=int, default=900,
                    help="交易層 FIRE 掃描間隔秒（預設 900=15min）")
     p.add_argument("--macro-interval", type=int, default=3600,

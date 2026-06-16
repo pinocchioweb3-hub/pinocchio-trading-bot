@@ -134,14 +134,22 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
     snap = decision["snapshot"]
     entry_price = snap["price"]
     sl_pct = CONFIG.sl_pct(setup)
-    if direction == "bull":
-        stop = round(entry_price * (1 - sl_pct / 100), 6)
-    else:
-        stop = round(entry_price * (1 + sl_pct / 100), 6)
-    lev = choose_leverage(sym, snap.get("atr_pct_7d"))
-    pos = compute_position(entry_price, stop, CONFIG.risk_per_trade_usd, lev)
-    tp_r = CONFIG.tp_r(setup)
-    tps = compute_tp_prices(entry_price, stop, direction, tp_r)
+    # v48: 交易計畫計算就地保護 — compute_position 在邊界情況（價格異常導致 stop==entry）
+    # 會拋 ValueError；過去無保護，疊加「dispatching 卡死」會放大漏單。捕到例外即 mark_failed，
+    # 讓此筆乾淨退場、不落入孤兒狀態。
+    try:
+        if direction == "bull":
+            stop = round(entry_price * (1 - sl_pct / 100), 6)
+        else:
+            stop = round(entry_price * (1 + sl_pct / 100), 6)
+        lev = choose_leverage(sym, snap.get("atr_pct_7d"))
+        pos = compute_position(entry_price, stop, CONFIG.risk_per_trade_usd, lev)
+        tp_r = CONFIG.tp_r(setup)
+        tps = compute_tp_prices(entry_price, stop, direction, tp_r)
+    except Exception as e:
+        mark_failed(fire_id, f"plan_compute_error: {e}")
+        print(f"[dispatcher] #{fire_id} {sym}/{setup}/{direction} PLAN ERROR: {e}")
+        return True
     atr = snap.get("atr_pct_7d")
     regime = ("unknown" if atr is None else
               "extreme" if atr >= 8.0 else
@@ -161,13 +169,19 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
             f"💡 價格回到進場區會自動推正式訊號（最多等 6 小時，"
             f"未觸發自動放棄 — 不追價）"
         )
+        # v48: 原子 claim — 送出前一刻搶 symbol_gate 槽；搶不到代表並發來源（deepdive/scheduler）
+        # 已搶先送同幣同向 → 本筆不送，避免重複（關閉原 should_send→await→mark_sent 的 TOCTOU 窗）。
+        if not symbol_gate.claim(sym, direction):
+            mark_failed(fire_id, "suppressed: symbol_gate race lost (waiting)")
+            print(f"[dispatcher] #{fire_id} {sym}/{direction} SUPPRESSED (symbol_gate claim race, waiting)")
+            return True
         try:
             resp = await tg.send_message(wait_text, parse_mode="HTML")
             msg_id = resp.get("result", {}).get("message_id") if resp.get("ok") else None
         except Exception:
             msg_id = None
         mark_sent(fire_id, tg_message_id=msg_id)
-        symbol_gate.mark_sent(sym, direction)   # v47: 已推 🎯（等待觸發也算）
+        # v48: claim 已寫入 symbol_gate（原 symbol_gate.mark_sent 移除）
         try:
             tid = record_entry(EntryRecord(
                 symbol=sym, setup=setup, direction=direction,
@@ -234,21 +248,28 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
     text += "\n\n⏳ <i>請按按鈕回報：按「已下單」才會計入持倉與績效（4 小時未按自動過期）</i>"
 
     # === 送 TG ===
+    # v48: 原子 claim — 送出前一刻搶槽；搶不到代表並發來源已代表此幣此向 → 不送（關閉 TOCTOU 窗）。
+    if not symbol_gate.claim(sym, direction):
+        mark_failed(fire_id, "suppressed: symbol_gate race lost")
+        print(f"[dispatcher] #{fire_id} {sym}/{setup}/{direction} SUPPRESSED (symbol_gate claim race)")
+        return True
     try:
         resp = await tg.send_message(text, parse_mode="HTML", inline_buttons=buttons)
     except Exception as e:
+        symbol_gate.release(sym, direction)   # v48: 送失敗 → 歸還槽，下一輪可重試（不靜默漏單）
         mark_failed(fire_id, str(e))
         print(f"[dispatcher] #{fire_id} {sym}/{setup}/{direction} EXC: {e}")
         return True
 
     if not resp.get("ok"):
+        symbol_gate.release(sym, direction)   # v48: 送失敗 → 歸還槽
         mark_failed(fire_id, resp.get("description", "unknown"))
         print(f"[dispatcher] #{fire_id} FAILED: {resp.get('description')}")
         return True
 
     msg_id = resp.get("result", {}).get("message_id")
     mark_sent(fire_id, tg_message_id=msg_id)
-    symbol_gate.mark_sent(sym, direction)   # v47: 已推 🎯（正式 FIRE）
+    # v48: claim 已在送出前寫入 symbol_gate（原 symbol_gate.mark_sent 移除）
 
     # v18-F: FIRE 附 SMC 標記圖（4h 結構 + 交易計畫線；失敗不阻塞）
     try:
@@ -300,6 +321,16 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
 async def run_dispatcher(tg: TelegramClient, tg_aux: TelegramClient | None = None,
                          poll_seconds: int = 3):
     """Worker 主迴圈。"""
+    # v48: 啟動回收 — 把上次崩潰/斷電/重啟遺留在 'dispatching' 中間態的 FIRE
+    # 重設回 'queued'，避免進場訊號被靜默吞掉。單一 dispatcher worker，啟動當下
+    # 必無真正在途的派發，回收安全。supervisor 重啟本 worker 時也會再跑一次。
+    try:
+        from .fire_queue import reclaim_orphans
+        n = reclaim_orphans()
+        if n:
+            print(f"[dispatcher] 啟動回收 {n} 筆卡在 dispatching 的孤兒 FIRE → 重新排入 queued")
+    except Exception as e:
+        print(f"[dispatcher] reclaim_orphans 失敗（不影響啟動）: {e}")
     while True:
         handled = await dispatch_once(tg, tg_aux)
         if not handled:

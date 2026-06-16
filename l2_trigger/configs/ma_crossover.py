@@ -35,11 +35,15 @@ MA_CROSSOVER_BTC = TriggerConfig(
     # --- 投票：crossover + trend 兩個訊號，≥1 即可（crossover 夠強）---
     min_confirmations=1,
 
-    # --- 風控：BTC 波動較小，用適中參數 ---
+    # --- 風控（適中參數）---
+    # ⚠️ v23-2 起，「實盤 dispatcher」的 SL/TP/風險/槓桿全部改走 botconfig 單一來源
+    #    （dispatcher.py：CONFIG.sl_pct / risk_per_trade_usd / tp_r / choose_leverage）。
+    #    下列 risk_per_trade_usd / default_leverage / sl_buffer_pct / tp_r_multiples 僅供
+    #    backtest 等獨立工具使用；改這裡【不會】影響線上發單。要調線上風控請改 botconfig。
     risk_per_trade_usd=100.0,
     default_leverage=10,
     tp_r_multiples=(1.0, 2.0, 3.0),
-    sl_buffer_pct=2.0,          # BTC 4h 級別 2% 止損
+    sl_buffer_pct=2.0,          # BTC 4h 級別 2% 止損（僅 backtest）
     hold_max_hours=72,          # 趨勢型持倉較久
 )
 

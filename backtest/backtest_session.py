@@ -107,6 +107,7 @@ async def run_backtest_once(days: int = DEFAULT_DAYS,
     from market_intel_mcp.sources.coinglass import CoinGlassSource
     from .real_historical import fetch_real_history, replay_real
     from .metrics import aggregate
+    from .validation import assess   # v48: 逐筆 R 序列的統計顯著性（PSR/DSR/minTRL）
 
     _ensure_schema()
     strategies = scheduler_strategies()
@@ -149,12 +150,17 @@ async def run_backtest_once(days: int = DEFAULT_DAYS,
         for sid, a in acc.items():
             metr = aggregate(a["trades"])
             syms = sorted(a["symbols"])
+            # v48: 算逐筆 R 序列的統計顯著性（樣本<3 → None；render 端據此誠實標註）
+            _rs = [t.realized_r for t in a["trades"]]
+            _val = assess(_rs) if len(_rs) >= 3 else {}
             results[sid] = {
                 "display": a["meta"].display_name_zh,
                 "n_symbols": len(syms), "symbols": syms,
                 "n_trades": metr.n_trades, "win_rate": metr.win_rate,
                 "expectancy_r": metr.expectancy_r, "profit_factor": metr.profit_factor,
                 "max_consec_losses": metr.max_consecutive_losses,
+                "psr": _val.get("psr"), "dsr": _val.get("dsr"),
+                "min_trl": _val.get("min_trl"),
             }
             conn.execute(
                 "INSERT INTO backtest_runs(run_ts, strategy, days, n_symbols, n_trades, "
@@ -176,7 +182,10 @@ def render_backtest_report(results: dict, days: int) -> str | None:
         return None
     lines = ["🔬 <b>回測 Session 報告</b>（真實歷史回放，純讀不下單）",
              f"━━━━━━━━━━━━━━━━",
-             f"<i>近 {days} 天全市場流動性池回放，驗證啟用中策略期望值</i>", ""]
+             f"<i>近 {days} 天全市場流動性池回放，驗證啟用中策略期望值</i>",
+             # v48: 誠實輸入揭露橫幅（紅線③不誇大）— 簡化假設先講清楚，數字才不會被誤讀為實盤
+             "⚠️ <i>此回測使用簡化輸入：固定 SL/TP 結構、未計入滑點與資金費、以歷史 1h K 線"
+             "近似觸發；數字僅供期望值錨定，非實盤績效保證。</i>", ""]
     for sid, r in results.items():
         if r["n_trades"] == 0:
             lines.append(f"<b>{r['display']}</b>（<code>{sid}</code>）："
@@ -184,12 +193,34 @@ def render_backtest_report(results: dict, days: int) -> str | None:
             continue
         wr = r["win_rate"] * 100
         exp = r["expectancy_r"]
-        verdict = "✅穩健" if exp >= 0.2 else ("⚠️負期望" if exp < 0 else "持平觀察")
+        n = r["n_trades"]
+        psr = r.get("psr")
+        dsr = r.get("dsr")
+        mtrl = r.get("min_trl")
+        # v48: 措辭由「樣本數 + 統計顯著性」決定，不再用與樣本無關的「穩健」。
+        #   n<30          → 樣本不足（任何方向都不下結論，只給歷史錨點）
+        #   負期望        → 直接標負期望
+        #   PSR≥95%       → 才敢稱統計顯著
+        #   其餘          → 持平觀察（未達顯著，可能是運氣）
+        if n < 30:
+            verdict = "⚠️樣本不足（n&lt;30，僅供錨定）"  # &lt; 防 Telegram HTML 把 <30 當標籤
+        elif exp < 0:
+            verdict = "⚠️負期望"
+        elif psr is not None and psr >= 0.95:
+            verdict = "✅統計顯著（PSR≥95%）"
+        else:
+            verdict = "持平觀察（未達統計顯著）"
         lines.append(
             f"<b>{r['display']}</b>（<code>{sid}</code>）{verdict}\n"
-            f"  {r['n_trades']} 筆／{r['n_symbols']} 檔｜勝率 {wr:.1f}%｜"
+            f"  {n} 筆／{r['n_symbols']} 檔｜勝率 {wr:.1f}%｜"
             f"期望值 <code>{exp:+.2f}R</code>｜PF {r['profit_factor']:.2f}｜"
             f"最大連虧 {r['max_consec_losses']}")
+        # v48: 顯著性細節（算得到才顯示）；min_trl 指出「還差多少筆才能下結論」
+        if psr is not None:
+            need = ""
+            if mtrl and n < mtrl:
+                need = f"｜還需≥{int(mtrl)}筆達顯著"
+            lines.append(f"  📊 PSR {psr * 100:.0f}%｜DSR {(dsr or 0) * 100:.0f}%{need}")
     lines.append("\n<i>用途：與紙上實單帳互相印證；樣本不足時提供歷史錨點。"
                  "不自動改參數，調整權保留給你（/settings 或 .env）。</i>")
     return "\n".join(lines)

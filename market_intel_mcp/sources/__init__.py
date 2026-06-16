@@ -4,7 +4,9 @@
     mock      → MockSource（v0 預設）
     coinglass → CoinGlassSource（Task 9）
     local     → LocalSource（Task 10）
-    auto      → 組合來源；單一缺料降級而不整包失敗
+
+（曾規劃 "auto" 組合來源，但 CompositeSource 從未實作；單一缺料降級已由
+ engine 層處理（STALE→HOLD/不計票），故移除該死路，避免選到它就 ImportError。）
 """
 from __future__ import annotations
 
@@ -24,7 +26,4 @@ def get_source() -> BaseSource:
     if backend == "local":
         from .local import LocalSource
         return LocalSource()
-    if backend == "auto":
-        from .composite import CompositeSource
-        return CompositeSource()
     raise ValueError(f"unknown backend: {backend}")

@@ -7,11 +7,12 @@
     第 1 層 ✅ 事件持久化檢索 — news_feed.db 已累積，這裡建跨時窗撈取
     第 2 層 ✅ 敘事聚類 — 每日 Claude session 把近期事件聚成主軸敘事
     第 3 層 ✅ 因果鏈 — 敘事內事件的前後因果（A 導致 B）
-    第 4 層 （規劃）經濟數據 × 新聞關聯回測
-    第 5 層 （規劃）餵回訊號層：訊號 vs 主導敘事一致性加減分
+    第 4 層 ✅ 經濟數據關聯 — _econ_context_lines() 把近期數據（實際/預期/前值）餵進
+            敘事 prompt，於因果鏈連結「數據意外→市場反應」（正式 econ×news 回測仍待補）
+    第 5 層 ✅ 餵回訊號層 — narrative_alignment() 提供訊號 vs 主導敘事的順風/逆風註記
 
-本檔交付第 1-3 層：narrative.db 儲存敘事、每日聚類 worker、敘事摘要、
-get_active_narratives() 供未來訊號層消費。
+本檔交付第 1-5 層：narrative.db 儲存敘事、每日聚類 worker、敘事摘要、
+get_active_narratives() / narrative_alignment() 供訊號層消費。
 """
 from __future__ import annotations
 

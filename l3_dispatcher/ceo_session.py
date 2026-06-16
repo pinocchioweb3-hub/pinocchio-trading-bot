@@ -138,13 +138,20 @@ def feature_health() -> list[tuple[str, str]]:
 # promotion_gate —— Phase 0 達標偵測（紅線 3：AI 只偵測+回報，永不自我宣告解鎖）
 # ===========================================================================
 def _count_closed(table: str) -> tuple[int, float]:
-    """某表已平倉筆數 + 平均 R（表不存在/無欄位 → (0, 0.0)）。"""
+    """某表「真實已平倉」筆數 + 平均 R（表不存在/無欄位 → (0, 0.0)）。
+
+    排除 exit_reason='entry_expired'：那是限價單掛了但價格沒走到、從未成交的單，
+    realized_r 一律 0，**不是一筆真實交易**。若把它算進 Phase 0 解鎖門檻會兩頭失真——
+    既高估筆數（含它 35 / 不含它才 24），又把 0R 拉低真實期望值（0.377 / 真實 0.549）。
+    與 paper_audit.load_closed() 的排除規則一致；紅線③：解鎖進度不可灌水。
+    """
     try:
         conn = sqlite3.connect(_TJ_DB, timeout=5)
         try:
             row = conn.execute(
                 f"SELECT COUNT(*), COALESCE(AVG(realized_r), 0) "
-                f"FROM {table} WHERE status='closed'"
+                f"FROM {table} WHERE status='closed' "
+                f"AND IFNULL(exit_reason,'') != 'entry_expired'"
             ).fetchone()
             return int(row[0] or 0), round(float(row[1] or 0), 3)
         finally:

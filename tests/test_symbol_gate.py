@@ -110,6 +110,82 @@ def test_cross_source_dedup_scenario():
     assert sg.should_send("ETH", "bull", now=t0 + 180) is True
 
 
+# ===========================================================================
+# claim() / release() — v48 原子搶槽（消除 should_send→await送→mark_sent 的 TOCTOU 競態）
+# ===========================================================================
+def test_claim_first_wins_second_blocked():
+    """第一個 claim 搶到（True 並寫 last_sent）；窗內第二個 claim 搶不到（False）。"""
+    _fresh()
+    t0 = 8_000_000
+    assert sg.claim("BTC", "bull", window_s=3600, now=t0) is True
+    assert sg.claim("BTC", "bull", window_s=3600, now=t0 + 300) is False
+
+
+def test_claim_atomic_no_double_send_simulated_race():
+    """同一時刻（同 now）兩個來源同時 claim → 只有一個搶到。
+
+    這正是 should_send 唯讀檢查的破口：deepdive 與 scheduler 同輪喚醒可雙雙通過唯讀檢查、
+    各送一單 → 重複。claim 用條件式 UPSERT 原子化，即使時間戳完全相同也只有一個改到列。
+    """
+    _fresh()
+    t0 = 8_100_000
+    first = sg.claim("BTC", "bull", window_s=3600, now=t0)
+    second = sg.claim("BTC", "bull", window_s=3600, now=t0)  # 完全同一秒
+    assert first is True
+    assert second is False
+    assert (first, second).count(True) == 1  # 恰好一個贏
+
+
+def test_claim_again_after_window():
+    """窗已過 → 同 (幣,向) 可再次 claim。"""
+    _fresh()
+    t0 = 8_200_000
+    assert sg.claim("ETH", "bear", window_s=3600, now=t0) is True
+    assert sg.claim("ETH", "bear", window_s=3600, now=t0 + 3599) is False
+    assert sg.claim("ETH", "bear", window_s=3600, now=t0 + 3601) is True
+
+
+def test_release_allows_immediate_reclaim():
+    """claim 後送出失敗 → release 歸還 → 下一輪可立即重 claim（不靜默漏單）。"""
+    _fresh()
+    t0 = 8_300_000
+    assert sg.claim("SOL", "bull", window_s=3600, now=t0) is True
+    # 模擬送 TG 失敗 → 歸還
+    sg.release("SOL", "bull")
+    # 歸還後窗內也能再搶（紀錄已刪，視同從未推過）
+    assert sg.claim("SOL", "bull", window_s=3600, now=t0 + 1) is True
+
+
+def test_claim_reversal_default_not_blocked():
+    """預設不擋反向：claim bull 後仍可 claim bear（反轉訊號對持倉出場有價值）。"""
+    _fresh()
+    os.environ.pop("SYMBOL_GATE_BLOCK_REVERSAL", None)
+    t0 = 8_400_000
+    assert sg.claim("SUI", "bull", window_s=3600, now=t0) is True
+    assert sg.claim("SUI", "bear", window_s=3600, now=t0 + 60) is True   # 反向放行
+    assert sg.claim("SUI", "bull", window_s=3600, now=t0 + 60) is False  # 同向仍擋
+
+
+def test_claim_reversal_blocked_when_enabled():
+    """SYMBOL_GATE_BLOCK_REVERSAL=1 → claim 反向也擋（與 should_send 一致）。"""
+    _fresh()
+    os.environ["SYMBOL_GATE_BLOCK_REVERSAL"] = "1"
+    try:
+        t0 = 8_500_000
+        assert sg.claim("BNB", "bull", window_s=3600, now=t0) is True
+        assert sg.claim("BNB", "bear", window_s=3600, now=t0 + 60) is False
+    finally:
+        os.environ.pop("SYMBOL_GATE_BLOCK_REVERSAL", None)
+
+
+def test_claim_then_should_send_consistent():
+    """claim 成功會寫 last_sent → 之後 should_send 同 (幣,向) 回 False（兩者看同一張表）。"""
+    _fresh()
+    t0 = 8_600_000
+    assert sg.claim("XRP", "bull", window_s=3600, now=t0) is True
+    assert sg.should_send("XRP", "bull", window_s=3600, now=t0 + 120) is False
+
+
 # --- 直接執行（無 pytest 也能跑）---
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

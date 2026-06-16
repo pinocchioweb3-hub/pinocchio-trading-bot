@@ -602,7 +602,10 @@ def _selftest() -> bool:  # noqa: C901 — 自測集中於此
     FAMILIES = {"btc_family": ("BTC", "ETH", "SOL")}
 
     # --- 倉位：風險驅動，槓桿不改風險 ---
+    # risk_usd 顯式釘 100，使本測不受 botconfig 分級預設（現為 Standard $50）漂移影響：
+    # 這裡驗的是「向下取整 + 實際風險」邏輯，需固定風險預算才有確定的期望張數（floor(7.69)=7）。
     p = build_order_plan("BTC", "bull", 65000.0, 63700.0, atr_pct_7d=4.2,
+                         risk_usd=100.0,
                          ct_val=0.01, lot_sz=1.0, min_sz=1.0, seq=1)
     check(p.ok, f"BTC 多單計畫成立（reject={p.reject_reason}）")
     # notional = 100/1300*65000 = 5000；qty_base=5000/65000≈0.0769 BTC；張=0.0769/0.01=7.69→7 張

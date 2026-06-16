@@ -39,7 +39,8 @@ def _init(conn: sqlite3.Connection) -> None:
             enqueued_at INTEGER NOT NULL,
             sent_at INTEGER,
             status TEXT NOT NULL DEFAULT 'queued',
-            tg_message_id INTEGER
+            tg_message_id INTEGER,
+            fail_reason TEXT
         )
     """)
     conn.execute("""
@@ -52,6 +53,10 @@ def _init(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fires_status ON fires(status, enqueued_at)")
+    # v48: 既有 DB 缺 fail_reason 欄 → 補上（失敗原因可事後稽核分類）。
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(fires)").fetchall()}
+    if "fail_reason" not in cols:
+        conn.execute("ALTER TABLE fires ADD COLUMN fail_reason TEXT")
 
 
 def _serialize_decision(d: TriggerDecision) -> str:
@@ -137,11 +142,15 @@ def dequeue_one() -> tuple[int, dict] | None:
         ).fetchone()
         if not row:
             return None
-        # 立刻 mark dispatching 避免兩個 worker 搶
-        conn.execute(
+        # 立刻 mark dispatching 避免兩個 worker 搶。
+        # v48: 真正落實樂觀鎖 — 只有把此筆 queued→dispatching 成功的 worker 才取走它。
+        # 檢查 rowcount==1；若為 0 代表已被其他 consumer 搶走 → 本輪空手而回（防重複派發）。
+        changed = conn.execute(
             "UPDATE fires SET status='dispatching' WHERE id=? AND status='queued'",
             (row[0],),
-        )
+        ).rowcount
+        if changed != 1:
+            return None
         return (row[0], json.loads(row[1]))
     finally:
         conn.close()
@@ -159,9 +168,32 @@ def mark_sent(fire_id: int, tg_message_id: int | None = None) -> None:
 
 
 def mark_failed(fire_id: int, reason: str = "") -> None:
+    # v48: 把 reason 真正寫進 DB（過去收到卻丟棄，事後無法分辨訊號為何沒送出）。
     conn = _conn()
     try:
-        conn.execute("UPDATE fires SET status='failed' WHERE id=?", (fire_id,))
+        _init(conn)
+        conn.execute(
+            "UPDATE fires SET status='failed', fail_reason=? WHERE id=?",
+            (reason or None, fire_id),
+        )
+    finally:
+        conn.close()
+
+
+def reclaim_orphans() -> int:
+    """啟動回收：把卡在 'dispatching' 中間態的 FIRE 重設回 'queued'，回傳回收筆數。
+
+    為何安全：本機只有單一 dispatcher worker。daemon 剛啟動（或 dispatcher 剛被
+    supervisor 重啟）的那一刻，必然沒有任何派發正在進行中，所以此時任何
+    status='dispatching' 都是上次崩潰/斷電/Ctrl+C 在「dequeue 之後、mark_sent 之前」
+    留下的孤兒 → 安全回收重派，避免進場訊號被靜默吞掉（使用者完全無感的漏單）。
+    """
+    conn = _conn()
+    try:
+        _init(conn)
+        return conn.execute(
+            "UPDATE fires SET status='queued' WHERE status='dispatching'"
+        ).rowcount
     finally:
         conn.close()
 
