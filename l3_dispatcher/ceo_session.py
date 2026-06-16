@@ -48,8 +48,8 @@ FEATURES = [
     # 風控
     {"key": "risk_gates", "name": "風控閘門（總曝險+日開倉上限，%制）", "kind": "risk", "status": "shipped"},
     {"key": "budget_tiering", "name": "依預算自適應風控分級（本金→槓桿/風險/曝險護欄）", "kind": "risk", "status": "shipped"},
-    {"key": "leverage_tier", "name": "你這台是否改吃 tier 槓桿預設（現行明確 15x 不動）", "kind": "risk", "status": "blocked",
-     "by": "decision", "note": "等發起人決策；框架已上線且零行為改變，僅你本機是否改設"},
+    {"key": "leverage_tier", "name": "槓桿/風險分級（決策已定：維持明確 15x／$100）", "kind": "risk", "status": "shipped",
+     "note": "v50 使用者授權 CEO 決定→維持現狀；出廠 tier 預設仍保守(5x/1%)保護自架者；生效值已於日報透明化"},
     {"key": "coach_monitor", "name": "教練式持倉提醒（追高/止損/熔斷/手續費侵蝕/降檔）", "kind": "risk", "status": "shipped"},
     {"key": "discipline_kpi", "name": "紀律遵守率 KPI（決斷率+不追高率）", "kind": "risk", "status": "shipped"},
     # 治理 / 對外
@@ -204,6 +204,26 @@ def _section_normal() -> str:
     else:
         lines.append("🩺 系統：全部 worker 由監督器看顧，核心管線正常")
 
+    # 1.5) 連續性（v50 / task #22）—— daemon 心跳新鮮度 + 過去 24h 離線缺口回顧。
+    #      把「引擎到底有沒有不間斷地跑」攤在日報，使用者不必翻 log。
+    try:
+        from . import liveness
+        last = liveness.read_last()
+        gaps = liveness.recent_gaps(86400)
+        if gaps:
+            worst = max(g.get("gap_sec", 0) for g in gaps)
+            gap_txt = f"過去24h 偵測到 {len(gaps)} 次離線缺口（最長 {liveness._fmt_duration(worst)}）"
+        else:
+            gap_txt = "過去24h 無離線缺口"
+        if last and last.get("ts"):
+            age_min = (time.time() - float(last["ts"])) / 60
+            fresh = "正常" if age_min <= 20 else f"⚠️已 {age_min:.0f} 分未更新"
+            lines.append(f"🔌 連續性：心跳 {age_min:.0f} 分前（{fresh}）｜{gap_txt}")
+        else:
+            lines.append(f"🔌 連續性：尚無存活戳記（剛啟動）｜{gap_txt}")
+    except Exception:
+        pass
+
     # 2) 績效快照（真實帳本，R 為主）
     try:
         s7 = get_stats(7)
@@ -230,6 +250,24 @@ def _section_normal() -> str:
             f"今日 {rs['today_pnl_pct']:+.1f}%／週 {rs['week_pnl_pct']:+.1f}%")
     except Exception as e:
         lines.append(f"🛡 風控：讀取失敗（{type(e).__name__}）")
+
+    # 3.2) 生效風控值透明化（v50 / task #21）—— 把「實際生效」的槓桿與單筆風險攤開。
+    #      .env 個人設定會悄悄覆寫出廠保守預設；非機密、僅推到本人系統頻道。
+    try:
+        from botconfig import CONFIG
+        bal = CONFIG.account_balance_usd
+        risk = CONFIG.risk_per_trade_usd
+        lev = CONFIG.default_leverage
+        risk_pct = (risk / bal * 100) if bal else 0.0
+        tier = CONFIG.tier
+        line = (f"⚙️ 生效風控：每筆風險 ${risk:.0f}（帳戶 {risk_pct:.1f}%）"
+                f"｜槓桿 {lev}x｜本金 ${bal:,.0f}（{tier.label}級）")
+        if lev != tier.leverage_cap or abs(risk_pct - tier.risk_pct_default) > 0.05:
+            line += (f"\n　　↳ 個人設定，已覆寫出廠保守預設"
+                     f"（{tier.leverage_cap}x／{tier.risk_pct_default:.1f}%）；純紙上、零真錢")
+        lines.append(line)
+    except Exception as e:
+        lines.append(f"⚙️ 生效風控：讀取失敗（{type(e).__name__}）")
 
     # 3.5) 紀律遵守率（task #8 ⑥）
     try:

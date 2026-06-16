@@ -26,3 +26,7 @@ charts/
 *.backup_*.db
 backtest/_wf_*_out.txt
 backtest/_cg_conf_cache/
+
+# 一次性提醒/排程包裝（spent artifacts；排程任務已自我刪除，不進開源 repo）
+remind_okx_demo_setup.py
+run_okx_demo_reminder.cmd

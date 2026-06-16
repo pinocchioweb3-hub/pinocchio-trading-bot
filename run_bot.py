@@ -193,6 +193,7 @@ async def amain(args: argparse.Namespace) -> int:
     try:
         _gap = liveness.check_gap()
         if _gap["gap"]:
+            liveness.record_gap(_gap["last_ts"], _gap["gap_sec"])  # v50: 記入缺口帳本供 CEO 日報回顧
             await tg_sys.send_message(
                 liveness.render_gap_alert(_gap["last_ts"], _gap["gap_sec"]),
                 parse_mode="HTML",

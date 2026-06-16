@@ -27,6 +27,8 @@ import time
 from botpaths import data_dir
 
 _LIVENESS_FILE = "liveness.json"
+_GAPS_FILE = "liveness_gaps.json"   # v50: 偵測到的離線缺口事件（供 CEO 日報「連續性」欄）
+_GAPS_KEEP = 50                      # 只保留最近 N 筆，避免無限長大
 
 # 斷層告警門檻：上次戳記距今超過這麼久 → 視為「daemon 曾經斷線」。
 # 預設 3600 秒（1 小時）：掃描間隔預設 900 秒，正常重啟只隔幾秒，
@@ -36,6 +38,10 @@ DEFAULT_GAP_THRESHOLD_SEC = int(os.getenv("OFFLINE_GAP_ALERT_SEC", "3600"))
 
 def _path():
     return data_dir() / _LIVENESS_FILE
+
+
+def _gaps_path():
+    return data_dir() / _GAPS_FILE
 
 
 def stamp(extra: dict | None = None) -> None:
@@ -80,6 +86,43 @@ def check_gap(threshold_sec: int = DEFAULT_GAP_THRESHOLD_SEC,
                 "reason": "threshold_exceeded"}
     return {"gap": False, "last_ts": last_ts, "gap_sec": gap_sec,
             "reason": "within_threshold"}
+
+
+# ---------------------------------------------------------------------------
+# v50: 離線缺口事件帳本 —— 啟動時偵測到斷層就記一筆，供 CEO 日報「連續性」欄回顧。
+# 純本地、append-only、上限 _GAPS_KEEP 筆。永不拋例外（不可拖垮啟動流程）。
+# ---------------------------------------------------------------------------
+def record_gap(last_ts: float, gap_sec: float, now: float | None = None) -> None:
+    """把一次偵測到的離線缺口寫入帳本（在 check_gap 回 gap=True 後呼叫）。"""
+    try:
+        detected_at = time.time() if now is None else now
+        events = _read_gaps()
+        events.append({"detected_at": float(detected_at),
+                       "last_ts": float(last_ts),
+                       "gap_sec": float(gap_sec)})
+        events = events[-_GAPS_KEEP:]
+        _gaps_path().write_text(json.dumps(events), encoding="utf-8")
+    except Exception:
+        pass  # 記錄失敗無所謂，不影響主流程
+
+
+def _read_gaps() -> list[dict]:
+    try:
+        p = _gaps_path()
+        if not p.exists():
+            return []
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def recent_gaps(within_sec: float = 86400, now: float | None = None) -> list[dict]:
+    """回傳 detected_at 落在過去 within_sec 內的缺口事件（預設過去 24h）。"""
+    now = time.time() if now is None else now
+    cutoff = now - within_sec
+    return [e for e in _read_gaps()
+            if isinstance(e, dict) and float(e.get("detected_at", 0)) >= cutoff]
 
 
 def _fmt_duration(sec: float) -> str:

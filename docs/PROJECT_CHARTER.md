@@ -211,10 +211,10 @@
 - ⬜ 建造日誌連載（task#5）— 你說「晚點再看」，暫不顯示/發布
 
 ### 新增 P0（治理章程衍生，本次建立）
-- ✅ **P0-A**：依預算自適應風控（v39 兩道閘門→v41 教練式 monitor+紀律 KPI→v42 預算分級+手續費/降檔教練）；僅 `leverage_tier_v42` 待你拍板（你這台是否改吃 tier 預設）
+- ✅ **P0-A**：依預算自適應風控（v39 兩道閘門→v41 教練式 monitor+紀律 KPI→v42 預算分級+手續費/降檔教練）；`leverage_tier_v42` 已定案（v50 你授權 CEO 決定→維持明確 15x/$100；生效值已於 CEO 日報透明化）
 - ✅ **P0-B**：CEO 監督 Session（v40）— 每日單一彙整簡報 + 需決策區 + feature_registry + outbox + promotion_gate
-- ⬜ **P0-C**：雙受眾呈現層（canonical dict → 人話卡片 + 機器 JSON + 指標白話對照表 + 驗證進度橫幅 + 新手/專家模式）
-- ⬜ **P0-D**：靜態信任網頁骨架（GitHub Pages，零後端零金鑰，先骨架後填數據）
+- 🟡 **P0-C**：雙受眾呈現層（task#10）— 人話卡（message_format）+ 機器 JSON（intent_format）+ 白話對照（glossary）已具雛形；**新手/專家模式 + 單一 canonical dict 雙視圖待整合**（真實狀態以 feature_registry `dual_audience` 為準）
+- 🟡 **P0-D**：靜態信任網頁骨架（task#11）— docs/trust-site 骨架+設計+資料檔已就緒；**尚未部署 GitHub Pages、verification-status.json 狀態列待接真數字**（真實狀態以 feature_registry `trust_site` 為準；部署屬紅線②待你放行）
 
 ---
 
