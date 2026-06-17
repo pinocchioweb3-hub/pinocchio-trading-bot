@@ -363,6 +363,9 @@ async def _check_waiting_trades(source, tg, bars_cache: dict[str, list],
                 entry_price=live, stop_price=w["stop_price"],
                 tp1=w["tp1"], tp2=w["tp2"], tp3=w["tp3"],
                 fire_id=w["fire_id"], regime=regime,
+                # v47-2: 等待觸發是「先前已承諾的等待單兌現」，非新單 → 豁免 post-close 冷卻，
+                #        否則同向同 setup 剛平倉時會誤殺正當觸發。
+                skip_cooldown=True,
             )
         except Exception as e:
             print(f"[trade_monitor] waiting paper entry error: {e}")

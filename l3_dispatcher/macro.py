@@ -720,6 +720,7 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
     v12: 已開單品種會被過濾掉，避免重複推同樣的做單機會。
     """
     from . import symbol_gate
+    from .paper_journal import open_paper_symbols
     from .synthesizer import synthesize_per_symbol
     from .trade_journal import get_open_trades
 
@@ -728,8 +729,12 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
 
     while True:
         try:
-            # 已開單品種（同方向才算重複；不同方向（如 BTC 多 + BTC 空）罕見但理論可行）
-            open_syms_set = {o["symbol"] for o in get_open_trades()}
+            # 已開單品種：實倉(get_open_trades，紙上模式恆空)∪ 紙上 deepdive 持倉。
+            # v47-2: 過去只看實倉表（紙上模式恆空）＝形同 no-op，於是 deepdive 每 6h 會對
+            #        仍持倉的同幣「重發」🎯 深度分析（symbol_gate 1h 窗早過），使用者看起來
+            #        就像重複單。改為也排除紙上 deepdive 持倉 → 持倉期間不再重發同幣 🎯。
+            open_syms_set = ({o["symbol"] for o in get_open_trades()}
+                             | open_paper_symbols("deepdive"))
             # 只跑 trading tier 排除已開單後的 top N
             candidates = [s for s in (watchlist.trading or []) if s not in open_syms_set]
             symbols = candidates[:max_symbols_per_run]
@@ -745,20 +750,23 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
                         sym_state = await compute_per_symbol_state(source, sym)
                         text, meta = await synthesize_per_symbol(sym, sym_state)
                         if text:
-                            # v47: 跨來源收斂閘——同 (幣, 方向) 近期已被任一來源推過就跳過，
-                            #      解決「deepdive 與 scheduler 數分鐘內各推一次同幣」的重複單。
+                            # v47/v48: 跨來源收斂閘——改用 claim() 原子搶槽，消除「should_send
+                            #      唯讀檢查 → await 送 TG → mark_sent」之間的 TOCTOU：deepdive 與
+                            #      scheduler 常同輪喚醒，原本可雙雙通過唯讀檢查各送一單 → 重複。
+                            #      claim 在送出前一刻原子搶槽，只有一個來源搶得到；送出失敗才 release。
                             _dir = (meta.get("plan") or {}).get("direction")
-                            if _dir in ("bull", "bear") and not symbol_gate.should_send(sym, _dir):
+                            if _dir in ("bull", "bear") and not symbol_gate.claim(sym, _dir):
                                 print(f"[deepdive] {sym} {_dir} 跳過：symbol_gate 跨來源冷卻中"
-                                      f"（近期已推同幣同向，避免重複單）")
+                                      f"（已被搶槽/近期已推同幣同向，避免重複單）")
                                 await asyncio.sleep(2)
                                 continue
                             sig_mid = await _send_to_telegram(
                                 tg, text,
                                 prefix=f"🎯 <b>{sym} 交易計畫深度分析</b>\n"
                             )
-                            if _dir in ("bull", "bear"):
-                                symbol_gate.mark_sent(sym, _dir)   # v47: 已推 🎯
+                            if _dir in ("bull", "bear") and not sig_mid:
+                                # v48: 送出失敗 → 歸還搶到的槽，下輪可重試（不靜默漏單）
+                                symbol_gate.release(sym, _dir)
                             # v33: 把可執行計畫接進紙上帳（看得到的報單→可追蹤可算勝率），
                             #      存原始訊號 message_id 供持倉回連。失敗不阻塞。
                             plan = meta.get("plan")

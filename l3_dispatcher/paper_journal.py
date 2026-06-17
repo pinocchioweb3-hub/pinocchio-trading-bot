@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 
@@ -92,6 +93,85 @@ def _compute_entry_splits(direction: str, zone_lo: float, zone_hi: float) -> lis
             for p, f in zip(prices, ENTRY_SPLIT_FRACS)]
 
 
+# =====================================================================
+# v47-2 post-close 冷卻：修「同幣同向同 setup 剛平倉就立刻重開同樣的單」重複單
+# ---------------------------------------------------------------------
+# 為什麼既有兩道閘擋不住這種重複：
+#   • symbol_gate 的送出窗預設 1h << 持倉動輒 24–48h，且「平倉」時不會刷新它，
+#     於是「timeout 平倉 → 十幾分鐘後同向同止損重開」這種貼身重複漏網。
+#   • deepdive 的 open_paper_symbols 只擋「still-open」，已平倉的舊單看不到。
+# 設計刻意保守，只有「全部硬條件成立」才擋，絕不誤殺正當新訊號：
+#   ① 最近一筆同 (symbol, direction, setup) 的『已平倉』trade
+#   ② exit_reason ∈ 白名單(timeout/stop/tp1/tp2/tp3)——entry_expired(掛單從未成交)不算，
+#      重掛限價是正當的
+#   ③ 平倉距今 < POST_CLOSE_COOLDOWN_S（預設 6h，可 .env 覆寫）
+#   ④ 新止損與舊止損近似（相對差 < POST_CLOSE_STOP_EPS，預設 0.5%）——硬性 AND 條件，
+#      差很多代表新論述/新結構，放行（如 BTC id21→id39 止損差 1.42% 是正當再進場）
+# 方向化：只比同方向 → 反轉訊號(bull↔bear)天然放行（對持倉出場有參考價值）。
+# setup 化：只比同 setup → 跨引擎(deepdive vs us_breakout)天然不互擋。
+_POST_CLOSE_DEFAULT_S = 21600          # 6h
+_POST_CLOSE_STOP_EPS_DEFAULT = 0.005   # 0.5%
+_EXIT_COOLDOWN_WHITELIST = ("timeout", "stop", "tp1", "tp2", "tp3")
+
+
+def _post_close_cooldown_s() -> int:
+    try:
+        v = int(float(os.getenv("POST_CLOSE_COOLDOWN_S", str(_POST_CLOSE_DEFAULT_S))))
+        return v if v > 0 else _POST_CLOSE_DEFAULT_S
+    except Exception:
+        return _POST_CLOSE_DEFAULT_S
+
+
+def _post_close_stop_eps() -> float:
+    try:
+        v = float(os.getenv("POST_CLOSE_STOP_EPS", str(_POST_CLOSE_STOP_EPS_DEFAULT)))
+        return v if v > 0 else _POST_CLOSE_STOP_EPS_DEFAULT
+    except Exception:
+        return _POST_CLOSE_STOP_EPS_DEFAULT
+
+
+def _recently_closed_dup(symbol: str, setup: str, direction: str,
+                         new_stop: float, *, now_ms: int | None = None) -> dict | None:
+    """判斷新單是否為『剛平倉的同向同 setup 同止損單』的貼身重複。
+
+    回 dict（被擋細節，供 log）= 應擋；回 None = 放行。任何 DB 錯誤一律回 None
+    （fail-open，絕不因閘故障漏真訊號）。
+    """
+    if new_stop is None or new_stop <= 0:
+        return None
+    t = int(now_ms if now_ms is not None else time.time() * 1000)
+    window_ms = _post_close_cooldown_s() * 1000
+    eps = _post_close_stop_eps()
+    try:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT id, stop_price, exit_reason, exit_at FROM paper_trades "
+                "WHERE symbol=? AND setup=? AND direction=? AND status='closed' "
+                "AND exit_at IS NOT NULL "
+                "ORDER BY exit_at DESC LIMIT 1",
+                (symbol, setup, direction),
+            ).fetchone()
+            if not row:
+                return None
+            last_id, last_stop, exit_reason, exit_at = row
+            if (exit_reason or "") not in _EXIT_COOLDOWN_WHITELIST:
+                return None                       # entry_expired 等 → 重下正當
+            if exit_at is None or (t - exit_at) >= window_ms:
+                return None                       # 已過冷卻窗 → 放行
+            if not last_stop or last_stop <= 0:
+                return None
+            stop_diff = abs(new_stop - last_stop) / last_stop
+            if stop_diff >= eps:
+                return None                       # 止損差很多 → 新論述，放行
+            return {"last_id": last_id, "exit_reason": exit_reason,
+                    "age_s": int((t - exit_at) / 1000), "stop_diff": stop_diff}
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
 def record_paper_entry(symbol: str, setup: str, direction: str,
                        entry_price: float, stop_price: float,
                        tp1: float, tp2: float, tp3: float,
@@ -100,10 +180,23 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                        zone_lo: float | None = None,
                        zone_hi: float | None = None,
                        split_mode: bool = False,
-                       signal_msg_id: int | None = None) -> int:
+                       signal_msg_id: int | None = None,
+                       skip_cooldown: bool = False) -> int:
     """v26: split_mode=True 時建分批限價單（entry_state='pending'，等價格逐格成交）；
-    否則維持原行為（直接全額成交，entry_state='full'）。"""
+    否則維持原行為（直接全額成交，entry_state='full'）。
+
+    v47-2: 進場前先過 post-close 冷卻去重（見 _recently_closed_dup）。
+    skip_cooldown=True 豁免（waiting-trigger 觸發是先前已承諾的等待單兌現，非新單）。
+    被擋時回 -1（不建單）；呼叫端只把回傳值用於 log，回 -1 安全。"""
     init_db()
+    if not skip_cooldown:
+        dup = _recently_closed_dup(symbol, setup, direction, stop_price)
+        if dup is not None:
+            print(f"[paper] {symbol}/{setup}/{direction} 跳過建單：post-close 冷卻中"
+                  f"（{dup['age_s']}s 前以 {dup['exit_reason']} 平倉、止損僅差 "
+                  f"{dup['stop_diff']*100:.2f}% < {_post_close_stop_eps()*100:.2f}% 門檻，"
+                  f"視為重複單；舊 id={dup['last_id']}）")
+            return -1
     conn = _conn()
     try:
         now_ms = int(time.time() * 1000)
