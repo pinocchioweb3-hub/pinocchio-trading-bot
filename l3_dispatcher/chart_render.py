@@ -38,6 +38,10 @@ PLAN_E = "#f5d442"  # 進場線（黃）
 FUND_C = "#ffa726"  # 資金費率（橘）
 LSCOL = "#26c6da"   # 多空比（青）
 SWEEP = "#ffca28"   # 流動性掃單標記（琥珀）
+# v51 Fibonacci 回撤
+FIB = "#90a4ae"        # 回撤線（藍灰，與其他疊加層區隔）
+FIB_GOLD = "#d4a017"   # 黃金口袋（0.618–0.786 高勝率回撤帶）
+FIB_RATIOS = (0.236, 0.382, 0.5, 0.618, 0.786)
 
 
 def _vol(c: dict) -> float:
@@ -108,6 +112,33 @@ def _atr(candles: list[dict], period: int = 14) -> float:
     if not trs:
         return 0.0
     return sum(trs[-period:]) / min(len(trs), period)
+
+
+def _fib_levels(candles: list[dict], window: int = 60) -> dict | None:
+    """v51：近期主擺盪腿（swing leg）的 Fibonacci 回撤位。
+    取近 window 根的絕對高/低，依先後定方向：低在前→上升腿（回撤＝找支撐）、
+    高在前→下降腿（回撤＝找阻力）。level(r)=end - r*(end-start)，r∈FIB_RATIOS。
+    腿幅不足全圖 1/4 → 回 None（回撤參考意義低、不畫以免雜訊）。"""
+    if len(candles) < 12:
+        return None
+    seg = candles[-min(len(candles), window):]
+    off = len(candles) - len(seg)            # seg[0] 在全序列的 index
+    hi_i = max(range(len(seg)), key=lambda i: seg[i]["high"])
+    lo_i = min(range(len(seg)), key=lambda i: seg[i]["low"])
+    hi, lo = seg[hi_i]["high"], seg[lo_i]["low"]
+    if hi <= lo:
+        return None
+    full_rng = (max(c["high"] for c in candles) - min(c["low"] for c in candles))
+    if full_rng and (hi - lo) < full_rng * 0.25:
+        return None                          # 腿幅 < 全圖 1/4 → 不畫
+    up = lo_i < hi_i                          # 低在前 → 上升腿
+    start = lo if up else hi                  # 腿起點
+    end = hi if up else lo                    # 腿終點（最新極值）
+    x_start = off + (lo_i if up else hi_i)
+    return {
+        "up": up, "start": start, "end": end, "x_start": x_start,
+        "levels": [(r, end - r * (end - start)) for r in FIB_RATIOS],
+    }
 
 
 def detect_structure_breaks(candles: list[dict], swings: list[dict]) -> list[dict]:
@@ -519,6 +550,28 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                        alpha=0.5, zorder=1)
             ax.text(n + 0.5, price, f"支撐 {price:,.6g}（×{cnt}）", color=SNR_S,
                     fontsize=7, va="center", ha="left", alpha=0.9, zorder=5)
+
+        # === Fibonacci 回撤（v51：近期主擺盪腿；金色＝黃金口袋 0.618–0.786 高勝率回撤帶）===
+        fib = _fib_levels(candles)
+        if fib:
+            xs = fib["x_start"]
+            gp = {round(r, 3): p for r, p in fib["levels"]}
+            g_lo, g_hi = sorted((gp[0.618], gp[0.786]))
+            ax.axhspan(g_lo, g_hi, color=FIB_GOLD, alpha=0.06, zorder=1)   # 黃金口袋帶
+            for r, price in fib["levels"]:
+                is_key = r in (0.5, 0.618)
+                col = FIB_GOLD if r == 0.618 else FIB
+                ax.plot([xs, n], [price, price], color=col,
+                        linewidth=1.0 if is_key else 0.6,
+                        linestyle=(0, (5, 4)) if is_key else (0, (1, 3)),
+                        alpha=0.8 if is_key else 0.5, zorder=1)
+                ax.text(xs + 0.3, price, f"Fib {r:.3f}　{price:,.6g}", color=col,
+                        fontsize=6.6, va="center", ha="left", alpha=0.9, zorder=4,
+                        bbox=dict(boxstyle="round,pad=0.1", fc=BG, ec=col, lw=0.3, alpha=0.6))
+            _leg = "上升腿回撤·找支撐" if fib["up"] else "下降腿回撤·找阻力"
+            ax.text(xs + 0.3, fib["end"], f"Fib {_leg}", color=FIB_GOLD,
+                    fontsize=6.8, fontweight="bold",
+                    va="bottom" if fib["up"] else "top", ha="left", alpha=0.95, zorder=4)
 
         # === 交易計畫線 ===
         if plan:
