@@ -204,6 +204,16 @@ async def amain(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"[liveness] gap check error: {type(e).__name__}: {e}")
 
+    # v52: 啟動即寫一筆存活戳記（不必等首輪 scan_once 完成，深度掃描可能耗時數分鐘）。
+    # 修正外部 watchdog 冷啟誤判：首輪掃描期間心跳會顯得過舊，watchdog 可能在 grace
+    # 後誤殺暖機中的健康 daemon。startup 戳記讓心跳從 t=0 起即新鮮。
+    # 註：必須在上面 check_gap 之後 —— check_gap 要先讀到「舊」戳記才能算出斷層。
+    try:
+        liveness.stamp({"startup": True, "scanned": 0, "fires": 0})
+        print("[liveness] startup heartbeat stamped")
+    except Exception as e:
+        print(f"[liveness] startup stamp error: {type(e).__name__}: {e}")
+
     _refresh_seen = {"first": True}
     async def on_refresh(result):
         # v23-6: 開機訊息已顯示觀察清單 → 跳過啟動時的首次 refresh 摘要（重啟不洗版）；
@@ -247,6 +257,8 @@ async def amain(args: argparse.Namespace) -> int:
     from threads_publisher import run_threads_publisher_loop as _run_threads
     # v22-4: 美股第一線快訊（TradingView 隱藏 API，零成本）
     from news_feed.us_news import run_us_news_loop as _run_us_news
+    # v52: CoinGlass 加密新聞快訊（/api/article/list，$79 Startup，AI 過濾+繁中翻譯）
+    from news_feed.coinglass_news import run_coinglass_news_loop as _run_cg_news
     # v24: 訊息稽核 Session（路由/重複/明確性自我檢測）
     from telegram_bot.message_auditor import run_audit_loop as _run_audit
     # v25: 事件脈絡敘事引擎（跨時窗事件聚類 + 因果鏈）
@@ -320,6 +332,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("threads_publisher", lambda: _run_threads(tg_sys)),
         # v22-4: 美股快訊（DJ 終端 flash 優先，AI 過濾+繁中）→ v36 併入 📰新聞快訊
         ("us_news", lambda: _run_us_news(router.client("news"))),
+        # v52: CoinGlass 加密快訊（AI 過濾+繁中）→ 📰新聞快訊；共用 source 限流器
+        ("cg_news", lambda: _run_cg_news(router.client("news"), source)),
         # v24: 稽核 Session 報告（每小時彙整路由/重複/明確性警示 → 系統主題）
         ("auditor", lambda: _run_audit(tg_sys)),
         # v25: 敘事引擎（每日聚類事件因果脈絡 → 市場情報主題）

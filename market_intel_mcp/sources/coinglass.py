@@ -1272,3 +1272,26 @@ class CoinGlassSource:
                     "code": r.get("code")}
         return {"ok": True, "source": "coinglass",
                 "details": f"rate limit {SETTINGS.rate_limit_per_min}/min"}
+
+    # =====================================================================
+    async def get_article_list(self, limit: int = 50) -> dict:
+        """v52: CoinGlass 新聞/快訊列表（GET /api/article/list；Startup $79 即有）。
+
+        回 {"source":"coinglass","articles":[...]}；底層失敗時回 make_error dict
+        （無 "articles" 鍵，上層以 .get("articles") or [] 取用即優雅降級）。
+
+        實測欄位：article_title / article_content(HTML body) / article_release_time(毫秒)
+        / article_picture / source_name / source_website_logo。
+        無 id / url / language 欄、內容恆英文 → 上層需 hash 去重 + LLM 翻繁中。
+        """
+        r = await self._get("/api/article/list", {}, tool="mi_get_news")
+        if r.get("error"):
+            return r
+        data = r.get("data")
+        # data 可能是 list，或被包成 {list/items/data: [...]}（防 API 包裝日後變動）
+        if isinstance(data, dict):
+            data = data.get("list") or data.get("items") or data.get("data") or []
+        articles = data if isinstance(data, list) else []
+        if limit and len(articles) > limit:
+            articles = articles[:limit]
+        return {"source": "coinglass", "articles": articles}
