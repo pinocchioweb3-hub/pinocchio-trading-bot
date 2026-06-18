@@ -69,9 +69,17 @@ def init_db() -> None:
                 n_total INTEGER, n_up24h INTEGER, n_down24h INTEGER,
                 n_up1h INTEGER, n_down1h INTEGER,
                 n_overheat INTEGER, n_oversold INTEGER,
-                avg_funding REAL
+                avg_funding REAL,
+                n_scanned INTEGER
             )
         """)
+        # 遷移：舊 DB 補 n_scanned。
+        # n_total = 流動性達標數（≥$10M）；n_scanned = 全市場原始掃描檔數（所有 USDT 永續）。
+        # 兩者分開存，開機橫幅才不會把 87(達標) 誤標成「全市場掃描」(實際 ~372)。
+        try:
+            conn.execute("ALTER TABLE breadth ADD COLUMN n_scanned INTEGER")
+        except sqlite3.OperationalError:
+            pass  # 欄位已存在
         conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_inst ON snapshots(inst, ts)")
     finally:
         conn.close()
@@ -228,10 +236,11 @@ def compute_breadth(snap: dict[str, dict], past_1h: dict[str, tuple],
 
     b = {"ts": now, "n_total": len(liquid), "n_up24h": up24, "n_down24h": dn24,
          "n_up1h": up1h, "n_down1h": dn1h, "n_overheat": overheat,
-         "n_oversold": oversold, "avg_funding": round(avg_f, 6)}
+         "n_oversold": oversold, "avg_funding": round(avg_f, 6),
+         "n_scanned": len(snap)}   # 全市場原始掃描檔數（n_total 是其中達 $10M 流動性的子集）
     conn = _conn()
     try:
-        conn.execute("INSERT OR REPLACE INTO breadth VALUES (?,?,?,?,?,?,?,?,?)",
+        conn.execute("INSERT OR REPLACE INTO breadth VALUES (?,?,?,?,?,?,?,?,?,?)",
                      tuple(b.values()))
         conn.execute("DELETE FROM breadth WHERE ts < ?", (now - 7 * 86400,))
     finally:
@@ -249,8 +258,8 @@ def get_latest_breadth() -> dict | None:
         if not row:
             return None
         keys = ["ts", "n_total", "n_up24h", "n_down24h", "n_up1h", "n_down1h",
-                "n_overheat", "n_oversold", "avg_funding"]
-        return dict(zip(keys, row))
+                "n_overheat", "n_oversold", "avg_funding", "n_scanned"]
+        return dict(zip(keys, row[:len(keys)]))
     finally:
         conn.close()
 

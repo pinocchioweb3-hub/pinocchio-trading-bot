@@ -239,13 +239,22 @@ def render_startup(backend: str, watchlist: list[str], interval_s: int) -> str:
         from l3_dispatcher.market_scanner import get_latest_breadth
         b = get_latest_breadth()
         market_n = b["n_total"] if b else "—"
+        scanned_n = b.get("n_scanned") if b else None
     except Exception:
         market_n = "—"
+        scanned_n = None
     n = len(watchlist)
+    # 全市場掃描＝原始掃描檔數（scanned_n，~372）；其中 market_n 檔達 $10M 流動性。
+    # 舊版只印 market_n 卻標「全市場」→ 看起來像縮水，這裡誠實分開顯示。
+    if scanned_n:
+        scan_line = (f"   全市場掃描：<code>OKX 永續 {scanned_n} 檔</code>"
+                     f"（{market_n} 檔達 $10M 流動性，異常即時偵測）\n")
+    else:
+        scan_line = f"   全市場掃描：<code>OKX 永續 {market_n} 檔達流動性</code>（異常即時偵測）\n"
     return (
         "🤖 <b>交易機器人上線</b>\n"
         f"   數據後端：<code>{_esc(backend_zh)}</code>\n"
-        f"   全市場掃描：<code>OKX 永續 {market_n} 檔</code>（異常即時偵測）\n"
+        + scan_line +
         f"   訊號層：<code>動態 Top {n}</code>（依強勢排名，非固定幣種）\n"
         f"   掃描間隔：<code>{interval_s} 秒</code>\n"
         f"   啟用策略：<code>{_esc(strat)}</code>\n"
