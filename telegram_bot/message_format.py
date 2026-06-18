@@ -221,9 +221,21 @@ def render_startup(backend: str, watchlist: list[str], interval_s: int) -> str:
     # v23-6: 啟用策略與風控參數改讀真實來源（registry + botconfig）
     try:
         from l2_trigger.registry import enabled_strategies
-        strat = "、".join(m.display_name_zh for m in enabled_strategies()) or "（無）"
+        # v55-2: 橫幅誠實化 — 帶上成熟度標記，避免把實驗性策略（如美股代幣突破）
+        #         與已驗證策略（日內爆發）並列得像同級。其他面（/strategies、/settings）本就有標。
+        _mi = {"live": "🟢", "paper": "🧪", "experimental": "🔬"}
+        _ml = {"live": "🟢 已驗證", "paper": "🧪 紙上實驗", "experimental": "🔬 實驗中·純紙上"}
+        _ens = enabled_strategies()
+        strat = "、".join(f"{m.display_name_zh}{_mi.get(m.maturity, '')}"
+                          for m in _ens) or "（無）"
+        _mats: list[str] = []
+        for m in _ens:
+            if m.maturity not in _mats:
+                _mats.append(m.maturity)
+        strat_legend = "　".join(_ml[x] for x in _mats if x in _ml)
     except Exception:
-        strat = "日內爆發"
+        strat = "日內爆發🟢"
+        strat_legend = ""
     try:
         from botconfig import CONFIG
         if CONFIG.risk_per_trade_pct > 0:
@@ -258,6 +270,7 @@ def render_startup(backend: str, watchlist: list[str], interval_s: int) -> str:
         f"   訊號層：<code>動態 Top {n}</code>（依強勢排名，非固定幣種）\n"
         f"   掃描間隔：<code>{interval_s} 秒</code>\n"
         f"   啟用策略：<code>{_esc(strat)}</code>\n"
+        + (f"     <i>{_esc(strat_legend)}</i>\n" if strat_legend else "")
         + risk_line +
         "\n🛰 開始監看市場...（/settings 自訂風險與策略 ｜ /strategies 看策略清單）"
     )
