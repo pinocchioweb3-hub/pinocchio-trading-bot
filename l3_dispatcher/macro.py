@@ -778,7 +778,8 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
                                 continue
                             sig_mid = await _send_to_telegram(
                                 tg, text,
-                                prefix=f"🎯 <b>{sym} 交易計畫深度分析</b>\n"
+                                prefix=(f"🎯 <b>{sym} 交易計畫深度分析</b>\n"
+                                        + _shadow_observe_prefix(sym_state))
                             )
                             if _dir in ("bull", "bear") and not sig_mid:
                                 # v48: 送出失敗 → 歸還搶到的槽，下輪可重試（不靜默漏單）
@@ -814,6 +815,76 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
         except Exception as e:
             print(f"[deepdive] loop error: {type(e).__name__}: {e}")
         await asyncio.sleep(interval_seconds)
+
+
+def _shadow_tf_nesting_line(sym_state: dict) -> str:
+    """#34 影子顯示：把多時框嵌套階段組成「一行」確定性文字（不過 LLM）。
+
+    純讀 sym_state['tf_nesting']（compute_per_symbol_state 已算好），任何缺料/錯誤回 ""。
+    嚴守紅線③：只敘述「結構階段／層對齊」客觀事實，無勝率/報酬%/年化等績效字眼；
+    明標「僅 OKX 原生時框、無 8H/5D 合成」「觀察中」，避免被當已驗證進場訊號。
+    """
+    try:
+        nest = sym_state.get("tf_nesting") or {}
+        n = int(nest.get("layer_count") or 0)
+        stage = nest.get("stage_label")
+        if n <= 0 or not stage:
+            return ""
+        align_pct = int(round(float(nest.get("alignment_score") or 0.0) * 100))
+        side = (nest.get("trade_side") or {}).get("side")
+        side_txt = {"right": "・右側順勢", "left": "・左側佈局"}.get(side, "")
+        fb = nest.get("false_break") or {}
+        fb_txt = "・⚠️疑似假突破" if fb.get("is_false_break") else ""
+        return (f"🪜 多時框階段：{stage}（{n}層・對齊{align_pct}%{side_txt}{fb_txt}"
+                f"；僅OKX原生時框1M/1w/1d/3d/2d/12h/4h，觀察中）\n")
+    except Exception:
+        return ""
+
+
+def _shadow_convergence_focus_line() -> str:
+    """#33 影子顯示：讀跨源匯流 JSONL 最後一輪，列「三方共現焦點幣」橫幅（不過 LLM）。
+
+    純讀 data_dir()/convergence_shadow.jsonl 最後一行；不存在/空/壞 JSON 回 ""。
+    嚴守紅線③：只敘述「OKX∧Binance∧CoinGlass 資金費率方向一致」此一事實，非「買進訊號」；
+    標「觀察中／參考」；此為全市場焦點榜（非當前幣專屬），故用橫幅式文案以免被誤當該幣訊號。
+    不顯示 strength_multiplier_SHADOW（避免被當已生效權重）。
+    """
+    try:
+        import json as _json
+        from botpaths import data_dir
+        path = data_dir() / "convergence_shadow.jsonl"
+        if not path.exists():
+            return ""
+        with open(path, "rb") as f:  # tail 讀，避免載入整個 5MB sink
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            chunk = f.read()
+        lines = [ln for ln in chunk.decode("utf-8", errors="ignore").splitlines()
+                 if ln.strip()]
+        if not lines:
+            return ""
+        rec = _json.loads(lines[-1])  # 取最後一行（可能因 tail 切斷較舊行，但末行完整）
+        focus = [it for it in (rec.get("focus") or []) if it.get("triple_present")]
+        focus.sort(key=lambda it: it.get("convergence_score") or 0.0, reverse=True)
+        syms = [it.get("symbol") for it in focus[:5] if it.get("symbol")]
+        if not syms:
+            return ""
+        return ("📊 本輪三方共現焦點幣（OKX∧Binance∧CoinGlass 資金費率方向一致，"
+                f"觀察中／參考）：{'、'.join(syms)}\n")
+    except Exception:
+        return ""
+
+
+def _shadow_observe_prefix(sym_state: dict) -> str:
+    """組合 #34（當前幣階段）+ #33（全市場焦點橫幅）兩行影子觀測，附在 deepdive 標題下。
+
+    全程只讀、不過 LLM、任何錯誤回 ""，絕不中斷 deepdive 發送。
+    """
+    try:
+        return _shadow_tf_nesting_line(sym_state) + _shadow_convergence_focus_line()
+    except Exception:
+        return ""
 
 
 async def _send_to_telegram(tg, text: str, prefix: str = "") -> int:
