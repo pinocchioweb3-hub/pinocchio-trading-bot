@@ -73,16 +73,16 @@ except Exception:  # pragma: no cover
 TF_ORDER = ["1M", "1w", "1d", "3d", "2d", "12h", "8h", "4h"]
 
 
-# ⚠️ PROVISIONAL（暫定）— stage 中文命名待使用者拍板（見回報的決策點）。
+# 階段中文命名：使用者 2026-06-18 拍板採「SMC/Wyckoff 專業術語版」（非白話版）。
 #    用中性英文碼當 key，方便日後抽換 value 而不動程式邏輯。
 STAGE_LABELS: dict[str, str] = {
-    "UP_TREND": "主升段",        # PROVISIONAL
-    "UP_PULLBACK": "高位回調",   # PROVISIONAL
-    "TOP_WATCH": "見頂待確認",   # PROVISIONAL
-    "RANGE": "區間震盪",         # PROVISIONAL
-    "BOTTOM_WATCH": "觸底待確認",  # PROVISIONAL
-    "DOWN_BOUNCE": "低位反彈",   # PROVISIONAL
-    "DOWN_TREND": "主跌段",      # PROVISIONAL
+    "UP_TREND": "上升擴張",      # 趨勢明確向上、各層共振
+    "UP_PULLBACK": "多頭回撤",   # 大層多頭、小層回檔（右側續多 / 回踩找多）
+    "TOP_WATCH": "派發見頂",     # 高位轉弱、疑似派發
+    "RANGE": "盤整",             # 區間震盪、方向未明
+    "BOTTOM_WATCH": "吸籌築底",  # 低位轉強、疑似吸籌
+    "DOWN_BOUNCE": "空頭反彈",   # 大層空頭、小層反彈（右側續空 / 反彈找空）
+    "DOWN_TREND": "下降擴張",    # 趨勢明確向下、各層共振
 }
 
 
@@ -249,14 +249,14 @@ def infer_stage(dominant_trend: str, ltf_direction: str,
 
     決策邏輯（可窮舉測）：
         主導 up：
-            小層也 up + 深度足  → UP_TREND（主升段）
-            小層 down/range     → 高位(pos≥0.7) 看 TOP_WATCH（見頂待確認）
-                                  否則 UP_PULLBACK（高位回調）
+            小層也 up + 深度足  → UP_TREND（上升擴張）
+            小層 down/range     → 高位(pos≥0.7) 看 TOP_WATCH（派發見頂）
+                                  否則 UP_PULLBACK（多頭回撤）
         主導 down：
-            小層也 down + 深度足 → DOWN_TREND（主跌段）
-            小層 up/range        → 低位(pos≤0.3) 看 BOTTOM_WATCH（觸底待確認）
-                                  否則 DOWN_BOUNCE（低位反彈）
-        主導 range / 其他        → RANGE（區間震盪）
+            小層也 down + 深度足 → DOWN_TREND（下降擴張）
+            小層 up/range        → 低位(pos≤0.3) 看 BOTTOM_WATCH（吸籌築底）
+                                  否則 DOWN_BOUNCE（空頭反彈）
+        主導 range / 其他        → RANGE（盤整）
     """
     pos = 0.5 if price_position is None else price_position
     dt = dominant_trend

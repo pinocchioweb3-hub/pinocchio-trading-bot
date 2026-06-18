@@ -252,15 +252,15 @@ def test_infer_stage_decision_table_all_seven():
         assert s["rationale"]
 
 
-def test_infer_stage_labels_provisional_set():
-    # STAGE_LABELS 是 7 階段、值為暫定中文（鎖定預期值，抽換時測試會提醒）
+def test_infer_stage_labels_smc_set():
+    # STAGE_LABELS 是 7 階段、值為使用者拍板的 SMC 術語（鎖定預期值，抽換時測試會提醒）
     assert set(STAGE_LABELS) == {
         "UP_TREND", "UP_PULLBACK", "TOP_WATCH", "RANGE",
         "BOTTOM_WATCH", "DOWN_BOUNCE", "DOWN_TREND",
     }
-    assert STAGE_LABELS["UP_TREND"] == "主升段"
-    assert STAGE_LABELS["DOWN_TREND"] == "主跌段"
-    assert STAGE_LABELS["RANGE"] == "區間震盪"
+    assert STAGE_LABELS["UP_TREND"] == "上升擴張"
+    assert STAGE_LABELS["DOWN_TREND"] == "下降擴張"
+    assert STAGE_LABELS["RANGE"] == "盤整"
 
 
 # ===========================================================================
