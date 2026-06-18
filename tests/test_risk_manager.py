@@ -122,14 +122,31 @@ def test_econ_blackout_blocks():
 
 
 def test_econ_calendar_failure_does_not_block_pipeline():
-    """經濟日曆故障（拋例外）絕不能擋住交易管線 → 應放行繼續後續檢查。"""
+    """經濟日曆故障（拋例外）絕不能擋住交易管線 → 應放行繼續後續檢查。
+
+    且故障必須「留痕」可觀測（稽核 #2 治本：不可靜默吞例外）：
+    details 須標記 econ_blackout_checked=False + 例外型別。
+    """
     _setup()
     def _boom():
         raise RuntimeError("econ feed down")
     _econ.in_blackout = _boom
-    blocked, reason, _ = rm.should_block(_decision("AAA"), _cfg())
+    blocked, reason, details = rm.should_block(_decision("AAA"), _cfg())
     assert blocked is False
     assert reason == "ok"
+    # fail-open 仍成立，但要留痕：
+    assert details["econ_blackout_checked"] is False
+    assert details["econ_blackout_error"] == "RuntimeError"
+
+
+def test_econ_calendar_ok_marks_checked():
+    """經濟日曆正常運作時，details 標記 econ_blackout_checked=True（可觀測已查過）。"""
+    _setup()  # in_blackout → (False, "")
+    blocked, reason, details = rm.should_block(_decision("AAA"), _cfg())
+    assert blocked is False
+    assert reason == "ok"
+    assert details["econ_blackout_checked"] is True
+    assert "econ_blackout_error" not in details
 
 
 # === 部位層 ==================================================================

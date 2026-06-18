@@ -63,6 +63,11 @@ async def cross_check_fire(
         checks.append({"name": "btc_gate_alignment", "pass": False, "delta": -25,
                        "note": "BTC 趨勢向下但發出 BULL FIRE"})
         score -= 25
+    elif direction == SignalState.BULL and snap.btc_gate_open is None:
+        # BTC 閘資料缺失/stale → 無法確認 BULL 與大盤對齊 → 保守降分（fail-closed 精神）
+        checks.append({"name": "btc_gate_alignment", "pass": False, "delta": -10,
+                       "note": "BTC 閘資料缺失/stale，BULL 對齊無法確認 → 保守降分"})
+        score -= 10
     else:
         checks.append({"name": "btc_gate_alignment", "pass": True, "delta": 0,
                        "note": f"BTC gate {snap.btc_gate_open}"})

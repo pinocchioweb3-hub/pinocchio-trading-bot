@@ -181,7 +181,8 @@ def in_blackout(now_ts: int | None = None) -> tuple[bool, str]:
         if row:
             return True, row[0]
         return False, ""
-    except Exception:
+    except Exception as e:
+        print(f"[econ] in_blackout 降級放行（DB/查詢故障）：{type(e).__name__}")
         return False, ""
 
 

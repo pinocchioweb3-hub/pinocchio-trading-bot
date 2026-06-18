@@ -123,17 +123,23 @@ def should_block(decision: dict | Any,
         }
 
     # === Check 2.5: 經濟數據靜默期（v16：高影響數據前30/後15分鐘暫停新訊號）===
+    # 設計取捨：經濟日曆故障時「刻意 fail-open」（不擋管線）——日曆是加分項而非核心風控，
+    # 但故障必須「留痕」可觀測，不可靜默吞掉（稽核發現的真缺陷是「沉默」，非放行本身）。
     try:
         from news_feed.econ_calendar import in_blackout
         bo, ev_name = in_blackout()
+        details["econ_blackout_checked"] = True
         if bo:
             return True, "econ_blackout", {
                 **details,
                 "msg": f"高影響經濟數據「{ev_name}」發布窗口（前30/後15分），"
                        f"技術面在消息行情中失靈，暫停新訊號",
             }
-    except Exception:
-        pass  # 經濟日曆故障絕不能擋住交易管線
+    except Exception as e:
+        # fail-open 是刻意設計，但要留痕（details 標記 + 告警 print），不靜默：
+        details["econ_blackout_checked"] = False
+        details["econ_blackout_error"] = type(e).__name__
+        print(f"[risk] econ_blackout 降級放行（日曆故障，非核心風控）：{type(e).__name__}")
 
     # === Check 3: 同時最多持倉數 ===
     opens = get_open_trades()
