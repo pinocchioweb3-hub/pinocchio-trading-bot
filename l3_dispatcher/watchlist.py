@@ -53,6 +53,10 @@ class WatchlistManager:
     last_refresh: dt.datetime | None = None
     trading_size: int = 8                            # 7-10 範圍中選 8
     candidate_pool: tuple[str, ...] = TRADING_CANDIDATES
+    # v54-3: #35 陰陽共生「做空候選」影子層。預設 short_tier_size=0 ＝ 永遠休眠：
+    #   short_tier 一律空、永不進 fire_tier()/all_symbols/scheduler，純觀測用。
+    short_tier: list[str] = field(default_factory=list)
+    short_tier_size: int = 0
 
     @property
     def all_symbols(self) -> list[str]:
@@ -145,12 +149,29 @@ class WatchlistManager:
         HOT_SYMBOLS.clear()
         HOT_SYMBOLS.update(chosen)
 
+        # v54-3: #35 陰陽共生影子層 — 在同一份 filtered universe 上算「弱勢做空候選」排名。
+        #   純觀測：short_tier_size 預設 0 → self.short_tier 永遠空 → 永不進 fire_tier()。
+        #   絕不影響 trading/chosen/HOT_SYMBOLS/掃描/下單；任何錯誤吞掉不影響做多 refresh。
+        short_scored: list[dict] = []
+        try:
+            from market_intel_mcp.weakness import (
+                compute_weakness_scores, passes_short_liquidity)
+            short_pool = [it for it in filtered
+                          if passes_short_liquidity(it, 20_000_000)]
+            short_scored = compute_weakness_scores(short_pool)
+            self.short_tier = [it["symbol"]
+                               for it in short_scored[:self.short_tier_size]]
+        except Exception:
+            self.short_tier = []
+
         elapsed = asyncio.get_event_loop().time() - t0
         return {
             "chosen": chosen,
             "dropped": list(before - set(chosen)),
             "added": list(set(chosen) - before),
             "scored": scored,    # 全部排序後的清單，給報告用
+            "short_scored": short_scored,   # v54-3: #35 弱勢做空排名（觀測；未啟用）
+            "short_tier": list(self.short_tier),
             "elapsed_sec": round(elapsed, 2),
             "ts": self.last_refresh,
         }

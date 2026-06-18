@@ -271,6 +271,10 @@ async def amain(args: argparse.Namespace) -> int:
     from l3_dispatcher.ledger_anchor import run_anchor_loop as _run_anchor
     # v40: CEO 監督 Session（每日彙整所有 Session 輸出 → 單一兩段式簡報，解決「埋在細節忘全局」）
     from l3_dispatcher.ceo_session import run_ceo_loop as _run_ceo
+    # v54-3: #33 跨源匯流影子觀測（OKX∧Binance∧CoinGlass 存在度 + funding 共振；
+    #        純觀測寫 convergence_shadow.jsonl，永不影響 strength/fire/下單）
+    from l3_dispatcher.convergence_shadow import (
+        run_convergence_shadow_loop as _run_convergence)
 
     # v14: 每個 worker 用 supervise() 隔離 — 單一 worker 崩潰自動重啟，不再全滅
     # v14.1: run_on_startup 只在首次啟動為 True — supervise 崩潰重啟不重推開機報告
@@ -346,6 +350,9 @@ async def amain(args: argparse.Namespace) -> int:
         ("ledger_anchor", lambda: _run_anchor(tg_sys)),
         # v40: CEO 監督 Session（每日 09:00 台北彙整簡報 → 系統主題，純讀不下單不發外）
         ("ceo_session", lambda: _run_ceo(tg_sys)),
+        # v54-3: #33 跨源匯流影子觀測（每 30 分一輪 → convergence_shadow.jsonl；
+        #        純背景觀測，不發 Telegram、不影響任何訊號/下單）
+        ("convergence_shadow", lambda: _run_convergence(source)),
     ]
     try:
         await asyncio.gather(*[

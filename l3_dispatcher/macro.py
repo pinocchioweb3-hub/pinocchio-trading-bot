@@ -599,6 +599,22 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
             bn_raw if isinstance(bn_raw, dict) else {}),
     }
 
+    # v54-3: #34 多時框趨勢嵌套（影子，純顯示層；只用 OKX 原生時框，
+    #        絕不合成 8H/5D。失敗 → 空 dict，永不中斷 deepdive，零訊號數學變更）
+    try:
+        from market_intel_mcp.timeframe_nesting import build_nesting
+        _extra = await candles_src.get_multi_tf(
+            symbol, ["1M", "1w", "3d", "2d", "12h"], limit_per_tf=200)
+        _by_tf = {
+            "4h": c_4h if isinstance(c_4h, dict) else None,   # 上方已取得，重用不重抓
+            "1d": c_1d if isinstance(c_1d, dict) else None,
+        }
+        for _tf, _r in (_extra.get("by_timeframe") or {}).items():
+            _by_tf[_tf] = _r
+        result["tf_nesting"] = build_nesting(_by_tf)
+    except Exception:
+        result["tf_nesting"] = {}
+
     if symbol in ("BTC", "ETH"):
         etf = await mi_get_etf_flows(symbol, 7)
         result[f"etf_{symbol.lower()}"] = _safe(etf)

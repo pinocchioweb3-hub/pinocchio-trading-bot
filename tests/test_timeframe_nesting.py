@@ -187,6 +187,45 @@ def test_nesting_empty_dict_safe_unknown():
     assert build_nesting(None)["dominant_trend"] == "unknown"
 
 
+def _okx_wrapped(cs: list[dict]) -> dict:
+    """模擬 sources/okx_candles.get_candles 的回傳形：{'candles':[...], + metadata}。
+    刻意帶多個 metadata 鍵讓 len(dict) >= 6（重現舊 bug：len(dict)<6 會提早 bail
+    而掩蓋問題；>=6 才會真的去迭代 dict 而把 key 字串當 candle）。"""
+    return {"candles": cs, "symbol": "BTC", "interval": "x",
+            "count": len(cs), "source": "okx", "ok": True}
+
+
+def test_nesting_wrapped_okx_dict_form_unwraps_everywhere():
+    """回歸（v54-3 接線煙霧測試抓到的真 bug）：build_nesting 收到 okx_candles 的
+    {'candles':[...], +metadata} 包裝形時，detect_false_break 與
+    _bigger_tf_direction 都必須 unwrap，不可把 dict 當 list 迭代而崩
+    （TypeError: string indices must be integers）。"""
+    # 最小層 4h：~40 根近水平 + 末根向上假突破（包在 okx dict 內）
+    small = _flat_base(40) + [_candle(100, 110, 99.5, 100.2, v=40)]
+    cbt = {
+        "1d": _okx_wrapped(_synth("down", 40, base=200.0)),   # 大層空（包裝形）
+        "12h": _okx_wrapped(_synth("down", 40, base=150.0)),  # 大層空（包裝形）
+        "4h": _okx_wrapped(small),                            # 最小層（包裝形）
+    }
+    n = build_nesting(cbt)
+    # 1) 不崩、三層都被吃進來
+    assert [ly["tf"] for ly in n["layers"]] == ["1d", "12h", "4h"]
+    # 2) 最小層 4h 的 false_break 真的有被算（非 insufficient）且抓到向上假突破
+    fb = n["false_break"]
+    assert "insufficient_candles" not in fb["reasons"]
+    assert fb["side"] == "up"
+    assert fb["is_false_break"] is True
+    # 3) 大層為空 → 逆勢加成出現，證明 _bigger_tf_direction 也正確 unwrap 了包裝形
+    assert any("逆勢" in r for r in fb["reasons"])
+    # 4) 直接呼叫 detect_false_break 餵包裝形也不崩
+    direct = detect_false_break({"4h": _okx_wrapped(small)}, "4h")
+    assert direct["side"] == "up"
+    # 5) error 包裝形仍安全降級（不崩、insufficient）
+    assert detect_false_break(
+        {"4h": {"error": True, "message": "boom"}}, "4h"
+    )["is_false_break"] is False
+
+
 # ===========================================================================
 # 10-13: detect_false_break
 # ===========================================================================

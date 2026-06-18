@@ -90,6 +90,28 @@ STAGE_LABELS: dict[str, str] = {
 # 內部 helper
 # ===========================================================================
 
+def _unwrap_candles(entry) -> list | None:
+    """容忍兩種輸入，回純 candles list 或 None。
+
+    * 直接 candles list（離線測試常用）→ 原樣回。
+    * sources/okx_candles.py 的回傳形 {'candles':[...], 'error':...}
+      → 有 error 回 None、否則回內層 list。
+    * 其餘型別 / 空 → None。
+    所有讀 candles_by_tf[tf] 的函式都該走這支，避免 build_nesting 與
+    detect_false_break / _bigger_tf_direction 各自為政（曾因此漏 unwrap 而崩）。
+    """
+    if not entry:
+        return None
+    if isinstance(entry, dict):
+        if entry.get("error"):
+            return None
+        cs = entry.get("candles")
+        return cs if cs else None
+    if isinstance(entry, list):
+        return entry
+    return None
+
+
 def _slope_sign(closes: list[float]) -> int:
     """近窗 close 線性回歸斜率符號（tie-breaker）。回 1 上 / -1 下 / 0 平。
 
@@ -321,7 +343,7 @@ def detect_false_break(candles_by_tf: dict, tf: str,
     缺資料 → is_false_break=False、confidence=0、reasons 標 insufficient。
     """
     reasons: list[str] = []
-    candles = (candles_by_tf or {}).get(tf)
+    candles = _unwrap_candles((candles_by_tf or {}).get(tf))
     if not candles or len(candles) < 6:
         return {"is_false_break": False, "confidence": 0.0,
                 "reasons": ["insufficient_candles"], "side": None}
@@ -406,7 +428,7 @@ def _bigger_tf_direction(candles_by_tf: dict, tf: str) -> str | None:
         return None
     idx = TF_ORDER.index(tf)
     for bigger in TF_ORDER[:idx]:  # 比 tf 大的層（在 TF_ORDER 中靠前）
-        cs = candles_by_tf.get(bigger)
+        cs = _unwrap_candles(candles_by_tf.get(bigger))
         if not cs:
             continue
         r = classify_tf_trend(cs)
@@ -481,18 +503,8 @@ def build_nesting(candles_by_tf: dict, tf_order: list[str] | None = None) -> dic
     layers: list[dict] = []
 
     for tf in order:
-        entry = (candles_by_tf or {}).get(tf)
-        if not entry:
-            continue
         # 容忍兩種輸入：直接 candles list，或 {'candles': [...], 'error':...}
-        if isinstance(entry, dict):
-            if entry.get("error"):
-                continue
-            candles = entry.get("candles")
-        elif isinstance(entry, list):
-            candles = entry
-        else:
-            continue
+        candles = _unwrap_candles((candles_by_tf or {}).get(tf))
         if not candles:
             continue
 
