@@ -59,8 +59,9 @@ FEATURES = [
     {"key": "promotion_gate", "name": "Phase 0 達標偵測（AI 不自我宣告）", "kind": "gov", "status": "shipped"},
     {"key": "rebate_tiers", "name": "返佣誠實分級標籤", "kind": "gov", "status": "shipped"},
     # 驗證真實性
-    {"key": "okx_paper", "name": "OKX 模擬盤自動下單（驗證持倉真實性）", "kind": "verify", "status": "blocked",
-     "note": "等使用者建 OKX Demo 金鑰"},
+    {"key": "okx_paper", "name": "OKX 模擬盤自動下單（驗證持倉真實性）", "kind": "verify", "status": "partial",
+     "note": "程式庫+操盤手已建妥並離線測試（demo_trader 44/44、demo_guard 全綠、demo_operator 23/23）；"
+             "預設雙鑰待命（DEMO_OPERATOR_ACTIVE 關），待單次 --cycle-once 監督試跑後再常駐"},
     # 呈現 / 信任
     {"key": "dual_audience", "name": "雙受眾呈現層（人話卡+機器JSON）", "kind": "ux", "status": "partial",
      "note": "人話卡(message_format)+機器JSON(intent_format)+白話對照(glossary)已具雛形；新手/專家模式待整合"},
@@ -289,6 +290,25 @@ def _section_normal() -> str:
     lines.append(
         f"🔬 驗證：模擬盤 {p['paper_n']}/{p['paper_min']} {_bar(p['paper_n'], p['paper_min'])}"
         f"｜真實 {p['live_n']}/{p['live_min']} {_bar(p['live_n'], p['live_min'])}")
+
+    # 4.5) OKX 模擬盤實單驗證（task #4/#39）—— 真實成交、零真錢。
+    #      只做透明呈現：demo 樣本走 demo_trades 表，**不**計入上方 Phase 0「真實」門檻
+    #      （那條讀 trades 表＝人類親手按下的真錢，紅線①）。demo_n 達標與否由人判讀。
+    try:
+        from . import demo_journal
+        from .demo_operator import is_active as _demo_active
+        dn, dev = demo_journal.count_closed_for_phase0()
+        ds = demo_journal.get_demo_stats(30)
+        n_live = ds.get("n_open", 0) + ds.get("n_pending", 0)
+        state = "運行中" if _demo_active() else "待命（DEMO_OPERATOR_ACTIVE 未開）"
+        if dn or n_live:
+            lines.append(
+                f"🧪 模擬盤實單：已平倉 {dn} 筆／期望 {dev:+.2f}R｜在場 {n_live} 筆｜{state}"
+                f"（OKX 真實成交·零真錢；不計入上方真實門檻）")
+        else:
+            lines.append(f"🧪 模擬盤實單：尚無樣本｜{state}（OKX 真實成交·零真錢）")
+    except Exception:
+        pass
 
     # 5) 功能完成度（一行摘要）
     d = feature_registry_dump()["counts"]

@@ -590,6 +590,102 @@ async def fetch_okx_positions(ex) -> list[dict]:
     return out
 
 
+async def fetch_okx_contract_spec(ex, symbol: str) -> dict:
+    """拉某標的的 OKX 永續合約規格（ctVal / lotSz / minSz），供 build_order_plan 正確取整。
+
+    這修掉「純函式層用 DEFAULT_CT_VAL=0.01 假設」對非 BTC 標的的錯倉位：各標的 ctVal 不同
+    （SOL/DOGE… 與 BTC 差很多），不取真值會把張數/實際風險算錯。讀取性質（不下單），故
+    不另呼 confirm_okx_demo——真正下單前的 place_demo_plan 仍會再正向證明模擬盤。"""
+    inst_id = f"{symbol}/USDT:USDT"
+    await ex.load_markets()
+    m = ex.market(inst_id)
+    prec = m.get("precision") or {}
+    amt_limit = (m.get("limits") or {}).get("amount") or {}
+    ct_val = float(m.get("contractSize") or DEFAULT_CT_VAL)
+    lot_sz = float(prec.get("amount") or DEFAULT_LOT_SZ)
+    if lot_sz <= 0:
+        lot_sz = DEFAULT_LOT_SZ
+    min_sz = float(amt_limit.get("min") or lot_sz)
+    if min_sz <= 0:
+        min_sz = lot_sz
+    return {"ct_val": ct_val, "lot_sz": lot_sz, "min_sz": min_sz, "inst_id": inst_id}
+
+
+async def cancel_demo_entry(ex, symbol: str, order_id: str | None,
+                            cl_ord_id: str | None = None) -> dict:
+    """取消一張未成交的模擬盤進場限價單（entry_expired 路徑）。
+    下單面動作 → 先再正向證明模擬盤（雙重保險），證不出在模擬盤就不動。"""
+    from l4_execution.demo_guard import confirm_okx_demo
+    await confirm_okx_demo(ex)
+    inst_id = f"{symbol}/USDT:USDT"
+    params: dict = {}
+    if not order_id and cl_ord_id:
+        params["clOrdId"] = cl_ord_id
+    try:
+        res = await ex.cancel_order(order_id, inst_id, params=params)
+        return {"ok": True, "result_id": (res or {}).get("id") if isinstance(res, dict) else None}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+async def market_close_demo(ex, symbol: str, pos_side: str, contracts: float) -> dict:
+    """市價平掉模擬盤某倉的剩餘張數（逾時平倉路徑）。reduceOnly。
+    下單面動作 → 先再正向證明模擬盤。contracts ≤ 0 視為無倉、不動。"""
+    from l4_execution.demo_guard import confirm_okx_demo
+    await confirm_okx_demo(ex)
+    if contracts <= 0:
+        return {"ok": False, "error": "no_contracts"}
+    inst_id = f"{symbol}/USDT:USDT"
+    close_side = "sell" if pos_side == "long" else "buy"
+    params = {"tdMode": "isolated", "posSide": pos_side, "reduceOnly": True}
+    try:
+        res = await ex.create_order(symbol=inst_id, type="market", side=close_side,
+                                    amount=contracts, params=params)
+        return {"ok": True, "order_id": (res or {}).get("id")}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+async def fetch_okx_closed_pnl(ex, symbol: str, pos_side: str,
+                               *, since_ms: int | None = None) -> dict:
+    """從 OKX positions-history 取某標的最近一筆已平倉的 realizedPnl（**真相，非捏造**）。
+
+    realizedPnl 為 OKX 計入手續費/資金費後的淨已實現損益，正是 realized_r 的分子來源。
+    回 {ok, found, pnl_usd, u_time}。找不到（history 尚未回填）→ found=False，呼叫端應
+    保守處理（不平本地帳、下輪重試），**絕不本地推估 PnL**。讀取性質，不另呼 confirm。"""
+    inst_id = f"{symbol}/USDT:USDT"
+    try:
+        hist = await ex.fetch_positions_history([inst_id], since=since_ms, limit=50)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "found": False, "error": f"{type(e).__name__}: {e}"}
+    cands: list[tuple[int, float]] = []
+    for h in hist:
+        info = h.get("info") or {}
+        ps = info.get("posSide") or h.get("side")
+        if pos_side and ps and ps != pos_side:
+            continue
+        raw_u = info.get("uTime") or info.get("cTime") or h.get("timestamp")
+        try:
+            u = int(raw_u) if raw_u else 0
+        except (TypeError, ValueError):
+            u = 0
+        pnl_raw = info.get("realizedPnl")
+        if pnl_raw is None:
+            pnl_raw = info.get("pnl")
+        try:
+            pnl = float(pnl_raw) if pnl_raw is not None and pnl_raw != "" else None
+        except (TypeError, ValueError):
+            pnl = None
+        if pnl is None:
+            continue
+        cands.append((u, pnl))
+    if not cands:
+        return {"ok": True, "found": False}
+    cands.sort(key=lambda x: x[0], reverse=True)
+    u, pnl = cands[0]
+    return {"ok": True, "found": True, "pnl_usd": pnl, "u_time": u}
+
+
 # ---------------------------------------------------------------------------
 # 自測 / CLI
 # ---------------------------------------------------------------------------

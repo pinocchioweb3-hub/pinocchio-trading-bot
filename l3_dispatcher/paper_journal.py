@@ -393,6 +393,38 @@ def apply_paper_event(paper_id: int, leg_label: str, size_pct: float,
         conn.close()
 
 
+def get_signals_after(after_id: int, limit: int = 200) -> list[dict]:
+    """task #39（OKX 模擬盤操盤手鏡像用）：回 id > after_id 的新紙上訊號，按 id 升冪。
+    只回鏡像下單所需欄位（entry/stop/tp/方向/setup/狀態/fire_id）。純讀、無副作用。"""
+    init_db()
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, symbol, setup, direction, entry_price, stop_price, "
+            "tp1, tp2, tp3, status, entry_state, fire_id, regime, entry_at "
+            "FROM paper_trades WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (int(after_id), int(limit)),
+        ).fetchall()
+        return [{"id": r[0], "symbol": r[1], "setup": r[2], "direction": r[3],
+                 "entry_price": r[4], "stop_price": r[5],
+                 "tp1": r[6], "tp2": r[7], "tp3": r[8],
+                 "status": r[9], "entry_state": r[10], "fire_id": r[11],
+                 "regime": r[12], "entry_at": r[13]} for r in rows]
+    finally:
+        conn.close()
+
+
+def max_paper_id() -> int:
+    """目前 paper_trades 最大 id（操盤手首次啟動設高水位用，略過歷史回補）。"""
+    init_db()
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM paper_trades").fetchone()
+        return int(row[0] or 0)
+    finally:
+        conn.close()
+
+
 def get_paper_stats(days: int = 30, setup: str | None = None,
                     setup_not: str | None = None) -> dict:
     """紙上帳統計（引擎期望值驗證用）。setup 指定時只統計該引擎；

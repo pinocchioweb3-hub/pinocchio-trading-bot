@@ -275,6 +275,14 @@ async def amain(args: argparse.Namespace) -> int:
     #        純觀測寫 convergence_shadow.jsonl，永不影響 strength/fire/下單）
     from l3_dispatcher.convergence_shadow import (
         run_convergence_shadow_loop as _run_convergence)
+    # v55: OKX 模擬盤自動操盤手（task #4/#39）— 鏡像新紙上加密訊號到 OKX 模擬盤實單。
+    #      預設「雙鑰待命」：DEMO_OPERATOR_ACTIVE 未開時整個 worker 完全閒置、零 OKX 互動
+    #      （連 ex 都不建）→ 接進 daemon 本身是安全的；真要開單須另外把旗標設 1。
+    #      模擬盤＝demo_guard 正向證明 x-simulated-trading=1，零真錢，不踩紅線①。
+    from l3_dispatcher.demo_operator import run_demo_operator_loop as _run_demo_operator
+    # v55: 監督員 Layer 1（task #40）— CEO 之上的純讀守望者：盤點進度寫 oversight_ledger.json，
+    #      真停滯且過冷卻才發私人提醒。純讀，不下單、不改參數、不碰 daemon。
+    from l3_dispatcher.ceo_oversight import run_oversight_loop as _run_oversight
 
     # v14: 每個 worker 用 supervise() 隔離 — 單一 worker 崩潰自動重啟，不再全滅
     # v14.1: run_on_startup 只在首次啟動為 True — supervise 崩潰重啟不重推開機報告
@@ -353,6 +361,12 @@ async def amain(args: argparse.Namespace) -> int:
         # v54-3: #33 跨源匯流影子觀測（每 30 分一輪 → convergence_shadow.jsonl；
         #        純背景觀測，不發 Telegram、不影響任何訊號/下單）
         ("convergence_shadow", lambda: _run_convergence(source)),
+        # v55: OKX 模擬盤操盤手（DEMO_OPERATOR_ACTIVE 未開＝完全閒置、零 OKX 互動）。
+        #      開啟後鏡像新紙上加密訊號到模擬盤實單，純驗證持倉真實性（零真錢）。
+        ("okx_demo_operator", lambda: _run_demo_operator(
+            interval_s=args.demo_operator_interval, tg=tg_sys)),
+        # v55: 監督員 Layer 1（純讀守望 → oversight_ledger.json + 停滯時私人提醒）。
+        ("ceo_oversight", lambda: _run_oversight(tg_sys, args.oversight_interval)),
     ]
     try:
         await asyncio.gather(*[
@@ -401,6 +415,11 @@ def main() -> int:
                    help="交易層大小（7-10 區間）")
     p.add_argument("--supervisor-interval", type=int, default=300,
                    help="健康監督檢查間隔秒（預設 300=5min）")
+    p.add_argument("--demo-operator-interval", type=int, default=180,
+                   help="v55: OKX 模擬盤操盤手巡檢間隔秒（預設 180=3min；"
+                        "DEMO_OPERATOR_ACTIVE 未開時完全閒置）")
+    p.add_argument("--oversight-interval", type=int, default=1800,
+                   help="v55: 監督員 Layer 1 盤點間隔秒（預設 1800=30min）")
     p.add_argument("--once", action="store_true")
     p.add_argument("--no-startup-msg", action="store_true")
     return asyncio.run(amain(p.parse_args()))

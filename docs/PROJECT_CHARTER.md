@@ -6,7 +6,7 @@
 > - 與 [VISION.md](../VISION.md) 的關係：VISION.md 是你口述的「最高願景」（為什麼做、分潤精神、合規底線），**不輕易改動**。
 >   本章程是「執行層的活地圖」，會**經常更新**，把願景拆成可追蹤的工作項與進度。兩者衝突時以 VISION.md 為準。
 > - 維護人：Claude Code（執行長角色）。每次有重大進度或決策，更新本文件並在 git 留痕。
-> - 最後更新：2026-06-16（事實基準校正：v38 → v46；常駐 worker 25 → 26，補列 ceo_session）
+> - 最後更新：2026-06-18（v55：常駐 worker 28 → 30，新增 `okx_demo_operator` 模擬盤操盤手[task#39]＋`ceo_oversight` 監督員 Layer 1[task#40]；另建監督員 Layer 2 排程喚醒。前一輪校正：26 → 28，補列 `performance`、`cg_news`[v52]、`convergence_shadow`[v54-3]，修正 `narrative` 重複計數、`risk_manager` 實為邏輯閘模組非獨立 worker）
 
 ---
 
@@ -40,7 +40,7 @@
 | **L0** 純人工 | 人做、AI 不碰 | （無） |
 | **L1** AI 建議、人決策 | AI 分析給選項，人按鈕 | 三條紅線全部永遠停在這裡；調參建議、對外草稿 |
 | **L2** AI 執行、人事後可否決 | AI 自己做，留痕，人隨時喊停 | 模擬盤紙上下單、訊號推播、健康自癒重啟 |
-| **L3** AI 全自動、僅異常上報 | 正常不打擾人 | 26 個常駐 worker、崩潰自動重啟、資料品質降級告警 |
+| **L3** AI 全自動、僅異常上報 | 正常不打擾人 | 30 個常駐 worker、崩潰自動重啟、資料品質降級告警 |
 | **L4** AI 自我演化 | AI 改自己的策略/參數並上線 | **尚未開放**，且策略上線前永遠要回測+你核准（不會純 L4） |
 
 **「完全獨立自主」能達成到什麼程度？** 誠實的答案：
@@ -52,22 +52,26 @@
 
 ## 第四部分：現在我們有什麼（已建成，L3 常駐運轉中）
 
-機器人是一個 Python asyncio 常駐程式，目前有 **26 個被監督的 worker**（任何一個崩潰會自動重啟並發 Telegram 警報，不會全滅）。
-依職能分群：
+機器人是一個 Python asyncio 常駐程式，目前有 **30 個被監督的 worker**（任何一個崩潰會自動重啟並發 Telegram 警報，不會全滅）。
+依職能分群（下列各群人數相加 = 30，與 `run_bot.py` 的監督清單一致）：
 
-**A. 交易訊號核心**（5）：scheduler 掃描 → dispatcher 推播 → deepdive 交易計畫 → trade_monitor 持倉監控 → position_tracker 持倉快照
+**A. 交易訊號核心**（7）：scheduler 掃描 → dispatcher 推播 → deepdive 交易計畫 → trade_monitor 持倉監控 → position_tracker 持倉快照、performance 績效統計、`okx_demo_operator` 模擬盤操盤手（v55；鏡像新加密紙上訊號 → OKX 模擬盤實單，零真錢、x-simulated-trading=1 正向證明，驗證持倉真實性；DEMO_OPERATOR_ACTIVE 未開＝完全閒置）
 **B. 市場情報**（7）：daily_macro 每日宏觀、hourly_pulse 即時脈動、market_scanner 全市場異常掃描、econ_calendar 經濟數據、unlock_calendar 代幣解鎖、narrative 事件因果敘事、watchlist_refresh 每日重排
-**C. 消息面**（4）：truth_social（川普）、twitter_apify（增量抓取省成本）、us_news（美股快訊）、us_stocks/us_signals（美股永續）
-**D. AI 自治 Session（重點）**（7）：
+**C. 消息面**（6）：truth_social（川普）、twitter_apify（增量抓取省成本）、us_news（美股快訊）、us_stocks（美股盤面）、us_signals（美股永續訊號）、cg_news（CoinGlass 消息流）
+**D. AI 自治 Session（重點）**（8）：
   - `supervisor` 健康監督（每 5 分鐘體檢）
   - `auto_tuner` 調參 Session（每日分析紙上帳 → **只給參數建議**，不自動套用）
   - `backtest` 回測 Session（每週真實歷史回放，驗證啟用策略期望值）
   - `auditor` 稽核 Session（每小時自檢訊息路由/重複/明確性）
-  - `narrative` 敘事引擎（同時列於 B 群，實際為單一 worker）
   - `ledger_anchor` 帳本錨定（每週把帳本雜湊錨定到比特幣鏈上防竄改，只送 32 bytes 雜湊、不下單）
   - `ceo_session` CEO 監督 Session（每日 09:00 台北彙整單一簡報 + 需決策區；純讀不下單不對外發布）
-**E. 風控**：`risk_manager` — 單筆風險上限、同時持倉上限、相關族群上限、日 -3%/週 -7% 熔斷、經濟數據靜默期
-**F. 互動/系統**：interactive（按鈕＋指令）、threads_publisher（建造日誌，無 token 時待命）
+  - `convergence_shadow` 多所共振影子觀測（純讀確定性，接進 deepdive 卡片顯示層，不過 LLM、零訊號／零下單）
+  - `ceo_oversight` 監督員 Layer 1（v55；位階在 CEO 之上的**純讀守望者**，每 30 分盤點 CEO 進度寫 `oversight_ledger.json`，真停滯且過冷卻才發私人提醒；不下單、不改參數、不碰 daemon）
+**F. 互動/系統**（2）：interactive（按鈕＋指令）、threads_publisher（建造日誌，無 token 時待命）
+
+> **E. 風控（不計入 30）**：`risk_manager` 是被 scheduler/dispatcher **行內呼叫的邏輯閘模組**，不是獨立的常駐 worker，因此不計入上面的 30。它管：單筆風險上限、同時持倉上限、相關族群上限、日 -7.5%/週 -15% 熔斷、經濟數據靜默期。（`narrative` 雖然概念上跨 B/D 兩群，實際在 `run_bot.py` 只是單一 worker，已只計一次於 B 群。）
+
+> **監督員 Layer 2（排程喚醒，不計入 30）**：除了 in-daemon 的 `ceo_oversight`（Layer 1），另建一個 Claude Code 排程任務 `overseer-layer2-advance-ceo`（每 30 分喚醒一個全新 Claude session 主動推進 CEO）。它**只在 Claude Code app 開著時跑**（與 always-on 的 Layer 1 互補），且硬守三紅線（不下真錢單、不對外發布、不捏造、不自宣 Phase 0 解鎖）。
 
 **已驗證過的關鍵設計**：無前視偏誤的走查回測管線（v38）、返佣誠實分級標籤、SMC 四流派同源理解、Forum 6 主題路由。
 
@@ -103,7 +107,7 @@
 
 ## 第六部分：多 Session 組織設計（你問的「像有 PM / 財管 / 行銷 / CEO」）
 
-**原則：不另外蓋一個花俏的多進程框架**（那會增加你看不懂的複雜度與故障點）。我們已經有 26 個常駐 worker 的成熟監督架構，
+**原則：不另外蓋一個花俏的多進程框架**（那會增加你看不懂的複雜度與故障點）。我們已經有 30 個常駐 worker 的成熟監督架構，
 正確做法是**在這個架構上新增「角色型 Session」**，每個就是一個 asyncio worker，受同一套 supervise() 保護。
 
 ### 6.1 現有的「員工」（已上線）
@@ -186,6 +190,7 @@
 **Phase 0 解鎖閘門（硬條件，全部滿足才可進 Phase 1）**：
 - [ ] 紙上交易 ≥100 筆
 - [ ] 實倉交易 ≥30 筆
+> **「實倉」定義（2026-06-18 使用者授權「你來決定」拍板）**：此處「實倉 ≥30 筆」**只算真金白銀、由人親手按下的成交**（紅線①），目前 0/30。OKX **模擬盤（demo）操盤手**自動累積的成交雖然走真實 OKX 撮合、但金額為虛擬籌碼，**僅在 CEO 日報「透明揭露」其筆數與表現，不計入本解鎖門檻、不解鎖 Phase 1**。理由：保守起見不讓「模擬盤帳面」混充「真實實績」（紅線③），模擬盤的價值是**端到端跑通下單管線 + 觀測策略行為**，不是宣稱績效。`promotion_gate.phase0_status()` 之 live_n 只讀 `trades` 表（人按真錢），demo 成交獨立寫 `demo_trades` 表，程式本就如此（零程式變更）。
 - [ ] 上述樣本期望值為正（且通過顯著性檢驗）
 
 > **計數定義（2026-06-18 使用者拍板「算全部」）**：「紙上 ≥100 筆」＝**全部引擎已平倉紙上交易**（含加密永續＋美股訊號＋巨集），排除「從未成交」的 `entry_expired` 限價掛單（realized_r 一律 0、非真實交易）；**非**僅加密引擎。`promotion_gate.phase0_status()` 之 `_count_closed("paper_trades")` 即依此口徑（無資產別過濾），與本定義一致。
