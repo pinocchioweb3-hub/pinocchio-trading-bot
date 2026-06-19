@@ -32,6 +32,13 @@ import time
 
 from botpaths import PROJECT_ROOT, data_dir
 
+# 治理策略層（task #51）：PDP 新鮮度前置門 + 工具 allowlist + 死 schema。
+# 純策略、零 IO，import 失敗也不可拖垮守望迴圈，故包 try。
+try:
+    from . import overseer_policy as _op
+except Exception:
+    _op = None
+
 LEDGER_PATH = data_dir() / "oversight_ledger.json"
 
 # 停滯門檻：超過這麼久沒有新 commit（且沒卡在使用者身上）＝ STALLED。
@@ -261,7 +268,32 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         "pending_outbox": pending_outbox,
         "last_nudge_ms": last_nudge_ms,  # 沿用；發送後才更新
     }
+    # PDP 契約區塊（task #51）：把新鮮度合約寫進帳本，讓 Layer 2 知道
+    # 「多舊就不該據此行動」。Layer 2 讀取時須以 pdp_check_freshness() 重新校驗。
+    if _op is not None:
+        try:
+            snap["pdp"] = _op.build_pdp_block(now_ms)
+        except Exception:
+            pass
     return snap
+
+
+def pdp_check_freshness():
+    """PDP 確定性前置門（供 Layer 2 監督員在「行動前」自我把關，task #51）。
+
+    讀現有 oversight_ledger，以本機 UTC 時鐘校驗其 generated_at_ms 新鮮度。
+    回 (allow: bool, reasons: list[str])。allow=False ＝ 帳本不夠新鮮，
+    Layer 2 不應據此舊快照下結論／派工（「不拿舊快照下結論」的程式化版本）。
+
+    fail-closed：策略層缺席或讀檔失敗一律回 False（與全系統閘門 fail-closed 收斂一致）。
+    """
+    if _op is None:
+        return False, ["治理策略層 overseer_policy 缺席（fail-closed）"]
+    try:
+        d = _op.ledger_freshness(_read_ledger())
+        return d.allow, list(d.reasons)
+    except Exception as e:
+        return False, [f"PDP 校驗異常（fail-closed）：{type(e).__name__}: {e}"]
 
 
 # ===========================================================================
