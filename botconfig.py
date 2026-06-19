@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 
 _WARNINGS: list[str] = []
@@ -24,8 +25,11 @@ _WARNINGS: list[str] = []
 try:
     from botpaths import data_dir as _data_dir
     _SETTINGS_FILE = _data_dir() / "bot_settings.json"
+    # v56: 設定變更稽核軌跡（復盤引擎全自動化前置；每次寫入留 before/after/source/git_sha）
+    _AUDIT_FILE = _data_dir() / "config_audit.jsonl"
 except Exception:
     _SETTINGS_FILE = None
+    _AUDIT_FILE = None
 
 _OVERRIDES: dict = {}
 
@@ -41,15 +45,75 @@ def _load_overrides() -> None:
 
 
 def _raw(key: str):
-    """取原始字串值：override 優先，再 env。"""
+    """取原始字串值：override 優先，再 env。
+
+    v56：``SHADOW_`` 前綴鍵仍隔離於熱路徑（一律回 None，只能用 get_shadow 讀）。這原是
+    step0 寫入鎖的一環；使用者 2026-06-20 移除寫入鎖後，SHADOW_ 不再是「自動端唯一能寫」
+    的安全邊界（自動優化器現可直接寫活鍵讓優化即時生效），而降為**選用的暫存區**——供
+    champion/challenger 把『提議但尚未晉升』的參數先擱在 SHADOW_*、過統計閘後再寫成活鍵。
+    保留此隔離無害且對分階段晉升有用。（紅線①的真正邊界在執行層而非此處——見 set_override。）"""
+    if key.startswith("SHADOW_"):
+        return None
     if key in _OVERRIDES and _OVERRIDES[key] not in (None, ""):
         return str(_OVERRIDES[key])
     return os.getenv(key)
 
 
-def set_override(key: str, value) -> None:
-    """寫入執行期覆寫並持久化（選單用）。"""
+def _git_sha() -> str:
+    """目前 repo 短 commit（稽核軌跡用）。取不到一律回 'unknown'，絕不拋例外。"""
+    try:
+        import subprocess
+        from pathlib import Path
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True, text=True, timeout=3)
+        sha = (out.stdout or "").strip()
+        return sha if sha else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _audit_write(key: str, before, after, source: str) -> None:
+    """附加一行 JSONL 設定變更稽核軌跡。永不因稽核失敗影響主流程（fail-safe）。"""
+    if not _AUDIT_FILE:
+        return
+    try:
+        rec = {
+            "ts_ms": int(time.time() * 1000),
+            "key": key,
+            "before": before,
+            "after": after,
+            "source": source,
+            "git_sha": _git_sha(),
+        }
+        with open(_AUDIT_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def set_override(key: str, value, *, source: str = "auto") -> None:
+    """寫入執行期覆寫並持久化。
+
+    v56 政策（使用者 2026-06-20 拍板**移除** step0 寫入鎖）：
+      自動優化器（復盤／回測／分析綜合數據評估後）可**直接寫任何鍵**——含影響模擬盤
+      行為的「活鍵」（槓桿／風險／策略開關）——讓優化結果即時生效，而非只寫永不生效的
+      影子鍵。理由：現在跑的是模擬盤、不是真金白銀；只寫影子＝改得好看卻永不生效，錯誤
+      參數會一直錯下去。把關靠**統計嚴謹度**（L2 stats／回測顯著性）而非人工逐次點頭。
+
+    透明（紅線③）：每次寫入都留稽核軌跡（before/after/source/git_sha），供每日 CEO
+      報告浮現「改了什麼／為何／依據哪些回測」，並可事後 revert_key 回滾——解決「變更被
+      埋著、忙時看不到也改不到」的痛點。source 僅作稽核標註（human=/settings 親手按；
+      auto=程式／優化器）。
+
+    紅線①（真錢下單／轉帳 AI 永不自動執行）**不受影響**——它在『執行層』把關：真錢只能
+      人工手動執行（okx-trade-mcp 全庫零呼叫＋黑名單），自動端 config 只驅動訊號／paper／
+      OKX-demo 模擬盤，活鍵物理上到不了真錢執行層（三票對抗驗證 refuted=0、confidence
+      high）。活鍵仍受 BotConfig.from_env 的範圍夾擠（如 leverage∈[1,50]、risk_pct≤20）
+      保護——那是『範圍安全』非『寫入鎖』，保留。"""
     _load_overrides()
+    before = _OVERRIDES.get(key)
     _OVERRIDES[key] = value
     if _SETTINGS_FILE:
         try:
@@ -57,7 +121,59 @@ def set_override(key: str, value) -> None:
                                                  indent=2), encoding="utf-8")
         except Exception:
             pass
+    _audit_write(key, before, value, source)
     reload()
+
+
+def get_shadow(key: str, default=None):
+    """讀取影子鍵（``SHADOW_*``）。僅供復盤/優化引擎讀回自己寫的建議參數；這些鍵被
+    _raw 物理隔離，永不進入實盤熱路徑。傳入非 SHADOW_ 鍵一律拒讀（防誤把影子當活鍵用）。"""
+    if not key.startswith("SHADOW_"):
+        raise ValueError(f"get_shadow 只接受 SHADOW_* 鍵，收到 {key!r}")
+    _load_overrides()
+    v = _OVERRIDES.get(key)
+    return v if v not in (None, "") else default
+
+
+def revert_key(key: str, *, source: str = "human") -> bool:
+    """人工回滾：把某鍵還原成稽核軌跡中「最後一次非回滾寫入之前」的值。
+    回 True＝有還原；找不到歷史回 False。僅限人工（與 set_override 同鎖）。"""
+    if source != "human":
+        raise PermissionError("revert_key 僅限人工（source='human'）")
+    if not _AUDIT_FILE or not _AUDIT_FILE.exists():
+        return False
+    last_before = None
+    found = False
+    try:
+        for line in _AUDIT_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("key") == key and rec.get("source") != "revert":
+                last_before = rec.get("before")
+                found = True
+    except Exception:
+        return False
+    if not found:
+        return False
+    _load_overrides()
+    if last_before is None:
+        _OVERRIDES.pop(key, None)
+    else:
+        _OVERRIDES[key] = last_before
+    if _SETTINGS_FILE:
+        try:
+            _SETTINGS_FILE.write_text(json.dumps(_OVERRIDES, ensure_ascii=False,
+                                                 indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    _audit_write(key, "<revert>", last_before, "revert")
+    reload()
+    return True
 
 
 _load_overrides()

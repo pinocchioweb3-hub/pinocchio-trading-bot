@@ -173,7 +173,30 @@ async def _place_one(ex, signal, *, avail_usd, tg=None) -> dict:
     stop = float(signal["stop_price"])
     seq = signal.get("fire_id") or f"p{signal['id']}"     # 持久 seq（intent_id 用，跨時去重）
 
-    spec = await dt.fetch_okx_contract_spec(ex, symbol)   # 真實 ctVal/lotSz/minSz
+    # v56 #54 治本：標的不在 OKX 永續宇宙（ex.market 丟 BadSymbol）→ 寫一筆 rejected
+    # 審計痕跡，而非讓例外逸出被 _intake 當無名 error 靜默漏記。這讓高水位能安全前進、
+    # 同一訊號不每輪重試，且「為何沒鏡像到模擬盤」在 demo_trades 帳本可見可歸因（解決
+    # 「資料沉沒看不到」）。只攔『確定不在 OKX』的 BadSymbol/BadRequest；網路/超時等
+    # 暫時性錯誤照舊往上拋，不誤把有效訊號永久標 rejected。
+    try:
+        spec = await dt.fetch_okx_contract_spec(ex, symbol)   # 真實 ctVal/lotSz/minSz
+    except Exception as e:  # noqa: BLE001
+        if type(e).__name__ not in ("BadSymbol", "BadRequest"):
+            raise                                            # 暫時性 → 交由上層計 error、下輪重試
+        rej_intent = f"noinstr:{seq}"
+        if not dj.intent_exists(rej_intent):
+            dj.record_demo_entry(
+                intent_id=rej_intent, cl_ord_id=f"x{seq}",
+                paper_id=signal["id"], fire_id=signal.get("fire_id"),
+                symbol=symbol, setup=signal.get("setup"), direction=direction,
+                entry_price=entry, stop_price=stop,
+                tp1=signal.get("tp1"), tp2=signal.get("tp2"), tp3=signal.get("tp3"),
+                leverage=0, notional_usd=0.0, margin_usd=0.0, contracts=0.0,
+                ct_val=0.0, risk_usd=0.0, entry_order_id=None,
+                regime=signal.get("regime"), status="rejected",
+                exit_reason="reject:not_on_okx",
+                note=f"標的不在 OKX 永續宇宙：{type(e).__name__}")
+        return {"placed": False, "reason": "not_on_okx"}
     plan = dt.build_order_plan(
         symbol, direction, entry, stop,
         atr_pct_7d=None, ct_val=spec["ct_val"], lot_sz=spec["lot_sz"],
