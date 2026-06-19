@@ -1258,6 +1258,172 @@ class CoinGlassSource:
         return out
 
     # =====================================================================
+    # v56 預留端點（尚未接入 confluence）：已付費($79 Startup)但目前無呼叫者的
+    # 「綜合宏觀」端點。⚠️ 誠實註記：macro_confluence._collect_components 目前
+    # 並未呼叫以下任一方法（macro 分數只用既有 funding/OI/清算/巨鯨/ETF 代理）。
+    # 這 5 個方法是為日後擴 _WEIGHTS / A-B 校準而預留的純讀骨架，接入前不影響任何輸出。
+    # ---------------------------------------------------------------------
+    # 設計鐵則（與本檔既有方法一致）：
+    #   * 全部走 self._get（共用限流器 + TTL 快取 + 退避重試），不另開額度。
+    #   * 任何失敗一律回 make_error dict（不 raise）；日後接入時，上層對缺料分量
+    #     一律「中性化」（不臆測方向），故路徑/欄位日後微調也優雅降級。
+    #   * 純讀，零下單路徑（紅線①）。
+    #   * ⚠️ 不得改動上方任何既有方法/簽名（純附加）。
+    # 端點路徑依 CoinGlass v4 文件 + 權益實測（trading-bot-coinglass-entitlements）。
+    # =====================================================================
+    async def get_coinbase_premium_index(self, interval: str = "1h",
+                                         limit: int = 24) -> dict:
+        """Coinbase 溢價指數歷史：美國現貨買壓代理（>0＝美國買盤強＝偏多）。
+
+        回 {"source","latest","series":[{ts,value}]}；失敗回 make_error dict。
+        """
+        r = await self._get(
+            "/api/coinbase-premium-index/history",
+            {"interval": interval, "limit": min(max(limit, 1), 500)},
+            tool="mi_get_coinbase_premium",
+        )
+        if r.get("error"):
+            return r
+        data = r.get("data") or []
+        series = []
+        for d in data:
+            # 文件常見欄位 premium / premium_rate / close 任一存在即取
+            v = self._to_float(
+                d.get("premium_rate") if d.get("premium_rate") is not None
+                else (d.get("premium") if d.get("premium") is not None
+                      else d.get("close")))
+            if v is not None:
+                series.append({"ts": self._extract_ts(d), "value": v})
+        if not series:
+            return make_error(tool="mi_get_coinbase_premium", symbol=None,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no coinbase premium data")
+        return {"source": "coinglass", "latest": series[-1]["value"],
+                "series": series}
+
+    async def get_coin_netflow(self, symbol: str = "BTC",
+                               interval: str = "1h", limit: int = 24) -> dict:
+        """交易所淨流（futures/coin/netflow）：>0＝資金流入交易所（潛在賣壓）、
+        <0＝流出（提幣冷錢包＝偏多）。注意文件 overview 曾有 typo `furures`，
+        實際路徑為 /api/futures/coin/netflow。
+
+        回 {"symbol","source","latest","series":[{ts,value}]}；失敗回 make_error。
+        """
+        agg_sym = self._agg_symbol(symbol)
+        r = await self._get(
+            "/api/futures/coin/netflow",
+            {"symbol": agg_sym, "interval": interval,
+             "limit": min(max(limit, 1), 500)},
+            tool="mi_get_coin_netflow", symbol=symbol,
+        )
+        if r.get("error"):
+            return r
+        data = r.get("data") or []
+        series = []
+        for d in data:
+            v = self._to_float(
+                d.get("netflow_usd") if d.get("netflow_usd") is not None
+                else (d.get("netflow") if d.get("netflow") is not None
+                      else d.get("close")))
+            if v is not None:
+                series.append({"ts": self._extract_ts(d), "value": v})
+        if not series:
+            return make_error(tool="mi_get_coin_netflow", symbol=symbol,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no netflow data")
+        return {"symbol": symbol, "source": "coinglass",
+                "latest": series[-1]["value"], "series": series}
+
+    async def get_bitcoin_dominance(self, limit: int = 30) -> dict:
+        """BTC.D（比特幣市占率）歷史：上升＝資金回流 BTC（山寨偏弱）。
+
+        回 {"source","latest","series":[{ts,value}]}；失敗回 make_error dict。
+        """
+        r = await self._get(
+            "/api/index/bitcoin-dominance",
+            {"limit": min(max(limit, 1), 500)},
+            tool="mi_get_btc_dominance",
+        )
+        if r.get("error"):
+            return r
+        data = r.get("data") or []
+        series = []
+        for d in data:
+            v = self._to_float(
+                d.get("bitcoin_dominance") if d.get("bitcoin_dominance") is not None
+                else (d.get("dominance") if d.get("dominance") is not None
+                      else d.get("close")))
+            if v is not None:
+                series.append({"ts": self._extract_ts(d), "value": v})
+        if not series:
+            return make_error(tool="mi_get_btc_dominance", symbol=None,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no dominance data")
+        return {"source": "coinglass", "latest": series[-1]["value"],
+                "series": series}
+
+    async def get_altcoin_season(self, limit: int = 30) -> dict:
+        """Altcoin Season Index（0-100）：>75＝山寨季、<25＝比特幣季。
+
+        回 {"source","latest","label","series":[{ts,value}]}；失敗回 make_error。
+        """
+        r = await self._get(
+            "/api/index/altcoin-season",
+            {"limit": min(max(limit, 1), 500)},
+            tool="mi_get_altcoin_season",
+        )
+        if r.get("error"):
+            return r
+        data = r.get("data") or []
+        series = []
+        for d in data:
+            v = self._to_float(
+                d.get("altcoin_index") if d.get("altcoin_index") is not None
+                else (d.get("altcoin_season") if d.get("altcoin_season") is not None
+                      else (d.get("value") if d.get("value") is not None
+                            else d.get("close"))))
+            if v is not None:
+                series.append({"ts": self._extract_ts(d), "value": v})
+        if not series:
+            return make_error(tool="mi_get_altcoin_season", symbol=None,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no altcoin season data")
+        latest = series[-1]["value"]
+        label = ("山寨季" if latest >= 75 else
+                 ("比特幣季" if latest <= 25 else "中性"))
+        return {"source": "coinglass", "latest": latest, "label": label,
+                "series": series}
+
+    async def get_bitcoin_vs_m2(self, region: str = "global",
+                                limit: int = 60) -> dict:
+        """BTC 價格 vs 全球/美國 M2 貨幣供給（流動性週期對照）。
+        region: global | us。M2 擴張通常為風險資產順風。
+
+        回 {"source","region","series":[{ts,price,m2}]}；失敗回 make_error dict。
+        """
+        reg = "us" if str(region).lower() == "us" else "global"
+        path = ("/api/index/bitcoin-vs-us-m2" if reg == "us"
+                else "/api/index/bitcoin-vs-global-m2")
+        r = await self._get(path, {"limit": min(max(limit, 1), 500)},
+                            tool="mi_get_btc_vs_m2")
+        if r.get("error"):
+            return r
+        data = r.get("data") or []
+        series = []
+        for d in data:
+            price = self._to_float(d.get("price"))
+            m2 = self._to_float(
+                d.get("m2") if d.get("m2") is not None else d.get("m2_supply"))
+            if price is None and m2 is None:
+                continue
+            series.append({"ts": self._extract_ts(d), "price": price, "m2": m2})
+        if not series:
+            return make_error(tool="mi_get_btc_vs_m2", symbol=None,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no btc-vs-m2 data")
+        return {"source": "coinglass", "region": reg, "series": series}
+
+    # =====================================================================
     async def health(self) -> dict:
         if not self.api_key:
             return {"ok": False, "source": "coinglass", "details": "API key missing"}

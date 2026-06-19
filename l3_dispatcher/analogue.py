@@ -13,11 +13,18 @@
 from __future__ import annotations
 
 import asyncio
-from statistics import mean, median
+import datetime as dt
+from statistics import mean, median, pstdev
 
 SL_PCT = 4.0          # 與實盤 intraday 止損一致
 FORWARD_BARS = 12     # 向前模擬 12 根 1h
 MIN_SAMPLES = 8
+
+# ── 跨年類比（Session B）參數 ──────────────────────────────────────────
+CY_TF = "1d"              # 跨年類比用日線（年級可行；綜合指標跨年取不到→只用價格）
+CY_WINDOW_BARS = 30       # 「當下情境」與「歷史月窗」各取 30 根日線（≈1 個月）
+CY_LOOKBACK_DAYS = 1500   # 回看年數（BTC/ETH/SOL 有 ~3 年；其餘較短自動截斷）
+CY_MIN_HISTORY = 120      # 至少要這麼多根日線才做跨年類比，否則「資料不足」
 
 
 def _vol_mult_at(bars: list[dict], i: int, window: int = 24) -> float | None:
@@ -154,6 +161,147 @@ def render_analogue_line(stats: dict | None) -> str:
             f"<code>{stats['win_rate_pct']:.0f}%</code>｜"
             f"平均 <code>{stats['avg_r']:+.2f}R</code> {icon}｜"
             f"中位 <code>{stats['median_hold_h']:.0f}h</code>")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 跨年歷史類比（Session B）：「今年最像 20XX 年 X 月」
+#   只用純價格層（年級可行；CoinGlass 綜合指標跨年取不到，不碰、不假裝有）。
+#   ⚠️嚴禁前視（沿用 smc_walkforward 三鐵律精神）：
+#     1) 歷史候選月窗必須「結束於當下窗起點之前」(end_idx < cur_start)，
+#        絕不納入任何 ts ≥ 當下窗的根。
+#     2) 特徵向量只由窗內各根算出，不看窗後任何資料。
+#     3) 不在比對迴圈內呼叫即時 fetcher（一次預抓整條年級序列，用索引切片）。
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _window_features(bars: list[dict], start: int, end: int) -> list[float] | None:
+    """算 bars[start:end] 這段的標準化情境特徵向量（純價格）。
+    特徵：累積報酬、平均日波幅、波動度(報酬std)、最大回撤、單調趨勢比例。
+    任何根缺價回 None。⚠️只用 [start:end) 窗內資料，無前視。"""
+    seg = bars[start:end]
+    if len(seg) < 5:
+        return None
+    closes = [b["close"] for b in seg]
+    if any(c <= 0 for c in closes):
+        return None
+    rets = [(closes[k] / closes[k - 1] - 1) for k in range(1, len(closes))]
+    cum_ret = closes[-1] / closes[0] - 1
+    rng = [((b["high"] - b["low"]) / b["close"]) for b in seg if b["close"] > 0]
+    avg_range = mean(rng) if rng else 0.0
+    vol = pstdev(rets) if len(rets) >= 2 else 0.0
+    # 最大回撤（窗內）
+    peak = closes[0]
+    max_dd = 0.0
+    for c in closes:
+        peak = max(peak, c)
+        max_dd = max(max_dd, (peak - c) / peak if peak > 0 else 0.0)
+    up = sum(1 for r in rets if r > 0)
+    trend = (up / len(rets)) if rets else 0.5     # 0.5=無方向；>0.5 偏多
+    return [cum_ret, avg_range, vol, max_dd, trend]
+
+
+def _similarity(a: list[float], b: list[float]) -> float:
+    """兩特徵向量的相似度 0..1（用尺度歸一後的歐氏距離轉換）。越接近 1 越像。"""
+    # 各維尺度差異大 → 用粗略尺度權重歸一（經驗值，純比較相對遠近）
+    scale = [0.30, 0.03, 0.03, 0.20, 0.50]   # cum_ret/avg_range/vol/max_dd/trend
+    d2 = 0.0
+    for ai, bi, s in zip(a, b, scale):
+        d2 += ((ai - bi) / s) ** 2
+    dist = d2 ** 0.5
+    return 1.0 / (1.0 + dist)
+
+
+def compute_crossyear_analogue(bars: list[dict],
+                               window: int = CY_WINDOW_BARS) -> dict | None:
+    """核心純函式：給年級日線 bars（升序）→ 找「當下窗最像歷史哪個月窗」。
+
+    當下窗 = 最後 window 根；候選歷史月窗 = 任何「結束於當下窗起點之前」的 window 根。
+    回 {best_month, best_year, similarity_pct, n_candidates, forward_after_best, ...}
+    forward_after_best = 該歷史最像月窗「之後」window 根的純價格報酬（誠實：那是
+    歷史接下來真的發生了什麼，僅供參考、非預測）。資料不足回 None 或 insufficient。"""
+    n = len(bars)
+    if n < CY_MIN_HISTORY or n < window * 2 + 2:
+        return {"insufficient": True, "n": n}
+    cur_start = n - window
+    cur_feat = _window_features(bars, cur_start, n)
+    if cur_feat is None:
+        return {"insufficient": True, "n": n}
+
+    best = None   # (sim, end_idx)
+    step = max(1, window // 3)   # 候選窗以 step 滑動，降重疊
+    end = cur_start              # 鐵律①：候選窗必須結束於當下窗起點之前
+    candidates = 0
+    e = window
+    while e <= end:
+        feat = _window_features(bars, e - window, e)
+        if feat is not None:
+            sim = _similarity(cur_feat, feat)
+            candidates += 1
+            if best is None or sim > best[0]:
+                best = (sim, e)
+        e += step
+    if best is None:
+        return {"insufficient": True, "n": n}
+
+    sim, best_end = best
+    # 最像月窗的中心日期當「年/月」標籤
+    center_ts = bars[max(0, best_end - window // 2)]["ts"]
+    cdt = dt.datetime.fromtimestamp(center_ts / 1000, dt.timezone.utc)
+    # 該歷史月窗之後 window 根的純價格報酬（鐵律①：best_end ≤ cur_start，故 forward 全在過去）
+    fwd = None
+    fwd_end = min(best_end + window, cur_start)
+    if fwd_end - best_end >= max(5, window // 3):
+        c0 = bars[best_end - 1]["close"]
+        c1 = bars[fwd_end - 1]["close"]
+        if c0 > 0:
+            fwd = round((c1 / c0 - 1) * 100, 1)
+    return {
+        "best_year": cdt.year,
+        "best_month": cdt.month,
+        "similarity_pct": round(sim * 100, 0),
+        "n_candidates": candidates,
+        "window_bars": window,
+        "forward_after_best_pct": fwd,   # 歷史「最像月」之後 ~1 個月的實際走勢（純參考）
+        "cur_cum_ret_pct": round(cur_feat[0] * 100, 1),
+        "cur_trend": round(cur_feat[4], 2),
+    }
+
+
+async def crossyear_analogue(symbol: str, timeout_sec: float = 15.0) -> dict | None:
+    """抓年級日線 → 跨年類比「今年最像 20XX 年 X 月」。任何失敗回 None（不阻塞）。
+    走 backtest.data_loader（Binance 年級、免 key、純讀）。綜合指標不碰。"""
+    try:
+        async def _run():
+            from backtest.data_loader import get_ohlc
+            bars = await get_ohlc(symbol, CY_TF, CY_LOOKBACK_DAYS)
+            if not bars:
+                return None
+            return compute_crossyear_analogue(bars)
+        return await asyncio.wait_for(_run(), timeout=timeout_sec)
+    except Exception:
+        return None
+
+
+_MONTH_ZH = ["", "1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月",
+             "9月", "10月", "11月", "12月"]
+
+
+def render_crossyear_line(stats: dict | None) -> str:
+    """渲染「今年最像 20XX 年 X 月」附註行（純顯示；帶誠實標示）。"""
+    if stats is None:
+        return ("\n🗓️ <i>跨年類比：數據暫不可用（純價格層；綜合指標跨年取不到）</i>")
+    if stats.get("insufficient"):
+        return ("\n🗓️ <i>跨年類比：年級歷史不足，無法比對（純價格層）</i>")
+    yr = stats["best_year"]
+    mo = _MONTH_ZH[stats["best_month"]] if 1 <= stats["best_month"] <= 12 else f"{stats['best_month']}月"
+    sim = stats["similarity_pct"]
+    fwd = stats.get("forward_after_best_pct")
+    fwd_txt = ""
+    if fwd is not None:
+        icon = "🟢" if fwd > 0 else "🔴"
+        fwd_txt = f"｜那之後約 1 個月實際 <code>{fwd:+.1f}%</code> {icon}"
+    return (f"\n🗓️ <b>跨年類比</b>（純價格層）：當下走勢最像 "
+            f"<code>{yr} 年 {mo}</code>（相似度 <code>{sim:.0f}%</code>）{fwd_txt}"
+            f"\n   <i>⚠️ 僅比對價格形態，未含 OI/CVD/資金費（跨年取不到）；歷史相似≠未來重演</i>")
 
 
 if __name__ == "__main__":

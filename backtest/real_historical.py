@@ -44,6 +44,14 @@ from .simulator import simulate
 
 _BTC_GATE_SERIES: list | None = None
 
+# ── Session B：跨年純價格層誠實橫幅（任何用 yearscale 來源的報告都必須帶）──
+YEARSCALE_HONESTY_BANNER = (
+    "⚠️ 跨年回測＝純價格層：只用 OHLC（價格/量/結構/ATR）。"
+    "CoinGlass 綜合指標（OI/CVD/funding/多空比）每個 history 端點硬卡 500 根、"
+    "present-anchored、無時間分頁 → 跨年「綜合指標」歷史物理上做不到，"
+    "故年級回測的 funding/OI/positioning 一律中性化（不是真值、不可解讀為當時市況）。"
+)
+
 
 async def _btc_gate_series() -> list:
     """v33: 取 BTC 4h 200MA 序列當回測 btc_gate 真值（取代寫死 True，那會嚴重高估）。
@@ -77,12 +85,145 @@ def _btc_gate_at(series: list, ts: int) -> bool:
     return bool(val)
 
 
+# ── Session B：跨年純價格層 BTC 200MA 閘門（不受 OKX 300 根上限）──────────
+_BTC_GATE_SERIES_YS: dict[str, list] = {}
+
+
+async def _btc_gate_series_yearscale(days: int, tf: str = "4h") -> list:
+    """年級版 BTC 4h 200MA 閘門序列。走 data_loader.get_ohlc（Binance 年級、分頁），
+    取代只能拉 300 根的 OKX 端點。回 [(ts_ms, above_200ma 或 None)] 升序。
+    按 (days,tf) 快取，整批回測只算一次。"""
+    from .data_loader import get_ohlc
+    key = f"{tf}:{days}"
+    cached = _BTC_GATE_SERIES_YS.get(key)
+    if cached is not None:
+        return cached
+    try:
+        candles = await get_ohlc("BTC", tf, days + 40)   # +40 暖機 200MA
+        closes = [c["close"] for c in candles]
+        out = []
+        for i, c in enumerate(candles):
+            out.append((c["ts"], (c["close"] > sum(closes[i - 199:i + 1]) / 200)
+                        if i >= 199 else None))
+        _BTC_GATE_SERIES_YS[key] = out
+    except Exception:
+        _BTC_GATE_SERIES_YS[key] = []
+    return _BTC_GATE_SERIES_YS[key]
+
+
+def _build_points_from_ohlc(symbol: str, candles: list[dict],
+                            btc_gate_series: list) -> list[HistoryPoint]:
+    """從純價格 OHLC（年級可行）組 HistoryPoint。
+
+    與 fetch_real_history 的價格層因子（cvd_slope 量能代理 / cvd_div / ATR7d /
+    higher_lows / oi_delta）邏輯完全一致；但綜合指標（OI/funding/positioning）
+    跨年取不到 → 全部中性化（oi=0、funding=0、ratio=1.0、cvd=0），並依賴
+    YEARSCALE_HONESTY_BANNER 說明這不是真值。
+
+    ⚠️ tf 假設：cvd_div / ATR7d / higher_lows 的「24 根=1 天、168 根=7 天」是
+    1h 慣例。年級來源建議用 4h（窗口會自然對應更長真實時長，純為波動度代理仍合理）。"""
+    points: list[HistoryPoint] = []
+    for i, c in enumerate(candles):
+        ts = c["ts"]
+        gate = _btc_gate_at(btc_gate_series, ts)
+        # cvd_slope：用近 6 根 up/down 量能差代理（無 trade-level CVD），與既有一致
+        if i >= 5:
+            recent = candles[max(0, i - 5):i + 1]
+            up_vol = sum(r.get("volume", 0) or 0 for r in recent if r["close"] > r["open"])
+            down_vol = sum(r.get("volume", 0) or 0 for r in recent if r["close"] < r["open"])
+            tot = up_vol + down_vol
+            cvd_slope = (up_vol - down_vol) / tot if tot > 0 else 0
+        else:
+            cvd_slope = 0
+        if i >= 5:
+            price_chg = (c["close"] - candles[i - 5]["close"]) / candles[i - 5]["close"] * 100
+            if price_chg <= 0.5 and cvd_slope > 0.2:
+                cvd_div = "bull"
+            elif price_chg >= -0.5 and cvd_slope < -0.2:
+                cvd_div = "bear"
+            else:
+                cvd_div = "none"
+        else:
+            cvd_div = "none"
+        if i >= 168:
+            recent7d = candles[i - 168:i]
+            highs = [r["high"] for r in recent7d]
+            lows = [r["low"] for r in recent7d]
+            atr_pct_7d = (max(highs) - min(lows)) / c["close"] * 100
+            daily_lows = []
+            for d_start in range(0, 168, 24):
+                d_bars = recent7d[d_start:d_start + 24]
+                if d_bars:
+                    daily_lows.append(min(b["low"] for b in d_bars))
+            ascending = sum(1 for j in range(1, len(daily_lows))
+                            if daily_lows[j] > daily_lows[j - 1])
+            higher_lows = ascending >= 4
+        else:
+            atr_pct_7d = 5.0
+            higher_lows = False
+        points.append(HistoryPoint(
+            ts=ts, symbol=symbol, price=c["close"],
+            high=c["high"], low=c["low"],
+            # ── 綜合指標跨年取不到 → 中性化（見 YEARSCALE_HONESTY_BANNER）──
+            oi=0, oi_delta_pct=0,
+            funding=0, funding_predicted=0,
+            cvd=0, cvd_slope=cvd_slope, cvd_price_divergence=cvd_div,
+            top_trader_ratio=1.0, ls_ratio=1.0,
+            liq_long=0, liq_short=0,
+            btc_gate_open=gate,
+            btc_regime="trend_up" if gate else "trend_down",
+            above_4h_200ma=gate,
+            is_hot=True, strength_score=70,
+            atr_pct_7d=atr_pct_7d, vol_24h_vs_30d=1.0,
+            cvd_slope_7d=cvd_slope * 5,
+            top_trader_slope_7d=0.0, oi_delta_7d_pct=0.0,
+            higher_lows_7d=higher_lows,
+            event_tag="yearscale_priceonly",
+        ))
+    return points
+
+
+async def fetch_real_history_yearscale(symbol: str, days: int = 365,
+                                       tf: str = "4h") -> list[HistoryPoint]:
+    """【純價格層年級來源】從 data_loader.get_ohlc（Binance 年級 K）組 HistoryPoint。
+
+    與 fetch_real_history 的差異（誠實）：
+        - 價格/量/結構/ATR：真值（年級可行）。
+        - OI / funding / positioning / CVD：中性化（跨年物理上取不到，見橫幅）。
+    顯式呼叫才走這條；既有 fetch_real_history 與週回測排程行為完全不變。"""
+    candles = await get_ohlc_yearscale(symbol, tf, days)
+    if len(candles) < 200:
+        print(f"    [skip] {symbol} 年級 {tf} 只有 {len(candles)} 根，不足")
+        return []
+    btc_gate = await _btc_gate_series_yearscale(days, "4h")
+    return _build_points_from_ohlc(symbol, candles, btc_gate)
+
+
+async def get_ohlc_yearscale(symbol: str, tf: str, days: int) -> list[dict]:
+    """薄包裝 data_loader.get_ohlc（讓本模組單一進入點便於測試/replace）。"""
+    from .data_loader import get_ohlc
+    return await get_ohlc(symbol, tf, days)
+
+
 async def fetch_real_history(
     symbol: str,
     days: int = 30,
     cg: CoinGlassSource | None = None,
+    *,
+    price_only_yearscale: bool = False,
+    yearscale_tf: str = "4h",
 ) -> list[HistoryPoint]:
-    """從多源拉真實歷史，組成 HistoryPoint 序列（每小時 1 個）"""
+    """從多源拉真實歷史，組成 HistoryPoint 序列（每小時 1 個）
+
+    Session B 附加（向後相容、預設關閉）：
+        price_only_yearscale=True → 改走純價格層年級來源（data_loader Binance 年級 K），
+        綜合指標中性化。⚠️只有顯式開啟才改行為；預設 False 時下方多源邏輯完全不變，
+        既有呼叫者（replay_real / backtest_session 週回測）零影響。
+    """
+    if price_only_yearscale:
+        # 純價格層年級分支：不碰 CoinGlass（綜合指標跨年取不到，已中性化）。
+        return await fetch_real_history_yearscale(symbol, days, yearscale_tf)
+
     if cg is None:
         cg = CoinGlassSource()
 
@@ -269,6 +410,183 @@ async def replay_real(history: list[HistoryPoint], config, future_window: int = 
         )
         trades.append(outcome)
     return trades, fires
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Session B 附加能力（只建骨架、不改線上行為）：歷史價格層 A/B 回測
+#   D6 = 進場區寬度（entry-zone width）：限價掛在 close 的 X% 折讓，未觸不進場。
+#   D7 = trailing vs 固定 R：對同一批進場點比較「固定 R 出場」vs「ATR/百分比追蹤」。
+# 都走純價格層年級 OHLC（誠實＝跨年可行）；只用 simulator 既有 OHLC 邏輯，零下單。
+# 這些是「能力骨架」：協調者可日後接到結構/類比訊號產生器上跑成對比較。
+# ═══════════════════════════════════════════════════════════════════════════
+from .metrics import aggregate as _aggregate          # noqa: E402
+from .validation import assess as _assess              # noqa: E402
+
+
+def _entry_signals_from_candles(candles: list[dict], *, brk_lookback: int = 20,
+                                vol_window: int = 20, vol_z_min: float = 1.8,
+                                warmup: int = 60) -> list[dict]:
+    """純價格層的簡易進場訊號產生器（突破 + 爆量），供 A/B 骨架共用同一批進場點。
+    回 [{idx, direction}]。⚠️無前視：每根 i 只看 candles[:i+1]。"""
+    n = len(candles)
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    closes = [c["close"] for c in candles]
+    vols = [c.get("volume", 0) or 0 for c in candles]
+    sigs = []
+    for i in range(max(warmup, brk_lookback, vol_window), n - 1):
+        vma = (sum(vols[i - vol_window:i]) / vol_window) or 1e-9
+        if vols[i] / vma < vol_z_min:
+            continue
+        prior_high = max(highs[i - brk_lookback:i])
+        prior_low = min(lows[i - brk_lookback:i])
+        if closes[i] > prior_high:
+            sigs.append({"idx": i, "direction": "bull"})
+        elif closes[i] < prior_low:
+            sigs.append({"idx": i, "direction": "bear"})
+    return sigs
+
+
+def _summary(trades: list, n_trials: int = 1) -> dict:
+    m = _aggregate(trades)
+    va = _assess([t.realized_r for t in trades], n_trials=n_trials)
+    return {"n": m.n_trades, "win_rate": round(m.win_rate * 100, 1),
+            "expectancy_r": round(m.expectancy_r, 4),
+            "profit_factor": round(m.profit_factor, 2),
+            "max_consec_losses": m.max_consecutive_losses,
+            "psr": va.get("psr"), "min_trl": va.get("min_trl"),
+            "verdict": va.get("verdict")}
+
+
+async def ab_entry_zone_width(symbol: str, days: int = 365, tf: str = "4h",
+                              widths_pct=(0.0, 0.5, 1.0, 1.5),
+                              sl_pct: float = 4.0, tp_r=(1.0, 1.5, 2.0),
+                              hold_max: int = 48, fill_window: int = 6) -> dict:
+    """D6 骨架：比較不同「進場區折讓寬度」對期望值的影響（純價格層、年級）。
+
+    對同一批突破訊號：width=0 → 市價進（close）；width=X% → 限價掛在 close 的
+    X% 折讓（多單往下、空單往上），未來 fill_window 根內觸及才算進場，否則放棄。
+    回 {width_pct: summary}。誠實：未模擬部分成交/排隊，僅觸價即視為成交。"""
+    candles = await get_ohlc_yearscale(symbol, tf, days)
+    if len(candles) < 200:
+        return {"error": f"insufficient ({len(candles)} bars)", "honesty": YEARSCALE_HONESTY_BANNER}
+    sigs = _entry_signals_from_candles(candles)
+    n = len(candles)
+    out: dict = {"_meta": {"symbol": symbol, "tf": tf, "days": days,
+                           "n_signals": len(sigs)},
+                 "_honesty": YEARSCALE_HONESTY_BANNER}
+    for w in widths_pct:
+        trades = []
+        for s in sigs:
+            i, direction = s["idx"], s["direction"]
+            ref = candles[i]["close"]
+            if w <= 0:
+                entry_idx, entry = i, ref
+            else:
+                want = ref * (1 - w / 100) if direction == "bull" else ref * (1 + w / 100)
+                entry_idx = None
+                for j in range(i + 1, min(i + 1 + fill_window, n)):
+                    if (direction == "bull" and candles[j]["low"] <= want) or \
+                       (direction == "bear" and candles[j]["high"] >= want):
+                        entry_idx, entry = j, want
+                        break
+                if entry_idx is None:
+                    continue   # 未成交 → 不進場（這正是 entry-zone 的取捨）
+            if direction == "bull":
+                stop = entry * (1 - sl_pct / 100); sld = entry - stop
+                tps = tuple(entry + sld * r for r in tp_r)
+            else:
+                stop = entry * (1 + sl_pct / 100); sld = stop - entry
+                tps = tuple(entry - sld * r for r in tp_r)
+            future = [(candles[k]["ts"], candles[k]["high"], candles[k]["low"],
+                       candles[k]["close"])
+                      for k in range(entry_idx + 1, min(entry_idx + 1 + hold_max, n))]
+            if not future:
+                continue
+            trades.append(simulate(symbol=symbol, setup_name=f"d6_w{w}",
+                                   direction=direction, entry_ts=candles[entry_idx]["ts"],
+                                   entry_price=entry, stop=stop, tps=tps,
+                                   future_prices=future, hold_max_hours=hold_max))
+        out[f"width_{w}pct"] = _summary(trades)
+    return out
+
+
+def _simulate_trailing(symbol: str, direction: str, entry_ts: int, entry: float,
+                       stop: float, future: list[tuple], hold_max: int,
+                       trail_pct: float):
+    """D7 骨架：百分比追蹤停損（取代固定 TP）。從高/低水位回撤 trail_pct% 出場。
+    純價格層；保守＝同根先判 stop（與 simulator 一致精神）。回 TradeOutcome-like dict。"""
+    sl_dist = abs(entry - stop)
+    if sl_dist == 0:
+        return {"realized_r": 0.0, "exit_reason": "invalid_stop", "bars_held": 0}
+    cost_r = 2 * (0.0005 + 0.0005) * entry / sl_dist   # 對齊 simulator 成本口徑
+    eff_stop = stop
+    peak = entry
+    for k, b in enumerate(future, start=1):
+        ts, hi, lo, cl = (b[0], b[1], b[2], b[3]) if len(b) >= 4 else (b[0], b[1], b[1], b[1])
+        if k > hold_max:
+            break
+        # 先判停損（保守）
+        if (direction == "bull" and lo <= eff_stop) or (direction == "bear" and hi >= eff_stop):
+            r = (eff_stop - entry) / sl_dist if direction == "bull" else (entry - eff_stop) / sl_dist
+            return {"realized_r": round(r - cost_r, 4), "exit_reason": "trail_stop", "bars_held": k}
+        # 更新水位 + 收緊追蹤停損
+        if direction == "bull":
+            peak = max(peak, hi)
+            eff_stop = max(eff_stop, peak * (1 - trail_pct / 100))
+        else:
+            peak = min(peak, lo)
+            eff_stop = min(eff_stop, peak * (1 + trail_pct / 100))
+    # timeout：末根收盤 mark
+    last_cl = (future[-1][3] if len(future[-1]) >= 4 else future[-1][1]) if future else entry
+    r = (last_cl - entry) / sl_dist if direction == "bull" else (entry - last_cl) / sl_dist
+    return {"realized_r": round(r - cost_r, 4), "exit_reason": "trail_timeout",
+            "bars_held": len(future)}
+
+
+async def ab_trailing_vs_fixed(symbol: str, days: int = 365, tf: str = "4h",
+                               sl_pct: float = 4.0, tp_r=(1.0, 1.5, 2.0),
+                               trail_pct: float = 3.0, hold_max: int = 48) -> dict:
+    """D7 骨架：同一批進場點比較「固定 R 出場」vs「百分比追蹤停損」（純價格層、年級）。
+    回 {fixed_r: summary, trailing: summary, delta_expectancy_r}。"""
+    candles = await get_ohlc_yearscale(symbol, tf, days)
+    if len(candles) < 200:
+        return {"error": f"insufficient ({len(candles)} bars)", "honesty": YEARSCALE_HONESTY_BANNER}
+    sigs = _entry_signals_from_candles(candles)
+    n = len(candles)
+    fixed_trades = []
+    trail_rs: list[float] = []
+    for s in sigs:
+        i, direction = s["idx"], s["direction"]
+        entry = candles[i]["close"]
+        if direction == "bull":
+            stop = entry * (1 - sl_pct / 100); sld = entry - stop
+            tps = tuple(entry + sld * r for r in tp_r)
+        else:
+            stop = entry * (1 + sl_pct / 100); sld = stop - entry
+            tps = tuple(entry - sld * r for r in tp_r)
+        future = [(candles[k]["ts"], candles[k]["high"], candles[k]["low"], candles[k]["close"])
+                  for k in range(i + 1, min(i + 1 + hold_max, n))]
+        if not future:
+            continue
+        fixed_trades.append(simulate(symbol=symbol, setup_name="d7_fixed",
+                                     direction=direction, entry_ts=candles[i]["ts"],
+                                     entry_price=entry, stop=stop, tps=tps,
+                                     future_prices=future, hold_max_hours=hold_max))
+        tr = _simulate_trailing(symbol, direction, candles[i]["ts"], entry, stop,
+                                future, hold_max, trail_pct)
+        trail_rs.append(tr["realized_r"])
+
+    fixed_sum = _summary(fixed_trades)
+    trail_va = _assess(trail_rs) if len(trail_rs) >= 3 else {}
+    trail_sum = {"n": len(trail_rs),
+                 "expectancy_r": round(sum(trail_rs) / len(trail_rs), 4) if trail_rs else 0.0,
+                 "psr": trail_va.get("psr"), "min_trl": trail_va.get("min_trl"),
+                 "verdict": trail_va.get("verdict")}
+    return {"_meta": {"symbol": symbol, "tf": tf, "days": days, "trail_pct": trail_pct},
+            "_honesty": YEARSCALE_HONESTY_BANNER,
+            "fixed_r": fixed_sum, "trailing": trail_sum,
+            "delta_expectancy_r": round(trail_sum["expectancy_r"] - fixed_sum["expectancy_r"], 4)}
 
 
 async def main(symbols: list[str] | None = None, days: int = 30):

@@ -267,6 +267,10 @@ async def amain(args: argparse.Namespace) -> int:
     from l3_dispatcher.auto_tuner import run_auto_tuner_loop as _run_tuner
     # v32: 回測 Session（每週真實歷史回放，驗證啟用策略期望值 → 系統主題 + 供 auto_tuner 參照）
     from backtest.backtest_session import run_backtest_loop as _run_backtest
+    # v56: 覆盤/驗屍 Session（task #41-A）— 每 6h 掃新平倉逐筆驗屍 + 每週一彙整賠錢模式 →
+    #      系統主題（頂部誠實橫幅）。100% 純讀（trade_journal/scanner/ohlc_cache 皆 mode=ro），
+    #      無下單路徑、不碰 strength/eval_cvd；寫 postmortem_notes.jsonl + digest 於 data_dir()。
+    from l3_dispatcher.postmortem import run_postmortem_loop as _run_postmortem
     # v35: 帳本防竄改錨定（每週 trade_journal 快照 → OpenTimestamps 錨定比特幣，純讀不下單）
     from l3_dispatcher.ledger_anchor import run_anchor_loop as _run_anchor
     # v40: CEO 監督 Session（每日彙整所有 Session 輸出 → 單一兩段式簡報，解決「埋在細節忘全局」）
@@ -275,6 +279,11 @@ async def amain(args: argparse.Namespace) -> int:
     #        純觀測寫 convergence_shadow.jsonl，永不影響 strength/fire/下單）
     from l3_dispatcher.convergence_shadow import (
         run_convergence_shadow_loop as _run_convergence)
+    # v56: 綜合宏觀指標合成影子層（task #41-C）— 每小時把 funding+OI+清算+巨鯨+ETF+DXY+breadth
+    #      用確定性規則合成 macro_confluence_score（影子鐵則：永不乘/加進 strength、不進 fire/
+    #      symbol_gate、不發 TG）。純讀，寫 macro_confluence.jsonl + 獨立 macro_history.db。
+    from l3_dispatcher.macro_confluence import (
+        run_macro_confluence_loop as _run_macro_confluence)
     # v55: OKX 模擬盤自動操盤手（task #4/#39）— 鏡像新紙上加密訊號到 OKX 模擬盤實單。
     #      預設「雙鑰待命」：DEMO_OPERATOR_ACTIVE 未開時整個 worker 完全閒置、零 OKX 互動
     #      （連 ex 都不建）→ 接進 daemon 本身是安全的；真要開單須另外把旗標設 1。
@@ -354,6 +363,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("auto_tuner", lambda: _run_tuner(tg_sys)),
         # v32: 回測 Session（每週歷史回放驗證期望值 → 系統主題，純讀不下單）
         ("backtest", lambda: _run_backtest(tg_sys)),
+        # v56: 覆盤/驗屍 Session（每 6h 逐筆驗屍 + 每週一彙整賠錢模式 → 系統主題，純讀不下單）
+        ("postmortem", lambda: _run_postmortem(tg_sys)),
         # v35: 帳本錨定 Session（每週快照 → OpenTimestamps 比特幣防竄改，只送 32B 雜湊）
         ("ledger_anchor", lambda: _run_anchor(tg_sys)),
         # v40: CEO 監督 Session（每日 09:00 台北彙整簡報 → 系統主題，純讀不下單不發外）
@@ -361,6 +372,9 @@ async def amain(args: argparse.Namespace) -> int:
         # v54-3: #33 跨源匯流影子觀測（每 30 分一輪 → convergence_shadow.jsonl；
         #        純背景觀測，不發 Telegram、不影響任何訊號/下單）
         ("convergence_shadow", lambda: _run_convergence(source)),
+        # v56: 綜合宏觀指標合成影子層（每小時一輪 → macro_confluence.jsonl + macro_history.db；
+        #       純影子觀測，不發 Telegram、永不影響 strength/fire/symbol_gate/下單）
+        ("macro_confluence", lambda: _run_macro_confluence(source)),
         # v55: OKX 模擬盤操盤手（DEMO_OPERATOR_ACTIVE 未開＝完全閒置、零 OKX 互動）。
         #      開啟後鏡像新紙上加密訊號到模擬盤實單，純驗證持倉真實性（零真錢）。
         ("okx_demo_operator", lambda: _run_demo_operator(
