@@ -70,6 +70,8 @@ def init_db() -> None:
             #   'pending'(掛單未成) / 'partial'(部分成交) / 'full'(全部成交)
             # v33: 發訊號當下的 Telegram message_id，供持倉訊息回連原始訊號
             ("signal_msg_id", "ALTER TABLE paper_trades ADD COLUMN signal_msg_id INTEGER"),
+            # v56: 進場計畫快照 JSON（復盤引擎 L1 前置——凍結預期劇本/止損劇本/當下上下文）
+            ("plan_snapshot", "ALTER TABLE paper_trades ADD COLUMN plan_snapshot TEXT"),
         ):
             if col not in existing:
                 conn.execute(ddl)
@@ -181,7 +183,8 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                        zone_hi: float | None = None,
                        split_mode: bool = False,
                        signal_msg_id: int | None = None,
-                       skip_cooldown: bool = False) -> int:
+                       skip_cooldown: bool = False,
+                       plan_snapshot: dict | None = None) -> int:
     """v26: split_mode=True 時建分批限價單（entry_state='pending'，等價格逐格成交）；
     否則維持原行為（直接全額成交，entry_state='full'）。
 
@@ -197,6 +200,11 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                   f"{dup['stop_diff']*100:.2f}% < {_post_close_stop_eps()*100:.2f}% 門檻，"
                   f"視為重複單；舊 id={dup['last_id']}）")
             return -1
+    # v56: 進場計畫快照（復盤引擎前置）。失敗回 None 不阻塞建單；序列化失敗也吞掉。
+    try:
+        ps_json = json.dumps(plan_snapshot, ensure_ascii=False) if plan_snapshot else None
+    except Exception:
+        ps_json = None
     conn = _conn()
     try:
         now_ms = int(time.time() * 1000)
@@ -206,20 +214,20 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                 """INSERT INTO paper_trades
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at,
-                    entry_splits, entry_filled_pct, entry_state, signal_msg_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?)""",
+                    entry_splits, entry_filled_pct, entry_state, signal_msg_id, plan_snapshot)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?, ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
-                 now_ms, fire_id, regime, now_ms, json.dumps(splits), signal_msg_id),
+                 now_ms, fire_id, regime, now_ms, json.dumps(splits), signal_msg_id, ps_json),
             )
         else:
             cur = conn.execute(
                 """INSERT INTO paper_trades
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at, entry_filled_pct, entry_state,
-                    signal_msg_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?)""",
+                    signal_msg_id, plan_snapshot)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?, ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
-                 now_ms, fire_id, regime, now_ms, signal_msg_id),
+                 now_ms, fire_id, regime, now_ms, signal_msg_id, ps_json),
             )
         return cur.lastrowid
     finally:

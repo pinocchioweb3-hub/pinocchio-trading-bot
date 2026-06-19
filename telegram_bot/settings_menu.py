@@ -86,21 +86,21 @@ async def handle_settings_callback(tg, cq: dict) -> bool:
 
     try:
         if action == "riskpct":
-            set_override("RISK_PER_TRADE_PCT", float(parts[2]))
+            set_override("RISK_PER_TRADE_PCT", float(parts[2]), source="human")
             note = f"單筆風險改為帳戶 {parts[2]}%"
         elif action == "riskusd":
-            set_override("RISK_PER_TRADE_PCT", 0)   # 關閉 % 模式
-            set_override("RISK_PER_TRADE_USD", float(parts[2]))
+            set_override("RISK_PER_TRADE_PCT", 0, source="human")   # 關閉 % 模式
+            set_override("RISK_PER_TRADE_USD", float(parts[2]), source="human")
             note = f"單筆風險改為固定 ${parts[2]}"
         elif action == "max":
-            set_override("MAX_CONCURRENT_TRADES", int(parts[2]))
+            set_override("MAX_CONCURRENT_TRADES", int(parts[2]), source="human")
             note = f"最多持倉改為 {parts[2]} 倉"
         elif action == "lev":
-            set_override("DEFAULT_LEVERAGE", int(parts[2]))
+            set_override("DEFAULT_LEVERAGE", int(parts[2]), source="human")
             note = f"槓桿改為 {parts[2]}x（由你自己決定；高槓桿風險自負）"
         elif action == "mode":
             mv = parts[2] if len(parts) > 2 else "balanced"
-            set_override("SIGNAL_MODE", mv)
+            set_override("SIGNAL_MODE", mv, source="human")
             note = "訊號模式改為 " + {"steady": "🛡️穩健", "balanced": "⚖️平衡",
                                       "aggressive": "🔥積極"}.get(mv, mv)
         elif action == "strat":
@@ -111,7 +111,7 @@ async def handle_settings_callback(tg, cq: dict) -> bool:
                 cur.discard(sid)
             else:
                 cur.add(sid)
-            set_override("STRATEGIES_ENABLED", ",".join(sorted(cur)))
+            set_override("STRATEGIES_ENABLED", ",".join(sorted(cur)), source="human")
             nm = REGISTRY[sid].display_name_zh if sid in REGISTRY else sid
             note = f"{'啟用' if sid in cur else '停用'} {nm}"
         elif action == "refresh":

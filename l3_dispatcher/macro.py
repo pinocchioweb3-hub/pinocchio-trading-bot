@@ -713,14 +713,26 @@ def _record_deepdive_plan(sym: str, plan: dict | None,
         from .paper_journal import record_paper_entry, open_paper_symbols
         if sym in open_paper_symbols("deepdive"):
             return chart_plan   # 已在追蹤：畫線但不重複建單
+        _tp2 = tp2 if tp2 is not None else tp1
+        _tp3 = tp3 if tp3 is not None else tp1
+        # v56 step1：進場那刻凍結計畫快照（純觀測，失敗回 None 不阻塞建單）
+        try:
+            from .plan_snapshot import build_plan_snapshot
+            plan_snap = build_plan_snapshot(
+                source="macro_deepdive", direction=direction,
+                entry_price=entry, planned_stop=stop,
+                tp1=tp1, tp2=_tp2, tp3=_tp3,
+                signal_msg_id=signal_msg_id, regime="deepdive")
+        except Exception:
+            plan_snap = None
         record_paper_entry(
             symbol=sym, setup="deepdive", direction=direction,
             entry_price=entry, stop_price=stop,
-            tp1=tp1, tp2=tp2 if tp2 is not None else tp1,
-            tp3=tp3 if tp3 is not None else tp1,
+            tp1=tp1, tp2=_tp2, tp3=_tp3,
             regime="deepdive",
             zone_lo=lo if is_limit else None, zone_hi=hi if is_limit else None,
             split_mode=is_limit, signal_msg_id=signal_msg_id,
+            plan_snapshot=plan_snap,
         )
         print(f"[deepdive] {sym} paper entry recorded ({direction}, "
               f"{'limit' if is_limit else 'market'})")

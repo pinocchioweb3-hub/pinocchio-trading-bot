@@ -302,13 +302,28 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
 
         # v16: 同步開紙上倉（Stage 0 — 每筆訊號自動追蹤，驗證引擎期望值）
         # v26: 分批限價模式 — 進場區拆兩格，價格逐格觸及才計成交，持倉主題顯示進場進度
+        # v56: 同步捕捉進場計畫快照（復盤引擎前置；純觀測，失敗回 None 不影響建單）
         from .paper_journal import record_paper_entry
+        try:
+            from .plan_snapshot import build_plan_snapshot
+            plan_snap = build_plan_snapshot(
+                source="direct_fire", direction=direction,
+                entry_price=entry_price, planned_stop=stop,
+                tp1=tps["tp1"], tp2=tps["tp2"], tp3=tps["tp3"],
+                fire_id=fire_id, signal_msg_id=msg_id, regime=regime,
+                thesis=decision.get("reason", ""),
+                confidence=(cc.get("confidence") if cc else None),
+            )
+        except Exception as _e:
+            plan_snap = None
+            print(f"[dispatcher] #{fire_id} plan_snapshot build skipped: {_e}")
         pid = record_paper_entry(
             symbol=sym, setup=setup, direction=direction,
             entry_price=entry_price, stop_price=stop,
             tp1=tps["tp1"], tp2=tps["tp2"], tp3=tps["tp3"],
             fire_id=fire_id, regime=regime,
             zone_lo=zone_lo, zone_hi=zone_hi, split_mode=True,
+            plan_snapshot=plan_snap,
         )
         print(f"[dispatcher] #{fire_id} {sym}/{setup}/{direction} -> sent "
               f"(msg_id={msg_id}, trade_id={tid} signal 等待確認, paper_id={pid} 自動追蹤)")

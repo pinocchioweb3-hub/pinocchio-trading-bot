@@ -358,6 +358,16 @@ async def _check_waiting_trades(source, tg, bars_cache: dict[str, list],
             for t in (w.get("tags") or "").split(","):
                 if t.startswith("regime:"):
                     regime = t.split(":", 1)[1]
+            # v56 step1：觸發成交那刻凍結計畫快照（純觀測，失敗回 None 不阻塞建單）
+            try:
+                from .plan_snapshot import build_plan_snapshot
+                plan_snap = build_plan_snapshot(
+                    source="waiting_trigger", direction=w["direction"],
+                    entry_price=live, planned_stop=w["stop_price"],
+                    tp1=w["tp1"], tp2=w["tp2"], tp3=w["tp3"],
+                    fire_id=w["fire_id"], regime=regime)
+            except Exception:
+                plan_snap = None
             record_paper_entry(
                 symbol=sym, setup=w["setup"], direction=w["direction"],
                 entry_price=live, stop_price=w["stop_price"],
@@ -366,6 +376,7 @@ async def _check_waiting_trades(source, tg, bars_cache: dict[str, list],
                 # v47-2: 等待觸發是「先前已承諾的等待單兌現」，非新單 → 豁免 post-close 冷卻，
                 #        否則同向同 setup 剛平倉時會誤殺正當觸發。
                 skip_cooldown=True,
+                plan_snapshot=plan_snap,
             )
         except Exception as e:
             print(f"[trade_monitor] waiting paper entry error: {e}")
