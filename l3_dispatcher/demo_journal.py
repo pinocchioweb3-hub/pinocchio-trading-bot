@@ -334,6 +334,52 @@ def count_closed_for_phase0() -> tuple[int, float]:
         conn.close()
 
 
+def count_rejected() -> tuple[int, str | None]:
+    """供監督層誠實呈現：模擬盤『下單被拒』筆數 + 最近一筆拒因摘要。
+
+    這些不是成交樣本（status='rejected'，已被 count_closed_for_phase0 排除），但若實倉
+    一路卡在 0 而拒單一直累積，next_step 不該謊稱「實倉樣本累積中」——要讓本人看到真正
+    卡點（多半是 OKX 帳戶模式 51010 或張數規格 51121）。回 (筆數, 最近拒因摘要|None)。"""
+    init_db()
+    conn = _conn()
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM demo_trades WHERE status='rejected'"
+        ).fetchone()
+        cnt = int((n[0] if n else 0) or 0)
+        if cnt == 0:
+            return 0, None
+        row = conn.execute(
+            "SELECT exit_reason FROM demo_trades WHERE status='rejected' "
+            "ORDER BY entry_at DESC LIMIT 1"
+        ).fetchone()
+        raw = (row[0] if row and row[0] else "")
+        return cnt, (_short_reject_hint(raw) or None)
+    finally:
+        conn.close()
+
+
+def _short_reject_hint(raw: str) -> str:
+    """把冗長的 OKX 拒單 JSON 壓成一句人話摘要（給監督層/帳本顯示用，不失真）。"""
+    if not raw:
+        return ""
+    s = str(raw)
+    # 已知 OKX 錯誤碼 → 白話對照（出現哪個就回哪個，永續最常見這兩個）
+    known = {
+        "51010": "OKX 51010：帳戶模式須改為單幣種/跨幣種保證金才可交易永續",
+        "51121": "OKX 51121：下單張數須為合約規格整數倍（已修，待重啟生效）",
+        "51008": "OKX 51008：模擬盤餘額不足",
+        "51004": "OKX 51004：下單超過可用保證金",
+    }
+    for code, msg in known.items():
+        if code in s:
+            return msg
+    # 未知碼：去前綴後截短，避免帳本塞整段 JSON
+    if s.startswith("reject:"):
+        s = s[len("reject:"):]
+    return (s[:60] + "…") if len(s) > 60 else s
+
+
 if __name__ == "__main__":
     init_db()
     print(f"demo journal at {DB_PATH}")

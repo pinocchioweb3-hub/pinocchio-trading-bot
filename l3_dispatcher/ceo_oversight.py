@@ -46,12 +46,19 @@ DEMO_SAMPLE_TARGET = 30
 # 純決策層（可離線測試，不碰 IO）
 # ===========================================================================
 def next_step(*, paper_n, paper_min, live_n, live_min,
-              demo_n, demo_active) -> str:
+              demo_n, demo_active, demo_rejected=0, demo_reject_hint=None) -> str:
     """依目前進度推「下一步該做什麼」（確定性階梯，非 LLM）。"""
     if not demo_active:
         return ("啟用 OKX 模擬盤操盤手：先做單次 --cycle-once 監督試跑，確認真實成交與"
                 "帳本回寫無誤後再常駐，開始累積實倉樣本（零真錢）")
     if demo_n < DEMO_SAMPLE_TARGET:
+        # 誠實卡點：操盤手在跑、但成交 0 而下單一路被 OKX 拒 → 不可謊稱「累積中」。
+        if demo_n == 0 and demo_rejected > 0:
+            hint = f"（最近拒因 {demo_reject_hint}）" if demo_reject_hint else ""
+            return (f"⚠️ 模擬盤操盤手已下單 {demo_rejected} 次、OKX 全數拒絕{hint}，"
+                    f"實倉成交樣本仍 0/{DEMO_SAMPLE_TARGET}——這是目前唯一卡住實倉樣本的點。"
+                    "請先排除下單被拒原因：多為 OKX 模擬盤帳戶須改為『單幣種/跨幣種保證金』"
+                    "模式才可交易永續（錯誤碼 51010），或張數規格取整（51121，已修待重啟生效）")
         tail = f"；同時續累積紙上樣本（{paper_n}/{paper_min}）" if paper_n < paper_min else ""
         return f"模擬盤操盤手運行中，續累積 OKX 實倉樣本（{demo_n}/{DEMO_SAMPLE_TARGET}）{tail}"
     if live_n < live_min:
@@ -62,6 +69,7 @@ def next_step(*, paper_n, paper_min, live_n, live_min,
 
 def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
            demo_n, demo_live, demo_active, open_decisions, pending_outbox,
+           demo_rejected=0, demo_reject_hint=None,
            last_nudge_ms=0, stall_sec=STALL_SEC, nudge_cooldown_sec=NUDGE_COOLDOWN_SEC) -> dict:
     """核心判定（純函式）。回 state / next_step / blockers / should_nudge。
 
@@ -78,7 +86,8 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
         blockers.append(f"{pending_outbox} 則對外內容待你核准（/approve）")
 
     ns = next_step(paper_n=paper_n, paper_min=paper_min, live_n=live_n,
-                   live_min=live_min, demo_n=demo_n, demo_active=demo_active)
+                   live_min=live_min, demo_n=demo_n, demo_active=demo_active,
+                   demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint)
 
     if commit_age_sec is None:
         state = "IDLE"
@@ -195,11 +204,14 @@ def build_snapshot(now_ms: int | None = None) -> dict:
 
     demo_n = 0
     demo_live = 0
+    demo_rejected = 0
+    demo_reject_hint = None
     try:
         from . import demo_journal
         demo_n, _ = demo_journal.count_closed_for_phase0()
         ds = demo_journal.get_demo_stats(30)
         demo_live = ds.get("n_open", 0) + ds.get("n_pending", 0)
+        demo_rejected, demo_reject_hint = demo_journal.count_rejected()
     except Exception:
         pass
 
@@ -231,6 +243,7 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         paper_n=paper_n, paper_min=paper_min, live_n=live_n, live_min=live_min,
         demo_n=demo_n, demo_live=demo_live, demo_active=demo_active,
         open_decisions=open_decisions, pending_outbox=pending_outbox,
+        demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint,
         last_nudge_ms=last_nudge_ms,
     )
 
@@ -242,6 +255,8 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         "demo_n": demo_n,
         "demo_live": demo_live,
         "demo_active": demo_active,
+        "demo_rejected": demo_rejected,
+        "demo_reject_hint": demo_reject_hint,
         "open_decisions": open_decisions,
         "pending_outbox": pending_outbox,
         "last_nudge_ms": last_nudge_ms,  # 沿用；發送後才更新
@@ -295,6 +310,14 @@ def _selftest():
     check("demo 運行中且樣本不足 → 續累積實倉", "5/30" in s2)
     s3 = next_step(paper_n=120, paper_min=100, live_n=0, live_min=30, demo_n=30, demo_active=True)
     check("demo 達標但真實 0 → 指向真錢小額(紅線①)", "真錢" in s3 and "紅線①" in s3)
+    # 新：成交 0 但下單一路被拒 → 誠實揭露卡點，不可謊稱「累積中」
+    s4 = next_step(paper_n=45, paper_min=100, live_n=0, live_min=30, demo_n=0,
+                   demo_active=True, demo_rejected=5, demo_reject_hint="51010")
+    check("成交0+全被拒 → 揭露卡點(非謊稱累積)", "全數拒絕" in s4 and "51010" in s4 and "0/30" in s4)
+    check("成交0+全被拒 → 不沿用『累積中』樂觀句", "續累積 OKX 實倉樣本（0/30）" not in s4)
+    s5 = next_step(paper_n=45, paper_min=100, live_n=0, live_min=30, demo_n=2,
+                   demo_active=True, demo_rejected=5)
+    check("已有成交(demo_n>0) → 回正常累積句(拒單不蓋)", "2/30" in s5 and "全數拒絕" not in s5)
 
     # assess：BLOCKED_ON_USER（有待決策）
     a1 = assess(now_ms=now, commit_age_sec=999999, paper_n=38, paper_min=100,

@@ -170,6 +170,16 @@ def choose_safe_leverage(symbol: str, entry: float, stop: float,
 # ---------------------------------------------------------------------------
 # 純函式：張數取整 / 實際風險 / TP 分腿
 # ---------------------------------------------------------------------------
+def _to_float(v) -> float:
+    """安全把 OKX 原始字串規格（'1'、'0.1'、''、None）轉 float；無法解析回 0.0。"""
+    try:
+        if v is None or v == "":
+            return 0.0
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def round_contracts_down(qty_base: float, ct_val: float, lot_sz: float) -> float:
     """基礎幣數量 → OKX 張數，向下取整到 lot_sz（絕不無中生有放大風險）。"""
     if ct_val <= 0 or lot_sz <= 0:
@@ -601,11 +611,16 @@ async def fetch_okx_contract_spec(ex, symbol: str) -> dict:
     m = ex.market(inst_id)
     prec = m.get("precision") or {}
     amt_limit = (m.get("limits") or {}).get("amount") or {}
+    info = m.get("info") or {}  # OKX 原始合約規格（lotSz/minSz/ctVal）
     ct_val = float(m.get("contractSize") or DEFAULT_CT_VAL)
-    lot_sz = float(prec.get("amount") or DEFAULT_LOT_SZ)
+
+    # lotSz：優先讀 OKX 原始 info.lotSz（張數最小變動單位＝張數須為其整數倍，errCode 51121）。
+    # ccxt 的 precision.amount 對 OKX 永續不可靠（常給小數位數而非「張數步進」，曾把 ARB 算成
+    # 4629.6 張被 51121 退單）。原始值缺漏才退回 precision.amount，再退 DEFAULT。
+    lot_sz = _to_float(info.get("lotSz")) or _to_float(prec.get("amount")) or DEFAULT_LOT_SZ
     if lot_sz <= 0:
         lot_sz = DEFAULT_LOT_SZ
-    min_sz = float(amt_limit.get("min") or lot_sz)
+    min_sz = _to_float(info.get("minSz")) or _to_float(amt_limit.get("min")) or lot_sz
     if min_sz <= 0:
         min_sz = lot_sz
     return {"ct_val": ct_val, "lot_sz": lot_sz, "min_sz": min_sz, "inst_id": inst_id}
