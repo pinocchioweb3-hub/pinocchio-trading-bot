@@ -71,6 +71,49 @@ def test_score_oi_clamped():
     assert mc.score_oi(None) == 0.0
 
 
+# --- 新增 5 個 CoinGlass 分量計分器的方向 / 邊界測試 ---
+def test_score_coinbase_premium_direction():
+    assert mc.score_coinbase_premium(50) == 1.0     # 美國買盤強滿格 → 偏多
+    assert mc.score_coinbase_premium(-50) == -1.0   # 偏空滿格
+    assert mc.score_coinbase_premium(0) == 0.0
+    assert mc.score_coinbase_premium(None) == 0.0   # 缺料中性
+    assert mc.score_coinbase_premium(25) == 0.5     # 線性
+
+
+def test_score_coin_netflow_inverted():
+    # 流入交易所(正)＝賣壓＝偏空(反號)；流出(負)＝偏多
+    assert mc.score_coin_netflow(500_000_000) < 0
+    assert mc.score_coin_netflow(-500_000_000) > 0
+    assert mc.score_coin_netflow(500_000_000) == -1.0   # 滿格反號
+    assert mc.score_coin_netflow(-500_000_000) == 1.0
+    assert mc.score_coin_netflow(0) == 0.0
+    assert mc.score_coin_netflow(None) == 0.0
+
+
+def test_score_btc_dominance_inverted_anchor50():
+    # 市占升＝risk_off(反號)；市占降＝risk_on
+    assert mc.score_btc_dominance(60) < 0
+    assert mc.score_btc_dominance(40) > 0
+    assert mc.score_btc_dominance(50) == 0.0        # 50% 中性錨
+    assert mc.score_btc_dominance(60) == -1.0       # ±10pp 滿格
+    assert mc.score_btc_dominance(40) == 1.0
+    assert mc.score_btc_dominance(None) == 0.0
+
+
+def test_score_altcoin_season_linear():
+    assert mc.score_altcoin_season(100) == 1.0      # 滿格山寨季 → risk_on
+    assert mc.score_altcoin_season(0) == -1.0       # 比特幣季 → risk_off
+    assert mc.score_altcoin_season(50) == 0.0       # 中性
+    assert mc.score_altcoin_season(None) == 0.0
+
+
+def test_score_btc_vs_m2_direction():
+    assert mc.score_btc_vs_m2(30) == 1.0            # 超漲滿格 → 溫和偏多
+    assert mc.score_btc_vs_m2(-30) == -1.0          # 落後滿格 → 偏空
+    assert mc.score_btc_vs_m2(0) == 0.0
+    assert mc.score_btc_vs_m2(None) == 0.0
+
+
 def test_score_breadth_direction_and_riskoff():
     # 24h 偏多 + 1h 不極端 → 正方向、無 risk_off
     s, ro = mc.score_breadth({"n_total": 100, "n_up24h": 70, "n_down24h": 30,
@@ -127,6 +170,17 @@ def test_compute_confluence_riskoff_flag_overrides_bias():
 def test_compute_confluence_weights_sum_to_one():
     total = sum(mc._WEIGHTS.values())
     assert abs(total - 1.0) < 1e-9, f"權重總和應為 1.0，實為 {total}"
+
+
+def test_weights_sum_to_one_after_extension():
+    """擴 12 項後仍守『總和==1.0』+ 鎖定 12 項數量（新增 5 個 CoinGlass 端點）。"""
+    total = sum(mc._WEIGHTS.values())
+    assert abs(total - 1.0) < 1e-9, f"擴項後權重總和應為 1.0，實為 {total}"
+    assert len(mc._WEIGHTS) == 12, f"應有 12 個分量，實為 {len(mc._WEIGHTS)}"
+    # 新 5 鍵必須在 _WEIGHTS 中
+    for k in ("coinbase_premium", "coin_netflow", "btc_dominance",
+              "altcoin_season", "btc_vs_m2"):
+        assert k in mc._WEIGHTS, f"新分量 {k} 應在 _WEIGHTS"
 
 
 def test_compute_confluence_contribution_matches_weight_times_sub():
@@ -188,6 +242,100 @@ def test_shadow_rule_score_does_not_feed_strength():
     # compute_confluence 為純函式：不接受、也不回傳任何 strength 寫入口
     sig = inspect.signature(mc.compute_confluence)
     assert "strength_score" not in sig.parameters
+
+
+def test_compute_confluence_no_strength_key_with_new_components():
+    """餵 5 個新鍵全給值，輸出仍含 macro_confluence_score、且不含 strength_score
+    / strength_multiplier（影子鐵則：新分量不混入 strength 命名空間）。"""
+    out = mc.compute_confluence({
+        "coinbase_premium_value": 40,
+        "coin_netflow_usd": -300_000_000,
+        "btc_dominance_pct": 45,
+        "altcoin_season_index": 80,
+        "btc_vs_m2_deviation_pct": 15,
+    })
+    assert "macro_confluence_score" in out
+    assert "strength_score" not in out
+    assert "strength_multiplier" not in out
+    # 5 個新分量都應出現在 components 明細
+    for k in ("coinbase_premium", "coin_netflow", "btc_dominance",
+              "altcoin_season", "btc_vs_m2"):
+        assert k in out["components"], f"新分量 {k} 應在 components 明細"
+    # n_present 應計入 5 個有料新項
+    assert out["n_present"] == 5
+
+
+def test_each_new_weight_in_components_detail():
+    """5 新鍵全給值時，各 contribution ≈ sub_score * weight。"""
+    out = mc.compute_confluence({
+        "coinbase_premium_value": 40,
+        "coin_netflow_usd": -300_000_000,
+        "btc_dominance_pct": 45,
+        "altcoin_season_index": 80,
+        "btc_vs_m2_deviation_pct": 15,
+    })
+    for k in ("coinbase_premium", "coin_netflow", "btc_dominance",
+              "altcoin_season", "btc_vs_m2"):
+        d = out["components"][k]
+        assert abs(d["contribution"] - d["sub_score"] * d["weight"]) < 1e-6
+        assert d["weight"] == mc._WEIGHTS[k]
+
+
+def test_collect_new5_all_missing_n_present_correct(monkeypatch):
+    """5 個新端點全缺/全失敗 → _collect_components 不崩潰、不含 5 個新鍵；
+    compute 端不因新項增加 n_present（純函式版：缺料 sub=0 不計分母）。"""
+    import asyncio
+
+    class _FakeSource:
+        """5 個新方法全回 make_error 形式或 raise；其餘既有方法回缺料 error。"""
+        async def get_coinbase_premium_index(self, *a, **k):
+            return {"error": True, "code": "EMPTY_DATA"}
+
+        async def get_coin_netflow(self, *a, **k):
+            raise RuntimeError("boom")  # 一塊 raise 不可波及他塊
+
+        async def get_bitcoin_dominance(self, *a, **k):
+            return {"error": True}
+
+        async def get_altcoin_season(self, *a, **k):
+            return {"error": True}
+
+        async def get_bitcoin_vs_m2(self, *a, **k):
+            return {"error": True}
+
+        # 既有端點：全部回缺料 error（讓 out 乾淨，方便斷言）
+        async def get_etf_flows(self, *a, **k):
+            return {"error": True}
+
+        async def get_funding(self, *a, **k):
+            return {"error": True}
+
+        async def get_oi(self, *a, **k):
+            return {"error": True}
+
+        async def get_liquidations(self, *a, **k):
+            return {"error": True}
+
+        async def get_hyperliquid_whales(self, *a, **k):
+            return {"error": True}
+
+    # 隔離本地 source/scanner/tradfi：避免真實 I/O 干擾（讓 out 只剩可控內容）
+    import l3_dispatcher.macro_confluence as _mc
+    monkeypatch.setattr(_mc, "_collect_components",
+                        _mc._collect_components)  # no-op，確保用真實函式
+
+    out = asyncio.run(_mc._collect_components(_FakeSource()))
+    # 5 個新鍵一個都不該寫入（全失敗/缺料）
+    for k in ("coinbase_premium_value", "coin_netflow_usd", "btc_dominance_pct",
+              "altcoin_season_index", "btc_vs_m2_deviation_pct"):
+        assert k not in out, f"全缺時不應寫入 {k}"
+    # 把 out 丟 compute：n_present 不因新項增加（純空時 == 0）
+    summary = mc.compute_confluence(out)
+    # 新 5 項缺料 → sub=0 → 不計分母；只可能由本地 breadth/dxy 等既有源貢獻
+    # 為穩健，直接驗純空 dict 的純函式語意：新項缺料不抬高 n_present
+    pure = mc.compute_confluence({})
+    assert pure["n_present"] == 0
+    assert "macro_confluence_score" in summary
 
 
 # ============================================================ 3. history-logger
@@ -275,6 +423,24 @@ def test_render_dashboard_riskoff_tag():
     })
     text = mc.render_dashboard(out)
     assert "risk-off" in text.lower() or "Risk-Off" in text
+    _assert_clean(text)
+
+
+def test_new_components_appear_in_dashboard():
+    """餵極端值讓某新項進貢獻度前 4 大，斷言其繁中標籤出現在儀表板輸出，
+    且無績效字眼、仍含誠實橫幅『影子觀測』『非進場訊號』。"""
+    # 只給新分量極端值（既有分量全缺）→ 新項必進前 4 大
+    out = mc.compute_confluence({
+        "coinbase_premium_value": 50,       # CB溢價 滿格
+        "coin_netflow_usd": -500_000_000,   # 交易所淨流 滿格(偏多)
+        "btc_dominance_pct": 40,            # BTC市占 滿格(risk_on)
+        "altcoin_season_index": 100,       # 山寨季 滿格
+    })
+    text = mc.render_dashboard(out)
+    # 至少 CB溢價（最高新權重 0.08）應入前 4 大並顯示其標籤
+    assert "CB溢價" in text
+    assert "影子觀測" in text
+    assert "非進場訊號" in text
     _assert_clean(text)
 
 

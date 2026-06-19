@@ -779,7 +779,7 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
                             sig_mid = await _send_to_telegram(
                                 tg, text,
                                 prefix=(f"🎯 <b>{sym} 交易計畫深度分析</b>\n"
-                                        + _shadow_observe_prefix(sym_state))
+                                        + await _shadow_observe_prefix(sym_state))
                             )
                             if _dir in ("bull", "bear") and not sig_mid:
                                 # v48: 送出失敗 → 歸還搶到的槽，下輪可重試（不靜默漏單）
@@ -841,6 +841,23 @@ def _shadow_tf_nesting_line(sym_state: dict) -> str:
         return ""
 
 
+async def _shadow_crossyear_line(symbol: str) -> str:
+    """(A) 影子顯示：跨年類比『今年最像 20XX 年 X 月』一行（純讀、不過 LLM）。
+
+    只對加密；任何失敗回 ''，絕不中斷 deepdive。crossyear_analogue 走
+    backtest.data_loader（Binance 年級、免 key、純讀，自帶 15s timeout＋回 None）；
+    render_crossyear_line 對 None/insufficient 都回安全字串，且已內含
+    『歷史相似≠未來重演』誠實橫幅，故此處不重複加。
+    嚴守影子鐵則：結果僅進顯示字串，永不進 strength_score/fire_queue/symbol_gate/下單。
+    """
+    try:
+        from .analogue import crossyear_analogue, render_crossyear_line
+        stats = await crossyear_analogue(symbol)
+        return render_crossyear_line(stats)
+    except Exception:
+        return ""
+
+
 def _shadow_convergence_focus_line() -> str:
     """#33 影子顯示：讀跨源匯流 JSONL 最後一輪，列「三方共現焦點幣」橫幅（不過 LLM）。
 
@@ -876,13 +893,22 @@ def _shadow_convergence_focus_line() -> str:
         return ""
 
 
-def _shadow_observe_prefix(sym_state: dict) -> str:
-    """組合 #34（當前幣階段）+ #33（全市場焦點橫幅）兩行影子觀測，附在 deepdive 標題下。
+async def _shadow_observe_prefix(sym_state: dict) -> str:
+    """組合 #34（當前幣階段）+ #33（全市場焦點橫幅）+ (A) 跨年類比三段影子觀測，
+    附在 deepdive 標題下。
 
     全程只讀、不過 LLM、任何錯誤回 ""，絕不中斷 deepdive 發送。
+    (A) 跨年類比僅對加密（emoji=='🪙'）顯示——deepdive 引擎也會選到美股如 MU，
+    用 _asset_kind 資產別守門擋掉美股，避免污染美股卡。跨年行加在最後
+    （render_crossyear_line 開頭已含 '\\n'）。
     """
     try:
-        return _shadow_tf_nesting_line(sym_state) + _shadow_convergence_focus_line()
+        sym = sym_state.get("symbol", "")
+        emoji, _ = _asset_kind(sym, "")   # deepdive 引擎會選到美股如 MU
+        cross = await _shadow_crossyear_line(sym) if emoji == "🪙" else ""
+        return (_shadow_tf_nesting_line(sym_state)
+                + _shadow_convergence_focus_line()
+                + cross)
     except Exception:
         return ""
 
@@ -928,6 +954,39 @@ def _next_daily_run_seconds(target_hour_utc: int = 0) -> float:
     if target <= now:
         target += dt.timedelta(days=1)
     return (target - now).total_seconds()
+
+
+def _macro_confluence_dashboard_line() -> str:
+    """(B) 影子顯示：讀 macro_confluence.jsonl 末行 → render_dashboard 儀表板字串。
+
+    純讀、不過 LLM、不二次打 API；檔缺/空/壞 JSON 回 ''。來源＝
+    run_macro_confluence_loop 每小時已寫的整份 summary（含 macro_confluence_score/
+    bias/components/risk_off/n_present/ts），讀末行＝零 API、零重算、與影子層解耦。
+    render_dashboard 已內含『綜合宏觀儀表板（影子觀測，非進場訊號）』橫幅＋
+    『永不影響訊號/下單』註腳，故此處不重複加。
+    嚴守影子鐵則：macro_confluence_score 僅進顯示字串，未乘進/加進任何訊號數學。
+    沿用 _shadow_convergence_focus_line 的 tail-read 樣式（seek 檔尾 65536 bytes）。
+    """
+    try:
+        import json as _json
+        from botpaths import data_dir
+        from .macro_confluence import render_dashboard
+        path = data_dir() / "macro_confluence.jsonl"
+        if not path.exists():
+            return ""
+        with open(path, "rb") as f:  # tail 讀（仿 _shadow_convergence_focus_line）
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            chunk = f.read()
+        lines = [ln for ln in chunk.decode("utf-8", errors="ignore").splitlines()
+                 if ln.strip()]
+        if not lines:
+            return ""
+        rec = _json.loads(lines[-1])  # 取最後一行（tail 可能切斷較舊行，但末行完整）
+        return render_dashboard(rec)
+    except Exception:
+        return ""
 
 
 # v36：持倉資產分類（決定 🪙加密 / 🇺🇸美股 / 🥇商品 標記）
@@ -1155,7 +1214,12 @@ async def run_daily_macro_loop(tg, source, watchlist, target_hour_utc: int = 0,
             pass
         text, meta = await synthesize_via_claude_code(state, tradfi, watchlist)
         if text:
-            await _send_to_telegram(tg, text, prefix=prefix)
+            # (B) 影子顯示：每日宏觀卡附「綜合宏觀儀表板（影子觀測，非進場訊號）」。
+            #     純讀本地 jsonl 末行；dash 為空時 prefix 原樣、daily macro 照常送。
+            dash = _macro_confluence_dashboard_line()
+            await _send_to_telegram(
+                tg, text,
+                prefix=(prefix + dash + "\n") if dash else prefix)
             print(f"[daily-macro] sent ({meta.get('output_chars')} chars)")
             return True
         # 敘事引擎離線/失敗 → 降級模板版（不再靜默消失）

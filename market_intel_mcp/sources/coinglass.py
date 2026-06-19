@@ -1258,15 +1258,17 @@ class CoinGlassSource:
         return out
 
     # =====================================================================
-    # v56 預留端點（尚未接入 confluence）：已付費($79 Startup)但目前無呼叫者的
-    # 「綜合宏觀」端點。⚠️ 誠實註記：macro_confluence._collect_components 目前
-    # 並未呼叫以下任一方法（macro 分數只用既有 funding/OI/清算/巨鯨/ETF 代理）。
-    # 這 5 個方法是為日後擴 _WEIGHTS / A-B 校準而預留的純讀骨架，接入前不影響任何輸出。
+    # 綜合宏觀端點（已付費 $79 Startup）：已正式接入 macro_confluence 影子分數。
+    # ✅ 誠實註記：macro_confluence._collect_components 已呼叫以下 5 個方法
+    # （coinbase premium / coin netflow / btc dominance / altcoin season /
+    # btc vs m2），各以低權重計入 _WEIGHTS（合計 0.22），純讀觀測。
+    # ⚠️ 影子鐵則：這 5 個分量永不乘進/加進 strength_score、永不進 fire/
+    # symbol_gate/下單、不發 Telegram；只供 confluence 影子合成 + 儀表板顯示。
     # ---------------------------------------------------------------------
     # 設計鐵則（與本檔既有方法一致）：
     #   * 全部走 self._get（共用限流器 + TTL 快取 + 退避重試），不另開額度。
-    #   * 任何失敗一律回 make_error dict（不 raise）；日後接入時，上層對缺料分量
-    #     一律「中性化」（不臆測方向），故路徑/欄位日後微調也優雅降級。
+    #   * 任何失敗一律回 make_error dict（不 raise）；上層對缺料分量一律
+    #     「中性化」（不臆測方向），故路徑/欄位日後微調也優雅降級。
     #   * 純讀，零下單路徑（紅線①）。
     #   * ⚠️ 不得改動上方任何既有方法/簽名（純附加）。
     # 端點路徑依 CoinGlass v4 文件 + 權益實測（trading-bot-coinglass-entitlements）。

@@ -40,14 +40,23 @@ import time
 _SINK_MAX_BYTES = 5_000_000
 
 # 分量權重（總和 = 1.0）。確定性、可調但目前固定；shadow 不影響任何下單故可自由校準。
+# 採 N/100.0 形式（points 表整數加總 = 100，最穩健抗未來改權重 / 浮點誤差）。
+# 新增 5 個 CoinGlass 綜合宏觀端點（coinbase_premium / coin_netflow / btc_dominance
+# / altcoin_season / btc_vs_m2）：舊 7 項整體下調騰出 22 points 給新 5 項（8+6+4+2+2），保持
+# 「ETF / DXY / breadth 仍主導、新端點為輔助觀測」的相對序。仍全程影子、不影響下單。
 _WEIGHTS = {
-    "etf": 0.22,        # ETF 機構淨流（最強的趨勢資金訊號）
-    "dxy": 0.18,        # 美元指數（升→風險資產逆風）
-    "breadth": 0.16,    # 全市場廣度（risk-on/off 旗標來源）
-    "funding": 0.14,    # 資金費率（過熱→偏空燃料）
-    "oi": 0.12,         # 未平倉量趨勢
-    "liquidation": 0.10,  # 清算失衡（空清算多→軋空燃料）
-    "whales": 0.08,     # HL 巨鯨淨倉
+    "etf": 18 / 100.0,            # 0.18  ETF 機構淨流（最強的趨勢資金訊號）
+    "dxy": 14 / 100.0,            # 0.14  美元指數（升→風險資產逆風）
+    "breadth": 12 / 100.0,        # 0.12  全市場廣度（risk-on/off 旗標來源）
+    "funding": 11 / 100.0,        # 0.11  資金費率（過熱→偏空燃料）
+    "oi": 9 / 100.0,             # 0.09  未平倉量趨勢
+    "liquidation": 8 / 100.0,     # 0.08  清算失衡（空清算多→軋空燃料）
+    "whales": 6 / 100.0,         # 0.06  HL 巨鯨淨倉
+    "coinbase_premium": 8 / 100.0,  # 0.08  新：美國現貨買壓（Coinbase 溢價）
+    "coin_netflow": 6 / 100.0,    # 0.06  新：交易所淨流（流入＝賣壓）
+    "btc_dominance": 4 / 100.0,   # 0.04  新：BTC 市占（避險／資金外溢山寨）
+    "altcoin_season": 2 / 100.0,  # 0.02  新：山寨季氛圍
+    "btc_vs_m2": 2 / 100.0,       # 0.02  新：流動性估值（最弱輔助）
 }
 
 # breadth<這個門檻 → 掛 risk_off 旗標
@@ -143,12 +152,64 @@ def score_whales(net_long_pct) -> float:
     return _clamp(net_long_pct / 100.0)
 
 
+def score_coinbase_premium(premium_value) -> float:
+    """Coinbase 溢價 → [-1,+1]。>0＝美國現貨買盤強＝偏多(+)；<0＝偏空。
+    ±50（bps／點，視單位）視為滿格。缺料/非數字回 0.0（中性化）。
+    """
+    if not isinstance(premium_value, (int, float)):
+        return 0.0
+    return _clamp(premium_value / 50.0)
+
+
+def score_coin_netflow(netflow_usd) -> float:
+    """交易所淨流 → [-1,+1]。>0＝流入交易所＝潛在賣壓＝偏空(反號,-)；
+    <0＝提幣冷錢包＝偏多(+)。±$5 億視為滿格。缺料/非數字回 0.0（中性化）。
+    """
+    if not isinstance(netflow_usd, (int, float)):
+        return 0.0
+    return _clamp(-netflow_usd / 500_000_000.0)
+
+
+def score_btc_dominance(dominance_pct) -> float:
+    """BTC 市占 → [-1,+1]（影子層採『對整體加密 risk 氛圍』解讀）。
+    市占升＝資金回流 BTC 避險、山寨失血＝整體 risk_off 傾向(反號,-)；
+    市占降＝資金外溢山寨＝risk_on(+)。以 50% 為中性錨，±10 個百分點
+    （40~60%）視為滿格。缺料/非數字回 0.0（中性化）。
+    """
+    if not isinstance(dominance_pct, (int, float)):
+        return 0.0
+    return _clamp(-(dominance_pct - 50.0) / 10.0)
+
+
+def score_altcoin_season(season_index) -> float:
+    """Altcoin Season Index（0-100）→ [-1,+1]。高＝山寨季＝risk_on(+)；
+    低＝比特幣季＝risk_off(-)。以 50 為中性，線性映射 (idx-50)/50。
+    缺料/非數字回 0.0（中性化）。
+    """
+    if not isinstance(season_index, (int, float)):
+        return 0.0
+    return _clamp((season_index - 50.0) / 50.0)
+
+
+def score_btc_vs_m2(deviation_pct) -> float:
+    """BTC 相對 M2 的超漲/落後% → [-1,+1]（估值／流動性對照）。
+    BTC 漲幅超過 M2（正偏離）＝流動性順風下的動能延續＝溫和偏多(+)；
+    落後＝偏空(-)。±30 個百分點視為滿格（此分量權重最低，僅給弱訊號）。
+    缺料/非數字回 0.0（中性化）。
+    """
+    if not isinstance(deviation_pct, (int, float)):
+        return 0.0
+    return _clamp(deviation_pct / 30.0)
+
+
 def compute_confluence(components: dict) -> dict:
     """把各分量原始輸入用確定性規則合成 macro_confluence_score + 明細。**純函式**。
 
     參數 components（各鍵皆可缺，缺則該分量中性化）：
         etf_cum_7d_flow_usd, dxy_change_pct, breadth(dict), avg_funding_8h,
-        oi_delta_pct, liq_long_usd, liq_short_usd, whale_net_long_pct
+        oi_delta_pct, liq_long_usd, liq_short_usd, whale_net_long_pct,
+        coinbase_premium_value, coin_netflow_usd, btc_dominance_pct,
+        altcoin_season_index, btc_vs_m2_deviation_pct
     回傳
         macro_confluence_score: float ∈ [-100,+100]（+偏多/risk-on，-偏空/risk-off）
         components: {name: {raw, sub_score∈[-1,1], weight, contribution}}
@@ -177,6 +238,17 @@ def compute_confluence(components: dict) -> dict:
                          "short": c.get("liq_short_usd")}),
         "whales": (score_whales(c.get("whale_net_long_pct")),
                    c.get("whale_net_long_pct")),
+        # 新增 5 個 CoinGlass 綜合宏觀端點（影子輔助觀測；鍵名須與 _WEIGHTS 一致）
+        "coinbase_premium": (score_coinbase_premium(c.get("coinbase_premium_value")),
+                             c.get("coinbase_premium_value")),
+        "coin_netflow": (score_coin_netflow(c.get("coin_netflow_usd")),
+                         c.get("coin_netflow_usd")),
+        "btc_dominance": (score_btc_dominance(c.get("btc_dominance_pct")),
+                          c.get("btc_dominance_pct")),
+        "altcoin_season": (score_altcoin_season(c.get("altcoin_season_index")),
+                           c.get("altcoin_season_index")),
+        "btc_vs_m2": (score_btc_vs_m2(c.get("btc_vs_m2_deviation_pct")),
+                      c.get("btc_vs_m2_deviation_pct")),
     }
 
     detail: dict[str, dict] = {}
@@ -233,7 +305,10 @@ def render_dashboard(summary: dict | None) -> str:
         comps = s.get("components") or {}
         name_zh = {"etf": "ETF淨流", "dxy": "美元DXY", "breadth": "市場廣度",
                    "funding": "資金費率", "oi": "未平倉OI",
-                   "liquidation": "清算失衡", "whales": "巨鯨淨倉"}
+                   "liquidation": "清算失衡", "whales": "巨鯨淨倉",
+                   "coinbase_premium": "CB溢價", "coin_netflow": "交易所淨流",
+                   "btc_dominance": "BTC市占", "altcoin_season": "山寨季",
+                   "btc_vs_m2": "M2流動性"}
         # 取貢獻度絕對值前 4 大分量列出（方向＋/−）
         ranked = sorted(
             ((name_zh.get(k, k), v.get("sub_score", 0.0))
@@ -411,6 +486,10 @@ async def _collect_components(source) -> dict:
         巨鯨：source.get_hyperliquid_whales()
         DXY：tradfi（Yahoo Finance）
         breadth：market_scanner.get_latest_breadth()（純讀 scanner.db）
+        新增 5 個 CoinGlass 綜合宏觀端點（coinbase premium / coin netflow /
+        btc dominance / altcoin season / btc vs m2）：全走同一 source（共用
+        限流器 + TTL 快取），各自獨立 try/except；任何缺料一律中性化、不計
+        n_present 分母（沿用既有優雅降級模式，永不臆測方向、永不拖垮 daemon）。
     """
     out: dict = {}
     if source is None:
@@ -489,6 +568,62 @@ async def _collect_components(source) -> dict:
                 if (it.get("symbol") or "").upper() in ("BTC", "BTCUSDT", "XBT"):
                     out["whale_net_long_pct"] = it.get("net_long_pct")
                     break
+    except Exception:
+        pass
+
+    # ----------------------------------------------------------------------
+    # 新增 5 個 CoinGlass 綜合宏觀端點（v56 預留→正式接入 confluence 影子分數）。
+    # 各自獨立 try/except（一塊崩潰不波及他塊），全部 `not r.get('error')` 才寫鍵；
+    # 缺料一律不寫鍵 → compute 端 score_* 收 None 回 0.0 → 不計 n_present 分母。
+    # 全程影子：只寫 out dict 供純函式合成 + 顯示，永不入 strength/fire/下單。
+    # ----------------------------------------------------------------------
+    # --- CB 溢價（美國現貨買壓代理）---
+    try:
+        r = await source.get_coinbase_premium_index("1h", 24)
+        if isinstance(r, dict) and not r.get("error"):
+            out["coinbase_premium_value"] = r.get("latest")
+    except Exception:
+        pass
+
+    # --- 交易所淨流（流入＝賣壓）---
+    try:
+        r = await source.get_coin_netflow("BTC", "1h", 24)
+        if isinstance(r, dict) and not r.get("error"):
+            out["coin_netflow_usd"] = r.get("latest")
+    except Exception:
+        pass
+
+    # --- BTC 市占（避險／資金外溢山寨）---
+    try:
+        r = await source.get_bitcoin_dominance(30)
+        if isinstance(r, dict) and not r.get("error"):
+            out["btc_dominance_pct"] = r.get("latest")
+    except Exception:
+        pass
+
+    # --- 山寨季氛圍（Altcoin Season Index 0-100）---
+    try:
+        r = await source.get_altcoin_season(30)
+        if isinstance(r, dict) and not r.get("error"):
+            out["altcoin_season_index"] = r.get("latest")
+    except Exception:
+        pass
+
+    # --- BTC vs M2（此端點無 'latest'，僅 series；須自 series 算近端偏離）---
+    try:
+        r = await source.get_bitcoin_vs_m2("global", 60)
+        if isinstance(r, dict) and not r.get("error"):
+            s = r.get("series") or []
+            if s:
+                last = s[-1]
+                first = s[0]
+                p, m = last.get("price"), last.get("m2")
+                p0, m0 = first.get("price"), first.get("m2")
+                # 確定性偏離 = BTC 漲幅% − M2 漲幅%（正＝BTC 相對 M2 超漲，負＝落後）
+                if all(isinstance(x, (int, float)) and x for x in (p, m, p0, m0)):
+                    btc_chg = (p - p0) / p0 * 100.0
+                    m2_chg = (m - m0) / m0 * 100.0
+                    out["btc_vs_m2_deviation_pct"] = btc_chg - m2_chg
     except Exception:
         pass
 

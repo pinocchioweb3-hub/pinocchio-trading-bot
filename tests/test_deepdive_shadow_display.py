@@ -6,6 +6,7 @@
   * 絕不出現績效字眼（勝率/報酬%/年化/買進訊號…）＝紅線③
   * #33 焦點橫幅：只列 triple_present、依 convergence_score 由高到低、只讀最後一輪
 """
+import asyncio
 import importlib
 import json
 
@@ -114,11 +115,12 @@ def test_convergence_focus_line_bad_json(tmp_path, monkeypatch):
 def test_observe_prefix_combines_and_never_raises(tmp_path, monkeypatch):
     import botpaths
     monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)  # 無 JSONL → 焦點行空
-    out = macro._shadow_observe_prefix({"tf_nesting": {
+    # _shadow_observe_prefix 已改為 async（會 await 跨年類比影子行），測試以 asyncio.run 驅動
+    out = asyncio.run(macro._shadow_observe_prefix({"tf_nesting": {
         "layer_count": 3, "stage_label": "盤整", "alignment_score": 0.5,
-        "trade_side": {"side": "neutral"}, "false_break": {}}})
+        "trade_side": {"side": "neutral"}, "false_break": {}}}))
     assert "盤整" in out
     _assert_clean(out)
     # 全壞輸入也只回字串、不拋例外
-    assert isinstance(macro._shadow_observe_prefix({}), str)
-    assert isinstance(macro._shadow_observe_prefix({"tf_nesting": 123}), str)
+    assert isinstance(asyncio.run(macro._shadow_observe_prefix({})), str)
+    assert isinstance(asyncio.run(macro._shadow_observe_prefix({"tf_nesting": 123})), str)
