@@ -1259,11 +1259,15 @@ class CoinGlassSource:
 
     # =====================================================================
     # 綜合宏觀端點（已付費 $79 Startup）：已正式接入 macro_confluence 影子分數。
-    # ✅ 誠實註記：macro_confluence._collect_components 已呼叫以下 5 個方法
-    # （coinbase premium / coin netflow / btc dominance / altcoin season /
-    # btc vs m2），各以低權重計入 _WEIGHTS（合計 0.22），純讀觀測。
-    # ⚠️ 影子鐵則：這 5 個分量永不乘進/加進 strength_score、永不進 fire/
+    # ✅ 誠實註記：macro_confluence._collect_components 已呼叫以下 8 個方法：
+    # 第一批 5 個（coinbase premium / coin netflow / btc dominance / altcoin
+    # season / btc vs m2）；第二批 3 個（orderbook ask-bids 掛單牆 /
+    # 現貨-合約量比 / 官方聚合 CVD），皆 $79 真 key 實測可用。各以低權重計入
+    # _WEIGHTS（第一批合計 0.16、第二批 0.06，共 0.22），純讀觀測。
+    # ⚠️ 影子鐵則：這 8 個分量永不乘進/加進 strength_score、永不進 fire/
     # symbol_gate/下單、不發 Telegram；只供 confluence 影子合成 + 儀表板顯示。
+    # ⚠️ 第二批的 get_aggregated_cvd_history 之 latest_slope 永不餵進 strength.py
+    #    既有的 cvd_slope_7d（兩者為獨立影子序列，僅供日後 A/B 校準）。
     # ---------------------------------------------------------------------
     # 設計鐵則（與本檔既有方法一致）：
     #   * 全部走 self._get（共用限流器 + TTL 快取 + 退避重試），不另開額度。
@@ -1424,6 +1428,159 @@ class CoinGlassSource:
                               source="coinglass", code="EMPTY_DATA",
                               message="no btc-vs-m2 data")
         return {"source": "coinglass", "region": reg, "series": series}
+
+    # ---------------------------------------------------------------------
+    # 第二批 3 個高價值端點（v58；trading-bot-coinglass-entitlements 真 key 實測）：
+    #   掛單牆深度 / 現貨-合約量比 / 官方聚合 CVD。全純讀影子，鐵則同上方第一批。
+    # ---------------------------------------------------------------------
+    async def get_orderbook_ask_bids_history(self, symbol: str = "BTC",
+                                             interval: str = "1h",
+                                             limit: int = 24) -> dict:
+        """聚合掛單牆（order-book 買/賣盤 USD 深度）歷史：真實供需牆代理。
+        買盤掛單牆較厚＝下方支撐(偏多)、賣盤牆較厚＝上方壓力(偏空)。
+        imbalance=(bid−ask)/(bid+ask)∈[-1,+1]。
+        端點 /api/futures/orderbook/aggregated-ask-bids-history（$79 實測可用）。
+
+        回 {"symbol","source","latest_bid_usd","latest_ask_usd",
+            "latest_imbalance","series":[{ts,bid_usd,ask_usd,imbalance}]}；
+        失敗回 make_error dict（不 raise）。
+        """
+        agg_sym = self._agg_symbol(symbol)
+        r = await self._get(
+            "/api/futures/orderbook/aggregated-ask-bids-history",
+            {"symbol": agg_sym, "interval": interval,
+             "limit": min(max(limit, 1), 500),
+             "exchange_list": self.DEFAULT_OI_EXCHANGES},
+            tool="mi_get_orderbook_walls", symbol=symbol,
+        )
+        if r.get("error"):
+            return r
+        data = r.get("data") or []
+        series = []
+        for d in data:
+            bid = self._to_float(
+                d.get("aggregated_bids_usd") if d.get("aggregated_bids_usd") is not None
+                else (d.get("bids_usd") if d.get("bids_usd") is not None
+                      else d.get("bids")))
+            ask = self._to_float(
+                d.get("aggregated_asks_usd") if d.get("aggregated_asks_usd") is not None
+                else (d.get("asks_usd") if d.get("asks_usd") is not None
+                      else d.get("asks")))
+            if bid is not None and ask is not None and (bid + ask) > 0:
+                imb = (bid - ask) / (bid + ask)
+                series.append({"ts": self._extract_ts(d), "bid_usd": bid,
+                               "ask_usd": ask, "imbalance": imb})
+        if not series:
+            return make_error(tool="mi_get_orderbook_walls", symbol=symbol,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no orderbook ask-bids data")
+        last = series[-1]
+        return {"symbol": symbol, "source": "coinglass",
+                "latest_bid_usd": last["bid_usd"],
+                "latest_ask_usd": last["ask_usd"],
+                "latest_imbalance": last["imbalance"], "series": series}
+
+    async def get_futures_spot_volume_ratio(self, symbol: str = "BTC",
+                                            interval: str = "1h",
+                                            limit: int = 24) -> dict:
+        """現貨/合約「主動成交量比」：CoinGlass 無單一比值端點，故由 spot 與 futures
+        兩個 aggregated-cvd 端點的主動買+賣量按同根時間戳推導。
+        ratio=現貨主動量÷合約主動量。>1＝現貨主導(較實,偏多+)；<1＝合約(永續)主導
+        (槓桿驅動,較虛,偏空−)，用來過濾純槓桿假突破。
+        ⚠️ 中性錨 1.0 為暫定值（永續量常>現貨量），待影子資料累積後校準；現純觀測。
+
+        回 {"symbol","source","latest","series":[{ts,value}]}；失敗回 make_error dict。
+        """
+        agg_sym = self._agg_symbol(symbol)
+        lim = min(max(limit, 1), 500)
+        fut, spot = await asyncio.gather(
+            self._get("/api/futures/aggregated-cvd/history",
+                      {"symbol": agg_sym, "interval": interval, "limit": lim,
+                       "exchange_list": self.DEFAULT_OI_EXCHANGES},
+                      tool="mi_get_spot_perp_ratio", symbol=symbol),
+            self._get("/api/spot/aggregated-cvd/history",
+                      {"symbol": agg_sym, "interval": interval, "limit": lim,
+                       "exchange_list": self.DEFAULT_OI_EXCHANGES},
+                      tool="mi_get_spot_perp_ratio", symbol=symbol),
+            return_exceptions=True,
+        )
+        if not (isinstance(fut, dict) and not fut.get("error")
+                and isinstance(spot, dict) and not spot.get("error")):
+            return make_error(tool="mi_get_spot_perp_ratio", symbol=symbol,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="spot/futures aggregated-cvd unavailable")
+
+        def _vol_by_ts(resp: dict) -> dict:
+            out: dict = {}
+            for d in (resp.get("data") or []):
+                buy = self._to_float(d.get("agg_taker_buy_vol"))
+                sell = self._to_float(d.get("agg_taker_sell_vol"))
+                if buy is None or sell is None:
+                    continue
+                out[self._extract_ts(d)] = buy + sell
+            return out
+
+        fut_v = _vol_by_ts(fut)
+        spot_v = _vol_by_ts(spot)
+        series = []
+        for ts in sorted(set(fut_v) & set(spot_v)):
+            fv = fut_v[ts]
+            if fv and fv > 0:
+                series.append({"ts": ts, "value": spot_v[ts] / fv})
+        if not series:
+            return make_error(tool="mi_get_spot_perp_ratio", symbol=symbol,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no overlapping spot/futures volume bars")
+        return {"symbol": symbol, "source": "coinglass",
+                "latest": series[-1]["value"], "series": series}
+
+    async def get_aggregated_cvd_history(self, symbol: str = "BTC",
+                                         interval: str = "1h",
+                                         limit: int = 168) -> dict:
+        """官方聚合 CVD 歷史（/api/futures/aggregated-cvd/history，$79 實測可用）：
+        用來『校準』本機自算的 cvd_slope（A/B 影子觀測，非取代）。
+        latest_slope＝視窗內淨主動量比＝Σ(buy−sell)/Σ(buy+sell)∈[-1,+1]
+        （已正規化、無單位，避免量級放大誤差）；>0＝買方累積(偏多+)、<0＝賣方(偏空−)。
+
+        回 {"symbol","source","latest_cvd","latest_slope","series":[{ts,value}]}；
+        失敗回 make_error dict。⚠️ 此分量永不餵進 strength.py 的 cvd_slope_7d。
+        """
+        agg_sym = self._agg_symbol(symbol)
+        r = await self._get(
+            "/api/futures/aggregated-cvd/history",
+            {"symbol": agg_sym, "interval": interval,
+             "limit": min(max(limit, 1), 500),
+             "exchange_list": self.DEFAULT_OI_EXCHANGES},
+            tool="mi_get_agg_cvd", symbol=symbol,
+        )
+        if r.get("error"):
+            return r
+        data = r.get("data") or []
+        series = []
+        tot_buy = 0.0
+        tot_sell = 0.0
+        for d in data:
+            v = self._to_float(
+                d.get("cum_vol_delta") if d.get("cum_vol_delta") is not None
+                else (d.get("cvd") if d.get("cvd") is not None
+                      else d.get("close")))
+            if v is not None:
+                series.append({"ts": self._extract_ts(d), "value": v})
+            buy = self._to_float(d.get("agg_taker_buy_vol"))
+            sell = self._to_float(d.get("agg_taker_sell_vol"))
+            if buy is not None:
+                tot_buy += buy
+            if sell is not None:
+                tot_sell += sell
+        if not series:
+            return make_error(tool="mi_get_agg_cvd", symbol=symbol,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no aggregated cvd data")
+        denom = tot_buy + tot_sell
+        slope = ((tot_buy - tot_sell) / denom) if denom > 0 else 0.0
+        return {"symbol": symbol, "source": "coinglass",
+                "latest_cvd": series[-1]["value"], "latest_slope": slope,
+                "series": series}
 
     # =====================================================================
     async def health(self) -> dict:

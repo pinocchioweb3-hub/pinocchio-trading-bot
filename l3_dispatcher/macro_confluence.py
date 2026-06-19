@@ -41,22 +41,28 @@ _SINK_MAX_BYTES = 5_000_000
 
 # 分量權重（總和 = 1.0）。確定性、可調但目前固定；shadow 不影響任何下單故可自由校準。
 # 採 N/100.0 形式（points 表整數加總 = 100，最穩健抗未來改權重 / 浮點誤差）。
-# 新增 5 個 CoinGlass 綜合宏觀端點（coinbase_premium / coin_netflow / btc_dominance
-# / altcoin_season / btc_vs_m2）：舊 7 項整體下調騰出 22 points 給新 5 項（8+6+4+2+2），保持
-# 「ETF / DXY / breadth 仍主導、新端點為輔助觀測」的相對序。仍全程影子、不影響下單。
+# 第一批 5 個 CoinGlass 端點（coinbase_premium / coin_netflow / btc_dominance /
+# altcoin_season / btc_vs_m2）已併入（合計 16 points）。
+# 第二批 3 個（v58；orderbook_imbalance 掛單牆 / spot_perp_ratio 現貨-合約量比 /
+# agg_cvd_slope 官方聚合CVD）：自 oi(9→7)、coinbase_premium(8→6)、coin_netflow(6→4)
+# 各騰出 2 points 共 6，分給新 3 項（3+2+1），維持「ETF / DXY / breadth 仍主導、
+# 新端點為弱輔助觀測」的相對序，整體加總仍 = 100。仍全程影子、不影響下單。
 _WEIGHTS = {
     "etf": 18 / 100.0,            # 0.18  ETF 機構淨流（最強的趨勢資金訊號）
     "dxy": 14 / 100.0,            # 0.14  美元指數（升→風險資產逆風）
     "breadth": 12 / 100.0,        # 0.12  全市場廣度（risk-on/off 旗標來源）
     "funding": 11 / 100.0,        # 0.11  資金費率（過熱→偏空燃料）
-    "oi": 9 / 100.0,             # 0.09  未平倉量趨勢
+    "oi": 7 / 100.0,             # 0.07  未平倉量趨勢（v58 9→7 騰權重）
     "liquidation": 8 / 100.0,     # 0.08  清算失衡（空清算多→軋空燃料）
     "whales": 6 / 100.0,         # 0.06  HL 巨鯨淨倉
-    "coinbase_premium": 8 / 100.0,  # 0.08  新：美國現貨買壓（Coinbase 溢價）
-    "coin_netflow": 6 / 100.0,    # 0.06  新：交易所淨流（流入＝賣壓）
-    "btc_dominance": 4 / 100.0,   # 0.04  新：BTC 市占（避險／資金外溢山寨）
-    "altcoin_season": 2 / 100.0,  # 0.02  新：山寨季氛圍
-    "btc_vs_m2": 2 / 100.0,       # 0.02  新：流動性估值（最弱輔助）
+    "coinbase_premium": 6 / 100.0,  # 0.06  美國現貨買壓（v58 8→6 騰權重）
+    "coin_netflow": 4 / 100.0,    # 0.04  交易所淨流（流入＝賣壓；v58 6→4 騰權重）
+    "btc_dominance": 4 / 100.0,   # 0.04  BTC 市占（避險／資金外溢山寨）
+    "altcoin_season": 2 / 100.0,  # 0.02  山寨季氛圍
+    "btc_vs_m2": 2 / 100.0,       # 0.02  流動性估值（最弱輔助）
+    "orderbook_imbalance": 3 / 100.0,  # 0.03  新：掛單牆買/賣盤深度失衡（供需牆）
+    "spot_perp_ratio": 2 / 100.0,  # 0.02  新：現貨/合約量比（過濾槓桿假突破）
+    "agg_cvd_slope": 1 / 100.0,   # 0.01  新：官方聚合 CVD 斜率（校準用，最弱）
 }
 
 # breadth<這個門檻 → 掛 risk_off 旗標
@@ -202,6 +208,40 @@ def score_btc_vs_m2(deviation_pct) -> float:
     return _clamp(deviation_pct / 30.0)
 
 
+def score_orderbook_imbalance(imbalance) -> float:
+    """掛單牆深度失衡 → [-1,+1]。client 端已算成 (bid-ask)/(bid+ask) ∈ [-1,+1]：
+    買牆厚於賣牆＝下方支撐強＝偏多(+)；賣牆厚＝上方壓力強＝偏空(-)。
+    已正規化故直接 clamp。缺料/非數字回 0.0（中性化）。
+    """
+    if not isinstance(imbalance, (int, float)):
+        return 0.0
+    return _clamp(imbalance)
+
+
+def score_spot_perp_ratio(ratio) -> float:
+    """現貨/合約量比 → [-1,+1]。錨點 1.0（現貨≈合約量）為中性：
+    >1＝現貨主導＝真實買賣盤推動（健康，偏多+）；<1＝合約槓桿主導＝
+    易為假突破（偏空/降權-）。以 (ratio-1.0) 映射、±1.0 視為滿格。
+    錨點 1.0 為暫定基準（影子觀測，落地後可依實測分布再校）。
+    缺料/非數字回 0.0（中性化）。
+    """
+    if not isinstance(ratio, (int, float)):
+        return 0.0
+    return _clamp(ratio - 1.0)
+
+
+def score_agg_cvd_slope(slope) -> float:
+    """官方聚合 CVD 斜率 → [-1,+1]。client 端已算成
+    Σ(主買-主賣)/Σ(主買+主賣) ∈ [-1,+1] 的無量綱正規化斜率：
+    主動買量淨多＝偏多(+)；主動賣量淨多＝偏空(-)。已正規化故直接 clamp。
+    ⚠️ 此值為影子校準用，**永不**餵進 strength.py 既有的 cvd_slope_7d。
+    缺料/非數字回 0.0（中性化）。
+    """
+    if not isinstance(slope, (int, float)):
+        return 0.0
+    return _clamp(slope)
+
+
 def compute_confluence(components: dict) -> dict:
     """把各分量原始輸入用確定性規則合成 macro_confluence_score + 明細。**純函式**。
 
@@ -209,7 +249,8 @@ def compute_confluence(components: dict) -> dict:
         etf_cum_7d_flow_usd, dxy_change_pct, breadth(dict), avg_funding_8h,
         oi_delta_pct, liq_long_usd, liq_short_usd, whale_net_long_pct,
         coinbase_premium_value, coin_netflow_usd, btc_dominance_pct,
-        altcoin_season_index, btc_vs_m2_deviation_pct
+        altcoin_season_index, btc_vs_m2_deviation_pct,
+        orderbook_imbalance_value, spot_perp_ratio_value, agg_cvd_slope_value
     回傳
         macro_confluence_score: float ∈ [-100,+100]（+偏多/risk-on，-偏空/risk-off）
         components: {name: {raw, sub_score∈[-1,1], weight, contribution}}
@@ -249,6 +290,16 @@ def compute_confluence(components: dict) -> dict:
                            c.get("altcoin_season_index")),
         "btc_vs_m2": (score_btc_vs_m2(c.get("btc_vs_m2_deviation_pct")),
                       c.get("btc_vs_m2_deviation_pct")),
+        # 第二批 3 個 CoinGlass 端點（v58；影子輔助觀測；鍵名須與 _WEIGHTS 一致）
+        "orderbook_imbalance": (
+            score_orderbook_imbalance(c.get("orderbook_imbalance_value")),
+            c.get("orderbook_imbalance_value")),
+        "spot_perp_ratio": (
+            score_spot_perp_ratio(c.get("spot_perp_ratio_value")),
+            c.get("spot_perp_ratio_value")),
+        "agg_cvd_slope": (
+            score_agg_cvd_slope(c.get("agg_cvd_slope_value")),
+            c.get("agg_cvd_slope_value")),
     }
 
     detail: dict[str, dict] = {}
@@ -308,7 +359,8 @@ def render_dashboard(summary: dict | None) -> str:
                    "liquidation": "清算失衡", "whales": "巨鯨淨倉",
                    "coinbase_premium": "CB溢價", "coin_netflow": "交易所淨流",
                    "btc_dominance": "BTC市占", "altcoin_season": "山寨季",
-                   "btc_vs_m2": "M2流動性"}
+                   "btc_vs_m2": "M2流動性", "orderbook_imbalance": "掛單牆",
+                   "spot_perp_ratio": "現貨/合約量比", "agg_cvd_slope": "官方CVD"}
         # 取貢獻度絕對值前 4 大分量列出（方向＋/−）
         ranked = sorted(
             ((name_zh.get(k, k), v.get("sub_score", 0.0))
@@ -624,6 +676,36 @@ async def _collect_components(source) -> dict:
                     btc_chg = (p - p0) / p0 * 100.0
                     m2_chg = (m - m0) / m0 * 100.0
                     out["btc_vs_m2_deviation_pct"] = btc_chg - m2_chg
+    except Exception:
+        pass
+
+    # ----------------------------------------------------------------------
+    # 第二批 3 個 CoinGlass 端點（v58；$79 即有，影子輔助觀測）。同樣各自
+    # 獨立 try/except，缺料一律不寫鍵 → score_* 收 None 回 0.0 → 不計 n_present。
+    # 全程影子：只寫 out dict 供純函式合成 + 顯示，永不入 strength/fire/下單。
+    # ----------------------------------------------------------------------
+    # --- 掛單牆深度失衡（聚合 ask/bids 歷史；client 已算 (bid-ask)/(bid+ask)）---
+    try:
+        r = await source.get_orderbook_ask_bids_history("BTC", "1h", 24)
+        if isinstance(r, dict) and not r.get("error"):
+            out["orderbook_imbalance_value"] = r.get("latest_imbalance")
+    except Exception:
+        pass
+
+    # --- 現貨/合約量比（client 由現貨vs合約主動量 derive，1.0 為中性錨）---
+    try:
+        r = await source.get_futures_spot_volume_ratio("BTC", "1h", 24)
+        if isinstance(r, dict) and not r.get("error"):
+            out["spot_perp_ratio_value"] = r.get("latest")
+    except Exception:
+        pass
+
+    # --- 官方聚合 CVD 斜率（校準用；client 已算成 [-1,+1] 正規化斜率）---
+    # ⚠️ 此值僅供影子合成/校準，永不餵進 strength.py 的 cvd_slope_7d。
+    try:
+        r = await source.get_aggregated_cvd_history("BTC", "1h", 168)
+        if isinstance(r, dict) and not r.get("error"):
+            out["agg_cvd_slope_value"] = r.get("latest_slope")
     except Exception:
         pass
 

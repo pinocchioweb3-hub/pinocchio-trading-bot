@@ -114,6 +114,36 @@ def test_score_btc_vs_m2_direction():
     assert mc.score_btc_vs_m2(None) == 0.0
 
 
+# --- 第二批 3 個 CoinGlass 分量計分器的方向 / 邊界測試（v58 影子層）---
+def test_score_orderbook_imbalance_direction():
+    # client 端已算成 [-1,+1]：買牆厚(正)＝偏多、賣牆厚(負)＝偏空
+    assert mc.score_orderbook_imbalance(0.5) == 0.5
+    assert mc.score_orderbook_imbalance(1.0) == 1.0     # 已正規化，直接 clamp
+    assert mc.score_orderbook_imbalance(-1.0) == -1.0
+    assert mc.score_orderbook_imbalance(2.0) == 1.0     # 越界夾在 +1
+    assert mc.score_orderbook_imbalance(0) == 0.0
+    assert mc.score_orderbook_imbalance(None) == 0.0    # 缺料中性
+
+
+def test_score_spot_perp_ratio_anchor_one():
+    # 錨點 1.0 為中性：>1 現貨主導(偏多+)、<1 合約主導(偏空-)
+    assert mc.score_spot_perp_ratio(2.0) == 1.0         # (2.0-1.0) 滿格偏多
+    assert mc.score_spot_perp_ratio(1.0) == 0.0         # 錨點中性
+    assert mc.score_spot_perp_ratio(0.0) == -1.0        # (0-1) 滿格偏空
+    assert mc.score_spot_perp_ratio(1.5) == 0.5         # 線性
+    assert mc.score_spot_perp_ratio(None) == 0.0        # 缺料中性
+
+
+def test_score_agg_cvd_slope_direction():
+    # client 端已算成 [-1,+1] 正規化斜率：買方淨多(正)＝偏多、賣方淨多(負)＝偏空
+    assert mc.score_agg_cvd_slope(0.7) == 0.7
+    assert mc.score_agg_cvd_slope(1.0) == 1.0
+    assert mc.score_agg_cvd_slope(-1.0) == -1.0
+    assert mc.score_agg_cvd_slope(2.0) == 1.0           # 越界夾在 +1
+    assert mc.score_agg_cvd_slope(0) == 0.0
+    assert mc.score_agg_cvd_slope(None) == 0.0          # 缺料中性
+
+
 def test_score_breadth_direction_and_riskoff():
     # 24h 偏多 + 1h 不極端 → 正方向、無 risk_off
     s, ro = mc.score_breadth({"n_total": 100, "n_up24h": 70, "n_down24h": 30,
@@ -173,13 +203,15 @@ def test_compute_confluence_weights_sum_to_one():
 
 
 def test_weights_sum_to_one_after_extension():
-    """擴 12 項後仍守『總和==1.0』+ 鎖定 12 項數量（新增 5 個 CoinGlass 端點）。"""
+    """擴 15 項後仍守『總和==1.0』+ 鎖定 15 項數量
+    （第一批 5 個 + 第二批 3 個 CoinGlass 端點）。"""
     total = sum(mc._WEIGHTS.values())
     assert abs(total - 1.0) < 1e-9, f"擴項後權重總和應為 1.0，實為 {total}"
-    assert len(mc._WEIGHTS) == 12, f"應有 12 個分量，實為 {len(mc._WEIGHTS)}"
-    # 新 5 鍵必須在 _WEIGHTS 中
+    assert len(mc._WEIGHTS) == 15, f"應有 15 個分量，實為 {len(mc._WEIGHTS)}"
+    # 第一批 5 鍵 + 第二批 3 鍵都必須在 _WEIGHTS 中
     for k in ("coinbase_premium", "coin_netflow", "btc_dominance",
-              "altcoin_season", "btc_vs_m2"):
+              "altcoin_season", "btc_vs_m2",
+              "orderbook_imbalance", "spot_perp_ratio", "agg_cvd_slope"):
         assert k in mc._WEIGHTS, f"新分量 {k} 應在 _WEIGHTS"
 
 
@@ -281,6 +313,25 @@ def test_each_new_weight_in_components_detail():
         assert d["weight"] == mc._WEIGHTS[k]
 
 
+def test_compute_confluence_new3_components_segregated():
+    """第二批 3 個新鍵全給值 → 輸出含 macro_confluence_score、不含 strength_score
+    / strength_multiplier；3 新分量都進 components 明細、且 n_present 計入 3 個。"""
+    out = mc.compute_confluence({
+        "orderbook_imbalance_value": 0.5,
+        "spot_perp_ratio_value": 1.5,
+        "agg_cvd_slope_value": 0.6,
+    })
+    assert "macro_confluence_score" in out
+    assert "strength_score" not in out
+    assert "strength_multiplier" not in out
+    for k in ("orderbook_imbalance", "spot_perp_ratio", "agg_cvd_slope"):
+        assert k in out["components"], f"新分量 {k} 應在 components 明細"
+        d = out["components"][k]
+        assert abs(d["contribution"] - d["sub_score"] * d["weight"]) < 1e-6
+        assert d["weight"] == mc._WEIGHTS[k]
+    assert out["n_present"] == 3
+
+
 def test_collect_new5_all_missing_n_present_correct(monkeypatch):
     """5 個新端點全缺/全失敗 → _collect_components 不崩潰、不含 5 個新鍵；
     compute 端不因新項增加 n_present（純函式版：缺料 sub=0 不計分母）。"""
@@ -301,6 +352,16 @@ def test_collect_new5_all_missing_n_present_correct(monkeypatch):
             return {"error": True}
 
         async def get_bitcoin_vs_m2(self, *a, **k):
+            return {"error": True}
+
+        # 第二批 3 個新端點：error / raise / error（驗各自 try/except 不互相波及）
+        async def get_orderbook_ask_bids_history(self, *a, **k):
+            return {"error": True, "code": "EMPTY_DATA"}
+
+        async def get_futures_spot_volume_ratio(self, *a, **k):
+            raise RuntimeError("boom")  # 一塊 raise 不可波及他塊
+
+        async def get_aggregated_cvd_history(self, *a, **k):
             return {"error": True}
 
         # 既有端點：全部回缺料 error（讓 out 乾淨，方便斷言）
@@ -325,9 +386,11 @@ def test_collect_new5_all_missing_n_present_correct(monkeypatch):
                         _mc._collect_components)  # no-op，確保用真實函式
 
     out = asyncio.run(_mc._collect_components(_FakeSource()))
-    # 5 個新鍵一個都不該寫入（全失敗/缺料）
+    # 第一批 5 + 第二批 3 個新鍵一個都不該寫入（全失敗/缺料/raise 皆吞）
     for k in ("coinbase_premium_value", "coin_netflow_usd", "btc_dominance_pct",
-              "altcoin_season_index", "btc_vs_m2_deviation_pct"):
+              "altcoin_season_index", "btc_vs_m2_deviation_pct",
+              "orderbook_imbalance_value", "spot_perp_ratio_value",
+              "agg_cvd_slope_value"):
         assert k not in out, f"全缺時不應寫入 {k}"
     # 把 out 丟 compute：n_present 不因新項增加（純空時 == 0）
     summary = mc.compute_confluence(out)
@@ -336,6 +399,74 @@ def test_collect_new5_all_missing_n_present_correct(monkeypatch):
     pure = mc.compute_confluence({})
     assert pure["n_present"] == 0
     assert "macro_confluence_score" in summary
+
+
+def test_collect_new3_present_maps_to_value_keys():
+    """第二批 3 個新端點回有效 dict 時，_collect_components 正確把
+    latest_imbalance / latest / latest_slope 對映到 *_value 鍵（驗鍵名接線無錯位）。
+    其餘端點全缺，確保 out 只剩這 3 個可控鍵 + 不誤觸 strength/下單路徑。"""
+    import asyncio
+
+    class _FakeSource:
+        # 第二批 3 個新端點：回有效 dict（欄位名須與 client 回傳一致）
+        async def get_orderbook_ask_bids_history(self, *a, **k):
+            return {"latest_imbalance": 0.42, "series": [{"ts": 1, "imbalance": 0.42}]}
+
+        async def get_futures_spot_volume_ratio(self, *a, **k):
+            return {"latest": 1.30, "series": [{"ts": 1, "value": 1.30}]}
+
+        async def get_aggregated_cvd_history(self, *a, **k):
+            return {"latest_slope": -0.25, "latest_cvd": 123.0,
+                    "series": [{"ts": 1, "value": 123.0}]}
+
+        # 其餘端點全缺料（讓 out 乾淨可斷言）
+        async def get_coinbase_premium_index(self, *a, **k):
+            return {"error": True}
+
+        async def get_coin_netflow(self, *a, **k):
+            return {"error": True}
+
+        async def get_bitcoin_dominance(self, *a, **k):
+            return {"error": True}
+
+        async def get_altcoin_season(self, *a, **k):
+            return {"error": True}
+
+        async def get_bitcoin_vs_m2(self, *a, **k):
+            return {"error": True}
+
+        async def get_etf_flows(self, *a, **k):
+            return {"error": True}
+
+        async def get_funding(self, *a, **k):
+            return {"error": True}
+
+        async def get_oi(self, *a, **k):
+            return {"error": True}
+
+        async def get_liquidations(self, *a, **k):
+            return {"error": True}
+
+        async def get_hyperliquid_whales(self, *a, **k):
+            return {"error": True}
+
+    out = asyncio.run(mc._collect_components(_FakeSource()))
+    # 核心：3 個新端點的回傳欄位正確對映到 *_value 鍵（接線無錯位）
+    assert out.get("orderbook_imbalance_value") == 0.42
+    assert out.get("spot_perp_ratio_value") == 1.30
+    assert out.get("agg_cvd_slope_value") == -0.25
+    # 丟進 compute：不混入 strength 命名空間、產出影子分數
+    summary = mc.compute_confluence(out)
+    assert "macro_confluence_score" in summary
+    assert "strength_score" not in summary
+    # n_present 的「純函式語意」用受控 dict 驗（_collect 會夾雜本地 breadth/dxy
+    # 即時 I/O，數量不可控，故 n_present 不在 collect 結果上斷言）：
+    pure3 = mc.compute_confluence({
+        "orderbook_imbalance_value": 0.42,
+        "spot_perp_ratio_value": 1.30,
+        "agg_cvd_slope_value": -0.25,
+    })
+    assert pure3["n_present"] == 3
 
 
 # ============================================================ 3. history-logger
@@ -439,6 +570,23 @@ def test_new_components_appear_in_dashboard():
     text = mc.render_dashboard(out)
     # 至少 CB溢價（最高新權重 0.08）應入前 4 大並顯示其標籤
     assert "CB溢價" in text
+    assert "影子觀測" in text
+    assert "非進場訊號" in text
+    _assert_clean(text)
+
+
+def test_new3_components_appear_in_dashboard():
+    """只給第二批 3 個新分量極端值（其餘全缺）→ 3 個繁中標籤都進前 4 大顯示，
+    且無績效字眼、仍含誠實橫幅『影子觀測』『非進場訊號』。"""
+    out = mc.compute_confluence({
+        "orderbook_imbalance_value": 1.0,   # 掛單牆 滿格(偏多)
+        "spot_perp_ratio_value": 2.0,       # 現貨/合約量比 滿格(偏多)
+        "agg_cvd_slope_value": -1.0,        # 官方CVD 滿格(偏空)
+    })
+    text = mc.render_dashboard(out)
+    assert "掛單牆" in text
+    assert "現貨/合約量比" in text
+    assert "官方CVD" in text
     assert "影子觀測" in text
     assert "非進場訊號" in text
     _assert_clean(text)
