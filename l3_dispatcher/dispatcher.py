@@ -306,6 +306,10 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
         from .paper_journal import record_paper_entry
         try:
             from .plan_snapshot import build_plan_snapshot
+            # v56 step4：影子層 — 把進場當下已算好的 regime/context 觀測值打包（純資料，
+            # 零下單數學；失敗回兩個空向量不影響建單）。
+            from .regime_vector import assemble as _assemble_regime
+            _rv, _ctx = _assemble_regime(snap, direction=direction)
             plan_snap = build_plan_snapshot(
                 source="direct_fire", direction=direction,
                 entry_price=entry_price, planned_stop=stop,
@@ -313,6 +317,7 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
                 fire_id=fire_id, signal_msg_id=msg_id, regime=regime,
                 thesis=decision.get("reason", ""),
                 confidence=(cc.get("confidence") if cc else None),
+                regime_vector=_rv, context=_ctx,
             )
         except Exception as _e:
             plan_snap = None

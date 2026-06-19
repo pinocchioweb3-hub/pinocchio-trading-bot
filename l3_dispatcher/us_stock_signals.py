@@ -266,13 +266,17 @@ async def run_us_signal_loop(tg, scan_interval: int = 900):
                                 # v56 step1：進場那刻凍結計畫快照（純觀測，失敗回 None 不阻塞）
                                 try:
                                     from .plan_snapshot import build_plan_snapshot
+                                    # v56 step4：影子層 regime/context 觀測（純資料，零下單數學）
+                                    from .regime_vector import assemble as _asm_rg
+                                    _rv, _ctx = _asm_rg(snap, direction=d.direction.value)
                                     plan_snap = build_plan_snapshot(
                                         source="us_breakout",
                                         direction=d.direction.value,
                                         entry_price=entry, planned_stop=stop,
                                         tp1=tps["tp1"], tp2=tps["tp2"],
                                         tp3=tps["tp3"], signal_msg_id=sig_mid,
-                                        regime=f"us_{snap.us_session}")
+                                        regime=f"us_{snap.us_session}",
+                                        regime_vector=_rv, context=_ctx)
                                 except Exception:
                                     plan_snap = None
                                 pid = record_paper_entry(

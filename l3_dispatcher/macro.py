@@ -718,11 +718,16 @@ def _record_deepdive_plan(sym: str, plan: dict | None,
         # v56 step1：進場那刻凍結計畫快照（純觀測，失敗回 None 不阻塞建單）
         try:
             from .plan_snapshot import build_plan_snapshot
+            # v56 step4：deepdive 無 per-symbol snapshot，仍補市場層 context
+            # （廣度/均資費，本地 DB 讀）；純觀測，零下單數學。
+            from .regime_vector import assemble as _asm_rg
+            _rv, _ctx = _asm_rg(None, direction=direction)
             plan_snap = build_plan_snapshot(
                 source="macro_deepdive", direction=direction,
                 entry_price=entry, planned_stop=stop,
                 tp1=tp1, tp2=_tp2, tp3=_tp3,
-                signal_msg_id=signal_msg_id, regime="deepdive")
+                signal_msg_id=signal_msg_id, regime="deepdive",
+                regime_vector=_rv, context=_ctx)
         except Exception:
             plan_snap = None
         record_paper_entry(

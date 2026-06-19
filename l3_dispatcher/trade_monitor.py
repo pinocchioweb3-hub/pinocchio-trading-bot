@@ -361,11 +361,16 @@ async def _check_waiting_trades(source, tg, bars_cache: dict[str, list],
             # v56 step1：觸發成交那刻凍結計畫快照（純觀測，失敗回 None 不阻塞建單）
             try:
                 from .plan_snapshot import build_plan_snapshot
+                # v56 step4：觸發成交當下補市場層 context（廣度/均資費，本地 DB 讀）。
+                # 此刻才是真實進場時點，市場廣度比訊號當時更貼近實況。純觀測，零下單數學。
+                from .regime_vector import assemble as _asm_rg
+                _rv, _ctx = _asm_rg(None, direction=w["direction"])
                 plan_snap = build_plan_snapshot(
                     source="waiting_trigger", direction=w["direction"],
                     entry_price=live, planned_stop=w["stop_price"],
                     tp1=w["tp1"], tp2=w["tp2"], tp3=w["tp3"],
-                    fire_id=w["fire_id"], regime=regime)
+                    fire_id=w["fire_id"], regime=regime,
+                    regime_vector=_rv, context=_ctx)
             except Exception:
                 plan_snap = None
             record_paper_entry(
