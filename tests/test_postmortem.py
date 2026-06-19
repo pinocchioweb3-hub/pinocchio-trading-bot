@@ -25,8 +25,10 @@ if str(ROOT) not in sys.path:
 from l3_dispatcher.postmortem import (
     BREADTH_MATCH_TOL_S,
     append_notes,
+    attribute_plan_vs_result,
     btc_above_200ma_4h,
     bucket_ev,
+    bucket_plan_attribution,
     classify_exit,
     d1_counterfactual,
     enrich_with_environment,
@@ -38,6 +40,7 @@ from l3_dispatcher.postmortem import (
     _dedup_key,
     _up_pct_from_breadth,
 )
+import l3_dispatcher.postmortem as _pm
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +335,173 @@ def test_load_processed_keys_tolerates_bad_lines():
         p.write_text('{"dedup_key": "fire:1"}\nNOT JSON\n\n{"dedup_key":"id:2"}\n',
                      encoding="utf-8")
         assert load_processed_keys(p) == {"fire:1", "id:2"}
+
+
+# ---------------------------------------------------------------------------
+# 6) #48 計畫 vs 結果歸因（復盤三問）
+# ---------------------------------------------------------------------------
+def _plan(expected_r=1.5, rr=(1.5, 2.5, 4.0), ceiling=1.0, stop=95.0,
+          source="direct_fire"):
+    return {
+        "source": source,
+        "expected_r": expected_r,
+        "rr_to_tp": {"tp1": rr[0], "tp2": rr[1], "tp3": rr[2]},
+        "expected_stop_scenario": {
+            "trigger_type": "invalidation_level",
+            "trigger_level": stop,
+            "expected_mae_ceiling_r": ceiling,
+        },
+    }
+
+
+def test_attribute_no_plan_marks_unknown_honestly():
+    # 舊單無 plan_snapshot → has_plan=False，比較欄誠實標 unknown（紅線③不臆測）
+    pa = attribute_plan_vs_result(
+        {"exit_reason": "stop", "realized_r": -1.0, "legs_hit": ""})
+    assert pa["has_plan"] is False
+    assert pa["plan_adherence"] == "unknown"
+    assert pa["stop_scenario_check"] == "unknown"
+    assert pa["expected_r"] is None
+    assert pa["cause"] == "觸及止損出場"
+
+
+def test_attribute_stop_as_expected():
+    # 止損、虧損在預期 1R 上限內 → stop_as_expected + as_planned_loss
+    t = {"exit_reason": "stop", "realized_r": -0.95, "legs_hit": "",
+         "plan_snapshot": _plan()}
+    pa = attribute_plan_vs_result(t)
+    assert pa["has_plan"] is True
+    assert pa["stop_scenario_check"] == "stop_as_expected"
+    assert pa["plan_adherence"] == "as_planned_loss"
+
+
+def test_attribute_stop_worse_than_expected():
+    # 止損但虧損超出預期上限（滑價/跳空）→ 關鍵教訓
+    t = {"exit_reason": "stop", "realized_r": -1.8, "legs_hit": "",
+         "plan_snapshot": _plan(ceiling=1.0)}
+    pa = attribute_plan_vs_result(t)
+    assert pa["stop_scenario_check"] == "stop_worse_than_expected"
+    assert pa["plan_adherence"] == "worse_than_plan"
+    assert pa["r_vs_expected"] == round(-1.8 - 1.5, 3)
+
+
+def test_attribute_win_as_planned():
+    # tp3 全打、R 落在最遠目標帶內 → as_planned_win；止損本次未觸發
+    t = {"exit_reason": "tp3", "realized_r": 3.8, "legs_hit": "tp1,tp2,tp3",
+         "plan_snapshot": _plan(rr=(1.5, 2.5, 4.0))}
+    pa = attribute_plan_vs_result(t)
+    assert pa["plan_adherence"] == "as_planned_win"
+    assert pa["stop_scenario_check"] == "stop_not_triggered"
+    assert pa["max_planned_r"] == 4.0
+
+
+def test_attribute_exceeded_plan():
+    # 賺得比最遠計畫目標還多 → exceeded_plan
+    t = {"exit_reason": "tp3", "realized_r": 5.2, "legs_hit": "tp1,tp2,tp3",
+         "plan_snapshot": _plan(rr=(1.5, 2.5, 4.0))}
+    pa = attribute_plan_vs_result(t)
+    assert pa["plan_adherence"] == "exceeded_plan"
+
+
+def test_attribute_under_plan_win():
+    # 獲利但不及首要目標（提早/部分出場）→ under_plan_win
+    t = {"exit_reason": "tp1", "realized_r": 0.8, "legs_hit": "tp1",
+         "plan_snapshot": _plan(expected_r=1.5, rr=(1.5, 2.5, 4.0))}
+    pa = attribute_plan_vs_result(t)
+    assert pa["plan_adherence"] == "under_plan_win"
+
+
+def test_attribute_flat():
+    t = {"exit_reason": "timeout", "realized_r": 0.0, "legs_hit": "",
+         "plan_snapshot": _plan()}
+    pa = attribute_plan_vs_result(t)
+    assert pa["plan_adherence"] == "flat"
+    # timeout 出場 → 止損未觸發
+    assert pa["stop_scenario_check"] == "stop_not_triggered"
+
+
+def test_attribute_does_not_mutate_input():
+    t = {"exit_reason": "stop", "realized_r": -1.0, "legs_hit": "",
+         "plan_snapshot": _plan()}
+    before = dict(t)
+    attribute_plan_vs_result(t)
+    assert t == before
+
+
+def test_enrich_attaches_plan_attribution():
+    trade = {"id": 1, "fire_id": 9, "direction": "bull", "setup": "deepdive",
+             "entry_at": 1_700_000_000_000, "realized_r": -1.0,
+             "exit_reason": "stop", "legs_hit": "", "plan_snapshot": _plan()}
+    rows = [{"ts": 1_700_000_000, "n_up24h": 10, "n_down24h": 90, "avg_funding": 0.0}]
+    e = enrich_with_environment(trade, rows)
+    assert "plan_attribution" in e
+    assert e["plan_attribution"]["has_plan"] is True
+    assert e["plan_attribution"]["stop_scenario_check"] == "stop_as_expected"
+
+
+def test_bucket_plan_attribution_coverage_and_counts():
+    rows = [{"ts": 1_700_000_000, "n_up24h": 50, "n_down24h": 50}]
+    # 2 筆有快照、1 筆無快照（舊單）
+    t1 = {"id": 1, "fire_id": 1, "direction": "bull", "setup": "deepdive",
+          "entry_at": 1_700_000_000_000, "realized_r": -1.8, "exit_reason": "stop",
+          "legs_hit": "", "plan_snapshot": _plan()}
+    t2 = {"id": 2, "fire_id": 2, "direction": "bull", "setup": "deepdive",
+          "entry_at": 1_700_000_000_000, "realized_r": 3.8, "exit_reason": "tp3",
+          "legs_hit": "tp1,tp2,tp3", "plan_snapshot": _plan()}
+    t3 = {"id": 3, "fire_id": 3, "direction": "bull", "setup": "deepdive",
+          "entry_at": 1_700_000_000_000, "realized_r": -1.0, "exit_reason": "stop",
+          "legs_hit": ""}     # 無快照
+    enriched = [enrich_with_environment(t, rows) for t in (t1, t2, t3)]
+    pa = bucket_plan_attribution(enriched)
+    assert pa["n_real"] == 3
+    assert pa["n_with_plan"] == 2
+    assert pa["coverage_pct"] == round(2 / 3 * 100, 1)
+    assert pa["adherence_counts"].get("worse_than_plan") == 1
+    assert pa["adherence_counts"].get("as_planned_win") == 1
+    assert pa["stop_check_counts"].get("stop_worse_than_expected") == 1
+
+
+def test_bucket_plan_attribution_excludes_entry_expired():
+    rows = [{"ts": 1_700_000_000, "n_up24h": 50, "n_down24h": 50}]
+    t = {"id": 1, "fire_id": 1, "direction": "bull", "setup": "deepdive",
+         "entry_at": 1_700_000_000_000, "realized_r": 0.0,
+         "exit_reason": "entry_expired", "legs_hit": "", "plan_snapshot": _plan()}
+    enriched = [enrich_with_environment(t, rows)]
+    pa = bucket_plan_attribution(enriched)
+    assert pa["n_real"] == 0
+    assert pa["coverage_pct"] == 0.0
+
+
+def test_fetch_closed_paper_deserializes_plan_snapshot():
+    """證明 _fetch_closed_paper 的 SELECT 含 plan_snapshot 且反序列化成 dict。"""
+    import json as _json
+    import sqlite3 as _sql
+    conn = _sql.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE paper_trades (id INTEGER, symbol TEXT, setup TEXT, "
+        "direction TEXT, entry_price REAL, stop_price REAL, tp1 REAL, tp2 REAL, "
+        "tp3 REAL, status TEXT, legs_hit TEXT, pnl_usd REAL, realized_r REAL, "
+        "exit_reason TEXT, entry_at INTEGER, exit_at INTEGER, fire_id TEXT, "
+        "regime TEXT, plan_snapshot TEXT)")
+    plan = _plan()
+    conn.execute(
+        "INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (1, "BTC", "deepdive", "bull", 100, 95, 110, 120, 130, "closed", "",
+         50, -1.0, "stop", 1_700_000_000_000, 1_700_003_600_000, "f1", "range",
+         _json.dumps(plan)))
+    # 第二筆：plan_snapshot 為 NULL（引擎上線前的舊單）
+    conn.execute(
+        "INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (2, "ETH", "deepdive", "bull", 50, 48, 55, 60, 65, "closed", "",
+         10, 0.5, "tp1", 1_700_000_000_000, 1_700_003_600_000, "f2", "range", None))
+    conn.commit()
+    rows = _pm._fetch_closed_paper(conn)
+    conn.close()
+    rows.sort(key=lambda r: r["id"])
+    assert len(rows) == 2
+    assert isinstance(rows[0]["plan_snapshot"], dict)
+    assert rows[0]["plan_snapshot"]["expected_r"] == 1.5
+    assert rows[1]["plan_snapshot"] is None       # NULL → None（誠實標未捕捉）
 
 
 # ---------------------------------------------------------------------------

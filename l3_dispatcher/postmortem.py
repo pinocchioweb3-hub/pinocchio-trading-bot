@@ -254,6 +254,8 @@ def enrich_with_environment(trade: dict, breadth_rows: list[dict]) -> dict:
     out["countertrend"] = is_countertrend(trade.get("direction"), up_pct)
     out["breadth_ts"] = b.get("ts") if b else None
     out["dedup_key"] = _dedup_key(trade)
+    # #48 計畫 vs 結果歸因（消費進場凍結的 plan_snapshot；無快照→誠實標 unknown）
+    out["plan_attribution"] = attribute_plan_vs_result(out)
     return out
 
 
@@ -327,6 +329,218 @@ def bucket_ev(enriched: list[dict]) -> dict:
     losing.sort(key=lambda x: x["sum_r"])    # 合計虧損最大的在前
     result["losing_patterns"] = losing
     return result
+
+
+# =====================================================================
+# 4.5) 計畫 vs 結果歸因（#48 復盤三問）— 純函式、零策略數學、不 import strength
+# =====================================================================
+# 計畫對比容忍帶（R 的相對誤差）：進出場有滑價、部位分批，給合理帶寬避免吹毛求疵。
+PLAN_R_BAND = 0.15
+
+# 與計畫吻合度 / 止損劇本驗證的中文標籤（digest 與 TG 共用，集中維護）
+_ADH_LABEL = {
+    "as_planned_win": "照計畫達標獲利",
+    "exceeded_plan": "超出計畫（賺更多）",
+    "under_plan_win": "獲利但不及計畫目標（提早/部分出場）",
+    "as_planned_loss": "照計畫認賠（止損上限內）",
+    "worse_than_plan": "⚠️ 虧損超出計畫（關鍵教訓）",
+    "win_no_plan_r": "獲利（計畫未含目標R）",
+    "flat": "打平出場（≈0R）",
+    "not_traded": "掛單未成交",
+    "unknown": "無法判定",
+}
+_STOP_LABEL = {
+    "stop_as_expected": "止損如預期",
+    "stop_worse_than_expected": "⚠️ 止損比預期更糟（滑價/跳空）",
+    "stop_not_triggered": "止損未觸發（以其他方式出場）",
+    "no_stop_plan": "計畫未含止損劇本",
+    "unknown": "無法判定",
+}
+
+
+def _planned_r_targets(plan: dict) -> tuple[float | None, float | None]:
+    """從 plan 取 (expected_r=首要目標R, max_planned_r=最遠目標R)。容錯回 (None, None)。"""
+    try:
+        exp = plan.get("expected_r")
+        exp = float(exp) if exp is not None else None
+    except Exception:
+        exp = None
+    mx = None
+    rr = plan.get("rr_to_tp")
+    if isinstance(rr, dict):
+        vals = []
+        for k in ("tp1", "tp2", "tp3"):
+            v = rr.get(k)
+            try:
+                if v is not None:
+                    vals.append(float(v))
+            except Exception:
+                pass
+        if vals:
+            mx = max(vals)
+    if exp is None:
+        exp = mx
+    return exp, mx
+
+
+def _stop_ceiling_r(plan: dict) -> float:
+    """預期止損上限（R 正值幅度）。缺值 → 預設 1.0（與 plan_snapshot 預設劇本一致）。"""
+    try:
+        ess = plan.get("expected_stop_scenario") or {}
+        c = ess.get("expected_mae_ceiling_r")
+        return float(c) if c is not None else 1.0
+    except Exception:
+        return 1.0
+
+
+def _stop_trigger_desc(ess: dict) -> str:
+    """把止損劇本渲染成短描述（給『未觸發』時回顧當初預期）。"""
+    tt = ess.get("trigger_type") or "invalidation_level"
+    lvl = ess.get("trigger_level")
+    return f"{tt}@{lvl}" if lvl is not None else str(tt)
+
+
+def attribute_plan_vs_result(trade: dict) -> dict:
+    """計畫 vs 結果歸因（純函式，零策略數學、不 import strength／不呼叫 evaluate）。
+
+    消費進場時凍結的 plan_snapshot（trade['plan_snapshot']，dict 或 None），對照真實
+    出場結果，回答使用者要的復盤三問：
+      ① 結果原因（cause）：哪一段劇本上演了（達標／部分／止損／超時）。
+      ② 與計畫吻合度（plan_adherence）：照計畫達標 / 超出 / 不及 / 比計畫更糟。
+      ③ 止損劇本驗證（stop_scenario_check）：當初預期『觸及失效價約 1R 出場』，
+         真止損時是否吻合（吻合 / 比預期更糟＝滑價跳空 / 本次未觸發）。
+
+    無 plan_snapshot（引擎上線前的舊單）→ has_plan=False，比較欄誠實標 unknown、
+    不臆測（紅線③）。隨引擎前向累積新單，覆蓋率會上升。回新 dict，不改輸入。
+    """
+    exit_class = trade.get("exit_class") or classify_exit(
+        trade.get("exit_reason"), trade.get("realized_r"), trade.get("legs_hit"))
+    try:
+        realized_r = trade.get("realized_r")
+        realized_r = float(realized_r) if realized_r is not None else None
+    except Exception:
+        realized_r = None
+
+    cause = {
+        "win_full": "達成完整計畫（tp3 全打）",
+        "win_partial": "部分止盈後出場（未達最終目標）",
+        "stop_loss": "觸及止損出場",
+        "timeout": "超時出場（既未達標也未止損）",
+        "entry_expired": "掛單未成交（非真實交易）",
+        "other": "其他/未明確出場",
+    }.get(exit_class, "未知")
+
+    plan = trade.get("plan_snapshot")
+    if not isinstance(plan, dict):
+        return {
+            "has_plan": False, "plan_source": None, "exit_class": exit_class,
+            "cause": cause, "plan_adherence": "unknown",
+            "plan_adherence_note": "進場時未凍結計畫快照（引擎上線前的舊單）→ 無法做計畫對比",
+            "stop_scenario_check": "unknown",
+            "stop_scenario_note": "無計畫快照，止損劇本無從驗證",
+            "expected_r": None, "max_planned_r": None,
+            "realized_r": realized_r, "r_vs_expected": None,
+            "expected_mae_ceiling_r": None,
+        }
+
+    exp_r, max_r = _planned_r_targets(plan)
+    ceiling = _stop_ceiling_r(plan)
+    r_vs_exp = (round(realized_r - exp_r, 3)
+                if (realized_r is not None and exp_r is not None) else None)
+
+    # ② 與計畫吻合度
+    if realized_r is None:
+        adh, adh_note = "unknown", "無真實 R，無法對比計畫"
+    elif exit_class == "entry_expired":
+        adh, adh_note = "not_traded", "掛單未成交，計畫未執行"
+    elif realized_r > 0:
+        if max_r is not None and realized_r > max_r * (1 + PLAN_R_BAND):
+            adh = "exceeded_plan"
+            adh_note = f"獲利 {realized_r:+.2f}R 超出最遠計畫目標 {max_r:+.2f}R（賺得比計畫多）"
+        elif exp_r is not None and realized_r >= exp_r * (1 - PLAN_R_BAND):
+            adh = "as_planned_win"
+            adh_note = f"獲利 {realized_r:+.2f}R 達計畫目標區（首要目標 {exp_r:+.2f}R）"
+        elif exp_r is not None:
+            adh = "under_plan_win"
+            adh_note = f"獲利 {realized_r:+.2f}R 但不及計畫首要目標 {exp_r:+.2f}R（提早/部分出場）"
+        else:
+            adh = "win_no_plan_r"
+            adh_note = f"獲利 {realized_r:+.2f}R（計畫未含目標 R，無對比基準）"
+    elif realized_r == 0:
+        adh, adh_note = "flat", "打平出場（≈0R）"
+    else:
+        if realized_r >= -ceiling * (1 + PLAN_R_BAND):
+            adh = "as_planned_loss"
+            adh_note = f"虧損 {realized_r:+.2f}R 在計畫止損上限（約 -{ceiling:.2f}R）內（照計畫認賠）"
+        else:
+            adh = "worse_than_plan"
+            adh_note = (f"虧損 {realized_r:+.2f}R 超出計畫止損上限 -{ceiling:.2f}R"
+                        "（滑價/跳空/止損未如期保護 → 關鍵教訓）")
+
+    # ③ 止損劇本驗證
+    ess = plan.get("expected_stop_scenario")
+    ess = ess if isinstance(ess, dict) else None
+    if ess is None:
+        stop_chk, stop_note = "no_stop_plan", "計畫未含止損劇本"
+    elif exit_class != "stop_loss":
+        stop_chk = "stop_not_triggered"
+        stop_note = (f"本次以 {exit_class} 出場，未觸發止損 → 當初『{_stop_trigger_desc(ess)}』"
+                     "的止損劇本本次未上演")
+    elif realized_r is None:
+        stop_chk, stop_note = "unknown", "止損出場但無真實 R，無法驗證"
+    elif realized_r >= -ceiling * (1 + PLAN_R_BAND):
+        stop_chk = "stop_as_expected"
+        stop_note = (f"止損如預期：觸及失效價出場、虧損 {realized_r:+.2f}R "
+                     f"在預期上限 -{ceiling:.2f}R 內（劇本吻合）")
+    else:
+        stop_chk = "stop_worse_than_expected"
+        stop_note = (f"止損但比預期更糟：虧損 {realized_r:+.2f}R 超出預期上限 -{ceiling:.2f}R"
+                     "（疑似滑價/跳空，止損未如期保護 → 關鍵教訓）")
+
+    return {
+        "has_plan": True,
+        "plan_source": plan.get("source"),
+        "exit_class": exit_class,
+        "cause": cause,
+        "plan_adherence": adh,
+        "plan_adherence_note": adh_note,
+        "stop_scenario_check": stop_chk,
+        "stop_scenario_note": stop_note,
+        "expected_r": exp_r,
+        "max_planned_r": max_r,
+        "realized_r": realized_r,
+        "r_vs_expected": r_vs_exp,
+        "expected_mae_ceiling_r": ceiling,
+    }
+
+
+def bucket_plan_attribution(enriched: list[dict]) -> dict:
+    """聚合計畫對比結果（純函式）。回快照覆蓋率 + adherence/stop_check 計數。
+
+    排除 entry_expired（非真實交易）。覆蓋率＝有快照的真實單 / 全部真實單；
+    引擎上線前的舊單無快照，覆蓋率會隨新單前向累積而上升（誠實呈現，不臆測舊單）。
+    """
+    real = [e for e in enriched if e.get("exit_class") != "entry_expired"]
+    n_real = len(real)
+    adh_counts: dict[str, int] = {}
+    stop_counts: dict[str, int] = {}
+    n_with_plan = 0
+    for e in real:
+        pa = e.get("plan_attribution") or {}
+        if not pa.get("has_plan"):
+            continue
+        n_with_plan += 1
+        a = pa.get("plan_adherence", "unknown")
+        s = pa.get("stop_scenario_check", "unknown")
+        adh_counts[a] = adh_counts.get(a, 0) + 1
+        stop_counts[s] = stop_counts.get(s, 0) + 1
+    return {
+        "n_real": n_real,
+        "n_with_plan": n_with_plan,
+        "coverage_pct": round(n_with_plan / n_real * 100, 1) if n_real else 0.0,
+        "adherence_counts": adh_counts,
+        "stop_check_counts": stop_counts,
+    }
 
 
 # =====================================================================
@@ -427,17 +641,33 @@ def _honesty_banner_md() -> str:
 # DB 讀取層（薄、純讀；核心邏輯都在上面的純函式）
 # =====================================================================
 def _fetch_closed_paper(conn: sqlite3.Connection) -> list[dict]:
-    """純讀所有 closed paper_trades（含 entry_expired，後續分類時再排）。"""
+    """純讀所有 closed paper_trades（含 entry_expired，後續分類時再排）。
+
+    含 plan_snapshot 欄（#47 進場凍結的計畫快照，TEXT/JSON）：在此反序列化成 dict，
+    供 #48 計畫 vs 結果歸因消費。舊單（引擎上線前）此欄為 NULL → 回 None（誠實標未捕捉）。
+    """
     rows = conn.execute(
         "SELECT id, symbol, setup, direction, entry_price, stop_price, "
         "tp1, tp2, tp3, status, legs_hit, pnl_usd, realized_r, exit_reason, "
-        "entry_at, exit_at, fire_id, regime "
+        "entry_at, exit_at, fire_id, regime, plan_snapshot "
         "FROM paper_trades WHERE status='closed' ORDER BY exit_at"
     ).fetchall()
     cols = ["id", "symbol", "setup", "direction", "entry_price", "stop_price",
             "tp1", "tp2", "tp3", "status", "legs_hit", "pnl_usd", "realized_r",
-            "exit_reason", "entry_at", "exit_at", "fire_id", "regime"]
-    return [dict(zip(cols, r)) for r in rows]
+            "exit_reason", "entry_at", "exit_at", "fire_id", "regime", "plan_snapshot"]
+    out = []
+    for r in rows:
+        d = dict(zip(cols, r))
+        ps = d.get("plan_snapshot")
+        if isinstance(ps, str) and ps:
+            try:
+                d["plan_snapshot"] = json.loads(ps)
+            except Exception:
+                d["plan_snapshot"] = None      # 壞 JSON → 視同未捕捉，不臆測
+        else:
+            d["plan_snapshot"] = None
+        out.append(d)
+    return out
 
 
 def _fetch_breadth_rows() -> list[dict]:
@@ -481,8 +711,8 @@ def _fetch_btc_4h_closes(days: int = 1200) -> list[tuple[int, float]]:
 # =====================================================================
 # digest 渲染（人類可讀 .md）
 # =====================================================================
-def render_digest_md(ev: dict, d1: dict, n_new: int) -> str:
-    """把分桶 EV + D1 渲染成 markdown。"""
+def render_digest_md(ev: dict, d1: dict, n_new: int, pa: dict | None = None) -> str:
+    """把分桶 EV + 計畫對比 + D1 渲染成 markdown。"""
     lines = [
         "# 🔬 皮諾丘交易覆盤（驗屍）摘要",
         "",
@@ -522,6 +752,23 @@ def render_digest_md(ev: dict, d1: dict, n_new: int) -> str:
     else:
         lines.append("（暫無達門檻的賠錢模式）")
 
+    if pa:
+        cov_warn = ("　⚠️ 引擎上線前的舊單無快照，覆蓋率會隨新單前向累積而上升"
+                    if pa.get("coverage_pct", 0) < 100 else "")
+        lines += ["", "## 📋 計畫 vs 結果歸因（復盤三問）", "",
+                  f"- 計畫快照覆蓋率：{pa.get('n_with_plan', 0)}/{pa.get('n_real', 0)} 筆"
+                  f"（{pa.get('coverage_pct', 0)}%）{cov_warn}"]
+        adh = pa.get("adherence_counts", {})
+        if adh:
+            lines += ["", "**② 與計畫吻合度：**"]
+            for k, v in sorted(adh.items(), key=lambda x: -x[1]):
+                lines.append(f"- {_ADH_LABEL.get(k, k)}：{v} 筆")
+        sc = pa.get("stop_check_counts", {})
+        if sc:
+            lines += ["", "**③ 止損劇本驗證：**"]
+            for k, v in sorted(sc.items(), key=lambda x: -x[1]):
+                lines.append(f"- {_STOP_LABEL.get(k, k)}：{v} 筆")
+
     lines += ["", "## D1 反事實（deepdive 加 breadth 閘 + BTC 4h>200MA）", "",
               f"- 評估筆數：{d1.get('n_eval', 0)}",
               f"- 會被擋：{d1.get('blocked_n', 0)} 筆，合計 {d1.get('blocked_sum_r', 0):+.2f}R",
@@ -531,7 +778,7 @@ def render_digest_md(ev: dict, d1: dict, n_new: int) -> str:
     return "\n".join(lines)
 
 
-def render_weekly_tg(ev: dict, d1: dict) -> str:
+def render_weekly_tg(ev: dict, d1: dict, pa: dict | None = None) -> str:
     """每週一彙整賠錢模式成建議，HTML 推系統主題（頂部誠實橫幅）。"""
     lp = ev.get("losing_patterns", [])
     blocks = [_honesty_banner_html(),
@@ -556,6 +803,14 @@ def render_weekly_tg(ev: dict, d1: dict) -> str:
         blocks.append("⚠️ <b>偵測到賠錢模式</b>（建議檢視）：\n" + "\n".join(tip_lines))
     else:
         blocks.append("✅ 本週無達門檻的賠錢模式（樣本仍 &lt;100，續觀察）")
+
+    if pa and pa.get("n_real"):
+        cov = f"{pa.get('n_with_plan', 0)}/{pa.get('n_real', 0)}（{pa.get('coverage_pct', 0)}%）"
+        wtp = pa.get("adherence_counts", {}).get("worse_than_plan", 0)
+        sworse = pa.get("stop_check_counts", {}).get("stop_worse_than_expected", 0)
+        blocks.append(f"📋 <b>計畫 vs 結果</b>：快照覆蓋 {cov}｜"
+                      f"虧損超出計畫 <code>{wtp}</code> 筆｜"
+                      f"止損比預期更糟 <code>{sworse}</code> 筆")
 
     blocks.append(f"🧪 <b>D1 反事實</b>（deepdive 加 breadth&ge;{d1.get('breadth_gate', '')} "
                   f"且 BTC 4h&gt;200MA）：\n  {d1.get('verdict', '')}")
@@ -597,6 +852,7 @@ def run_scan_once(notes_path: Path | None = None,
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
     records = []
     for e in new_enriched:
+        pa_e = e.get("plan_attribution") or {}
         records.append({
             "dedup_key": e["dedup_key"],
             "processed_at": now_iso,
@@ -614,23 +870,33 @@ def run_scan_once(notes_path: Path | None = None,
             "countertrend": e.get("countertrend"),
             "entry_at": e.get("entry_at"),
             "exit_at": e.get("exit_at"),
+            # #48 計畫 vs 結果歸因（復盤三問留痕；無快照→has_plan=False）
+            "has_plan": pa_e.get("has_plan"),
+            "cause": pa_e.get("cause"),
+            "plan_adherence": pa_e.get("plan_adherence"),
+            "plan_adherence_note": pa_e.get("plan_adherence_note"),
+            "stop_scenario_check": pa_e.get("stop_scenario_check"),
+            "stop_scenario_note": pa_e.get("stop_scenario_note"),
+            "r_vs_expected": pa_e.get("r_vs_expected"),
         })
     n_written = append_notes(records, np_)
 
-    # 滾動聚合（用全部已平倉，非只新筆）+ D1 反事實
+    # 滾動聚合（用全部已平倉，非只新筆）+ 計畫對比 + D1 反事實
     ev = bucket_ev(enriched_all)
+    pa = bucket_plan_attribution(enriched_all)
     btc_4h = _fetch_btc_4h_closes()
     d1 = d1_counterfactual(enriched_all, btc_4h)
 
     # 寫 digest（覆寫；它是「最新狀態」快照）
     try:
         dp_.parent.mkdir(parents=True, exist_ok=True)
-        dp_.write_text(render_digest_md(ev, d1, n_written), encoding="utf-8")
+        dp_.write_text(render_digest_md(ev, d1, n_written, pa), encoding="utf-8")
     except Exception as e:
         print(f"[postmortem] digest write failed: {type(e).__name__}: {e}")
 
     return {"n_new": n_written, "n_total": ev.get("n_total", 0),
-            "ev": ev, "d1": d1, "losing_patterns": ev.get("losing_patterns", [])}
+            "ev": ev, "d1": d1, "plan_attribution": pa,
+            "losing_patterns": ev.get("losing_patterns", [])}
 
 
 def build_weekly_report() -> str | None:
@@ -650,9 +916,10 @@ def build_weekly_report() -> str | None:
     ev = bucket_ev(enriched)
     if ev.get("n_total", 0) == 0:
         return None
+    pa = bucket_plan_attribution(enriched)
     btc_4h = _fetch_btc_4h_closes()
     d1 = d1_counterfactual(enriched, btc_4h)
-    return render_weekly_tg(ev, d1)
+    return render_weekly_tg(ev, d1, pa)
 
 
 # =====================================================================
