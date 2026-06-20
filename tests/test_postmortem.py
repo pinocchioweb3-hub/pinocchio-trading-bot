@@ -505,6 +505,40 @@ def test_fetch_closed_paper_deserializes_plan_snapshot():
 
 
 # ---------------------------------------------------------------------------
+# 6b. entry_expired 不可被當成「打平 flat」（迴歸鎖：分類順序護欄）
+# ---------------------------------------------------------------------------
+def test_attribute_entry_expired_is_not_traded_not_flat():
+    """掛單未成交 realized_r=0.0：歸因必須是 not_traded（非真實交易），絕不可落入 flat。
+
+    這是復盤誠實性的關鍵迴歸鎖（紅線③）——entry_expired 從未成交，把它算進「打平」
+    會污染期望值與覆蓋率。attribute_plan_vs_result 內 entry_expired 分支必須先於 flat。
+    """
+    t = {"exit_reason": "entry_expired", "realized_r": 0.0, "legs_hit": "",
+         "plan_snapshot": _plan()}
+    pa = attribute_plan_vs_result(t)
+    assert pa["has_plan"] is True
+    assert pa["exit_class"] == "entry_expired"
+    assert pa["plan_adherence"] == "not_traded"   # 不可是 "flat"
+    assert pa["stop_scenario_check"] == "stop_not_triggered"
+    assert "非真實交易" in pa["cause"]
+    assert pa["r_vs_expected"] == round(0.0 - 1.5, 3)
+
+
+def test_enrich_entry_expired_end_to_end_not_traded():
+    """end-to-end：enrich 後 entry_expired 帶 not_traded 歸因，且不進真實單聚合分母。"""
+    rows = [{"ts": 1_700_000_000, "n_up24h": 50, "n_down24h": 50}]
+    t = {"id": 1, "fire_id": 1, "direction": "bull", "setup": "deepdive",
+         "entry_at": 1_700_000_000_000, "realized_r": 0.0,
+         "exit_reason": "entry_expired", "legs_hit": "", "plan_snapshot": _plan()}
+    e = enrich_with_environment(t, rows)
+    assert e["exit_class"] == "entry_expired"
+    assert e["plan_attribution"]["plan_adherence"] == "not_traded"
+    pa = bucket_plan_attribution([e])
+    assert pa["n_real"] == 0          # 非真實交易，不進分母
+    assert pa["n_with_plan"] == 0
+
+
+# ---------------------------------------------------------------------------
 # 直跑入口
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":

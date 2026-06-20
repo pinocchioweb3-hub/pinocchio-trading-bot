@@ -506,8 +506,16 @@ def get_paper_stats(days: int = 30, setup: str | None = None,
         conn.close()
 
 
+# L2 學習單位門檻鏡像：每個 (symbol×regime) 桶需 ≥30 筆「成交」單才能過 minTRL 閘。
+# 與 backtest.l2_stat_gates.MIN_BUCKET_N 對齊；此處只用於誠實推估「還缺多少提案」，
+# 不參與任何下單／訊號數學（純顯示）。刻意不 import 以免 daemon 熱路徑拉進回測相依。
+MIN_BUCKET_N_MIRROR = 30
+
+
 def get_paper_funnel(days: int = 30, setup_not: str | None = None) -> dict:
-    """v26: 訂單漏斗 — 提出/真正進場/未成交/部分倉/止盈止損/進行中。"""
+    """v26: 訂單漏斗 — 提出/真正進場/未成交/部分倉/止盈止損/進行中。
+    task#57: 額外揭露 entry_expired（限價掛單逾時未成交）、有效成交率、與依現行成交率
+    推估湊滿一個 L2 學習桶所需的提案數——讓「限價未成交拖累」在日報上可見而非被埋。"""
     init_db()
     conn = _conn()
     try:
@@ -521,6 +529,8 @@ def get_paper_funnel(days: int = 30, setup_not: str | None = None) -> dict:
         proposed = len(rows)
         entered = sum(1 for r in rows if (r[2] or 0) > 0)
         never_filled = sum(1 for r in rows if (r[2] or 0) == 0)      # 掛單從未觸及=無效
+        # entry_expired 是 never_filled 的子集（限價單到期未成交），單獨揭露其拖累佔比。
+        entry_expired = sum(1 for r in rows if (r[3] or "") == "entry_expired")
         partial = sum(1 for r in rows if 0 < (r[2] or 0) < 0.999)
         in_progress = sum(1 for r in rows if r[0] == "open" and (r[2] or 0) > 0)
         # v33: entry_expired 已計入 never_filled（filled_pct==0），不重複算進「已平倉」
@@ -528,9 +538,19 @@ def get_paper_funnel(days: int = 30, setup_not: str | None = None) -> dict:
         tp_wins = sum(1 for r in closed if (r[4] or 0) > 0)
         sl_losses = sum(1 for r in closed if (r[4] or 0) < 0)
         timeouts = sum(1 for r in closed if "timeout" in (r[3] or ""))
+        # 有效成交率＝真正進場 / 提出（None 表示尚無提案，誠實不假裝 0%）。
+        fill_rate = round(100.0 * entered / proposed, 1) if proposed else None
+        # 依現行成交率推估：還需多少提案才能湊滿一個 L2 學習桶（30 筆成交）。
+        # 成交率為 0（全數未成交）時誠實回 None，不捏造一個有限數字。
+        est_proposals_per_bucket = (
+            int(-(-MIN_BUCKET_N_MIRROR * proposed // entered)) if entered else None)
         return {"proposed": proposed, "entered": entered, "never_filled": never_filled,
-                "partial": partial, "in_progress": in_progress, "closed": len(closed),
-                "tp_wins": tp_wins, "sl_losses": sl_losses, "timeouts": timeouts}
+                "entry_expired": entry_expired, "partial": partial,
+                "in_progress": in_progress, "closed": len(closed),
+                "tp_wins": tp_wins, "sl_losses": sl_losses, "timeouts": timeouts,
+                "fill_rate_pct": fill_rate,
+                "est_proposals_per_bucket": est_proposals_per_bucket,
+                "min_bucket_n": MIN_BUCKET_N_MIRROR}
     finally:
         conn.close()
 
@@ -539,13 +559,23 @@ def render_paper_funnel(days: int = 30, setup_not: str | None = None) -> str:
     f = get_paper_funnel(days, setup_not)
     if f["proposed"] == 0:
         return "🔄 <b>訂單漏斗</b>（{}d）：尚無訊號".format(days)
+    fr = f.get("fill_rate_pct")
+    fr_txt = f"{fr}%" if fr is not None else "—"
+    est = f.get("est_proposals_per_bucket")
+    # 誠實揭露限價未成交拖累 + 湊滿 L2 學習桶（30 筆成交）所需提案推估。
+    honest = (f"  限價未成交 <code>{f.get('entry_expired', 0)}</code>　"
+              f"有效成交率 <code>{fr_txt}</code>")
+    if est is not None:
+        honest += (f"　→ 依此率約需 <code>{est}</code> 筆提案"
+                   f"才湊滿 1 個 L2 學習桶（{f.get('min_bucket_n', MIN_BUCKET_N_MIRROR)} 筆成交）")
     return (f"🔄 <b>訂單漏斗</b>（{days}d，紙上）\n"
             f"  提出訊號 <code>{f['proposed']}</code> → "
             f"真正進場 <code>{f['entered']}</code>"
             f"（部分倉 {f['partial']}）→ 進行中 <code>{f['in_progress']}</code>\n"
             f"  無效（掛單未觸及）<code>{f['never_filled']}</code>　"
             f"已平倉 <code>{f['closed']}</code>"
-            f"（止盈 {f['tp_wins']} / 止損 {f['sl_losses']} / 逾時 {f['timeouts']}）")
+            f"（止盈 {f['tp_wins']} / 止損 {f['sl_losses']} / 逾時 {f['timeouts']}）\n"
+            f"{honest}")
 
 
 def render_paper_summary(stats: dict) -> str:

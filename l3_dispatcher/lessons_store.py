@@ -121,9 +121,12 @@ def _parse_snap(raw):
     if not raw:
         return None
     try:
-        return json.loads(raw)
+        v = json.loads(raw)
     except Exception:
         return None
+    # 只接受 dict 快照；合法 JSON 但型別不對（list/int/str/None）一律降級為「無快照」，
+    # 否則 distill 對 list/int 呼叫 .get() 會炸 → 整檔重建掛掉（紅線③：壞資料誠實降級而非崩潰）。
+    return v if isinstance(v, dict) else None
 
 
 def distill(row: dict) -> dict:
@@ -176,8 +179,17 @@ def distill(row: dict) -> dict:
 
 
 def build_lessons(days: int = 365) -> list[dict]:
-    """從 DB 蒸餾全部教訓卡（不寫檔）。"""
-    return [distill(r) for r in _load_rows(days)]
+    """從 DB 蒸餾全部教訓卡（不寫檔）。
+    逐列防護：單一壞列（如 plan_snapshot 結構異常）只跳過該列並告警，不得拖垮整檔重建——
+    rebuild_lessons_file 每晚由 auto_tuner 迴圈呼叫，一列毒不能讓全庫消失（韌性 > 完整）。"""
+    out: list[dict] = []
+    for r in _load_rows(days):
+        try:
+            out.append(distill(r))
+        except Exception as e:  # noqa: BLE001 — 防一筆壞列炸掉整檔重建
+            print(f"[lessons_store] 跳過壞列 id={r.get('id')!r}: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+    return out
 
 
 def rebuild_lessons_file(path: Path | None = None, days: int = 365) -> dict:

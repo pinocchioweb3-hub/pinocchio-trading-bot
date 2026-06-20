@@ -137,3 +137,39 @@ def test_query_empty_file_returns_empty():
         assert ls.query_lessons(path=p) == []
         assert ls.learning_set(p) == []
         assert ls.summarize_by_quadrant(p)["total"] == 0
+
+
+# ── task#57：壞快照韌性（合法 JSON 但非 dict / 截斷 JSON 不得炸） ──────────
+def test_parse_snap_rejects_non_dict():
+    # 合法 JSON 但型別不對 → 一律降級為 None（distill 才不會對 list/int 呼叫 .get()）
+    assert ls._parse_snap("[]") is None
+    assert ls._parse_snap("42") is None
+    assert ls._parse_snap('"x"') is None
+    assert ls._parse_snap("null") is None
+    # 截斷／非法 JSON → None
+    assert ls._parse_snap("{not json") is None
+    assert ls._parse_snap("") is None
+    # 正常 dict → 原樣回傳
+    assert ls._parse_snap('{"a": 1}') == {"a": 1}
+
+
+def test_distill_non_dict_snapshot_degrades_to_unknown():
+    # 限價單若某天寫進結構異常的 plan_snapshot（list/int/str），distill 須誠實降級為
+    # 無快照（quadrant=unknown、has_snapshot=False），不得拋例外。
+    for bad in ("[]", "42", '"oops"', "{truncated"):
+        d = ls.distill(_row(id=99, plan_snapshot=bad, realized_r=1.2, exit_reason="tp1"))
+        assert d["quadrant"] == "unknown"
+        assert d["has_snapshot"] is False
+        assert d["expected_r"] is None and d["delta_r"] is None
+
+
+def test_build_lessons_skips_bad_row_keeps_good(monkeypatch, capsys):
+    # 一筆會讓 distill 拋例外的毒列（realized_r 非數值）不得拖垮整檔重建——
+    # build_lessons 須跳過該列、告警 stderr，並保住其餘好列（韌性 > 完整）。
+    good = _row(id=1)
+    bad = _row(id=2, realized_r="not-a-number")     # float() 會在 distill 內炸
+    monkeypatch.setattr(ls, "_load_rows", lambda days=365: [good, bad])
+    out = ls.build_lessons()
+    assert len(out) == 1 and out[0]["paper_id"] == 1
+    err = capsys.readouterr().err
+    assert "跳過壞列" in err and "id=2" in err
