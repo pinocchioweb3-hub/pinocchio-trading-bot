@@ -6,8 +6,9 @@
 本檔＝第二步：開始「回補缺的數據」。資料缺口在 universe 排名路徑——
 coinglass.py:666 對每個 universe 幣硬塞 `cvd_slope_7d = 0.0`（z-score 恆 0 →
 strength.py 的 20% CVD 權重在排名路徑等於死掉）。本影子 worker 每小時：
-    1. 取 universe 因子快照（source.get_strength_universe，bounded N，重用 daemon
-       共用限流器 + TTL 快取）——這是 strength 排名器「實際吃到」的因子（含 0.0 stub）。
+    1. 取 universe 因子快照（**逐幣節流**呼叫 source.get_strength_universe，避開
+       「burst N 筆被 CoinGlass 上游 429 截斷成 ~2–5 筆」的缺陷；重用 daemon 共用
+       限流器 + TTL 快取）——這是 strength 排名器「實際吃到」的因子（含 0.0 stub）。
     2. 對同一批幣用免 key Binance klines 自算 cvd_slope_7d / cvd_slope（零額度）。
     3. 把「實際因子（含 0.0 缺口）＋ 該補的 Binance CVD 值」併成一筆 JSONL 寫進
        獨立 sink：data_dir()/cvd_shadow.jsonl。
@@ -35,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import time
 
 # universe 因子快照取樣數（對它們逐幣免費自算 Binance CVD；上限保守省 CoinGlass 額度）
 _UNIVERSE_N = 20
@@ -43,6 +45,14 @@ _CVD_INTERVAL = "1h"
 _CVD_LIMIT = 168
 # JSONL sink 軟上限（位元組）；超過就先改名 .1 再重開，避免無限長
 _SINK_MAX_BYTES = 5_000_000
+# universe 逐幣取數的節流間隔（秒）。探針實證：對 CoinGlass Startup tier 的
+# /pairs-markets，一次 burst N 筆會被上游 429 截斷成 ~2–5 筆；間隔逐筆送大幅提升成功率。
+# 取 3.0s：20 幣 × 3.0s ≈ 60s 在「一輪內」跑完整個橫斷面快照（單筆 JSONL 含全幣同一時刻
+# 因子，供離線反事實重排序須同 T 橫斷面），且 60s 略大於 90s TTL/60s 滑窗——讓多數第二趟
+# 補抓能吃到 live 暖快取命中。刻意不把採樣攤到整個小時（會把同 T 橫斷面打散成 20 筆單幣記錄）。
+# 影子側自己 pace（純讀、零訊號影響），不碰 live get_strength_universe 本身——
+# 改 live 方法的節流＝改變訊號路徑的幣覆蓋（→ trading tier → FIRE），須過回測閘屬另案。
+_UNIVERSE_PACE_SECONDS = 3.0
 
 
 def _sink_path():
@@ -79,17 +89,21 @@ _FACTOR_KEYS = (
 )
 
 
-def _build_item(symbol: str, factors: dict, cvd: dict | None) -> dict:
+def _build_item(symbol: str, factors: dict, cvd: dict | None,
+                captured_ts: str | None = None) -> dict:
     """把一個 universe 因子 dict + 一份 cvd_slopes_from_klines 輸出併成觀測 item。
 
     純函式（無 I/O）：factors=get_strength_universe 的單筆 item；cvd=Binance 自算
     （None＝Binance 取數失敗，誠實記 None 不捏造，紅線③）。
     刻意把「實際因子（含 0.0 stub 缺口）」與「該補的 Binance 值」並排，供離線反事實重排。
+    captured_ts＝該幣因子實際取到的 UTC 時刻（None＝未知，誠實不捏造）；離線閘可據此
+    驗證整輪是否落在同一橫斷面窗口（見 span_sec）。
     """
     factors_live = {k: factors.get(k) for k in _FACTOR_KEYS}
     stub_cvd = factors_live.get("cvd_slope_7d")
     item = {
         "symbol": symbol,
+        "captured_ts": captured_ts,          # 該幣因子實際取到的 UTC 時刻（同 T 橫斷面驗證用）
         "factors_live": factors_live,        # strength 排名器實際吃到的（cvd_slope_7d=0.0 缺口）
         "stub_cvd_slope_7d": stub_cvd,       # 明確標出 universe 路徑現用的 stub（通常 0.0）
         "binance_cvd_slope_7d": None,
@@ -105,6 +119,26 @@ def _build_item(symbol: str, factors: dict, cvd: dict | None) -> dict:
         item["binance_bars"] = len(cvd.get("series") or [])
         item["binance_ok"] = True
     return item
+
+
+def _span_seconds(ts_list) -> float | None:
+    """一輪內「最早→最晚」因子取到時刻的時間跨度（秒）。
+
+    純函式（無 I/O）：ts_list＝各幣 captured_ts（ISO 字串，None 略過）。少於 2 個
+    可解析時刻回 None（誠實不捏造，紅線③）。離線閘用它驗證整輪是否落在同一橫斷面窗口
+    （span 太大＝因子散在不同時刻，同 T 反事實重排序的前提被破壞，該筆記錄須降權/剔除）。
+    """
+    parsed = []
+    for ts in ts_list or []:
+        if not ts:
+            continue
+        try:
+            parsed.append(dt.datetime.fromisoformat(ts))
+        except (ValueError, TypeError):
+            continue
+    if len(parsed) < 2:
+        return None
+    return round((max(parsed) - min(parsed)).total_seconds(), 1)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -134,20 +168,77 @@ async def _binance_cvd(bn, symbol: str) -> dict | None:
         return None
 
 
-async def _universe_factors(source, n: int) -> list[dict]:
-    """取 universe 因子快照（bounded N，重用 daemon source 共用限流器 + TTL 快取）。
+# 取數補抓回合數（pass 1 之後再補抓 miss 的幣；吸收瞬時 429 競爭，盡量湊滿 universe）。
+# 取 2：最壞 20 幣 ×（1+2）趟 = 60 次呼叫，仍遠低於共用限流器 75/min 上限；補抓只送
+# 「上一趟 miss 的幣」（通常遠少於 20），換手前指數退避讓 60s 滑窗釋出額度，攤平瞬時 429。
+_UNIVERSE_RETRIES = 2
 
-    回 get_strength_universe 的 items（每筆含 0.0 cvd_slope_7d stub 缺口）；失敗回 []。
+
+async def _universe_factors(source, n: int,
+                            pace: float = _UNIVERSE_PACE_SECONDS,
+                            retries: int = _UNIVERSE_RETRIES) -> list[dict]:
+    """取 universe 因子快照——**逐幣節流 + miss 補抓**呼叫 get_strength_universe。
+
+    重用 live get_strength_universe 的「每幣聚合」邏輯（candidate_symbols=[sym]、
+    limit=1 → 恰 1 筆 /pairs-markets 上游呼叫，與 burst 版逐幣完全等價），但影子側
+    **自己排程**、每筆間隔 `pace` 秒。這避開「同步 burst N 筆被上游 429 截斷成
+    ~2–5 筆」的缺陷，又**完全不碰 live 方法本身**（改 live＝改變訊號路徑的幣覆蓋
+    → trading tier → FIRE，須過回測閘，屬另案；影子側純讀、零訊號影響）。
+
+    缺料回補：429 競爭下 _get 退避 3 次仍可能空手（get_strength_universe 對該幣
+    `continue` → items=[]）。故再做 `retries` 回合補抓**只剩 miss 的幣**，攤平把
+    瞬時節流吃掉，盡量湊滿整個 universe（hourly cadence、TTL 快取會幫忙，成本低）。
+    上游呼叫量仍受共用限流器封頂，不增 CoinGlass 額度上限風險。
+
+    universe 幣＝live 路徑同一份（get_strength_universe 無 candidate_symbols 時即用
+    TRADING_CANDIDATES[:limit]）→ 逐幣重現完全相同的 universe。回每幣 item（依
+    canonical 順序）；個別幣最終仍失敗就誠實略過（不捏造，紅線③）。
     """
     if source is None or not hasattr(source, "get_strength_universe"):
         return []
     try:
-        r = await source.get_strength_universe(limit=n)
-        if isinstance(r, dict) and not r.get("error"):
-            return list(r.get("items") or [])
+        from market_intel_mcp.symbol_mapping import TRADING_CANDIDATES
+        candidates = list(TRADING_CANDIDATES)[:n]
     except Exception:
         return []
-    return []
+
+    captured: dict[str, dict] = {}
+    remaining = list(candidates)
+    attempt = 0
+    while remaining and attempt <= retries:
+        misses: list[str] = []
+        last = len(remaining) - 1
+        for i, sym in enumerate(remaining):
+            ok = False
+            try:
+                r = await source.get_strength_universe(limit=1, candidate_symbols=[sym])
+                if isinstance(r, dict) and not r.get("error"):
+                    its = r.get("items") or []
+                    if its:
+                        item0 = its[0]
+                        # 把該幣「實際取到」的 UTC 時刻釘在 item 上（離線閘據此驗同 T 橫斷面）。
+                        # 用私有鍵 _captured_ts 暫存於 item（不改本函式回傳型別 list[dict]，
+                        # 避免動到既有測試簽章）；_run_cycle 會抽出來餵給 _build_item。
+                        try:
+                            item0["_captured_ts"] = dt.datetime.now(
+                                tz=dt.timezone.utc).isoformat()
+                        except (TypeError, AttributeError):
+                            pass
+                        captured[sym] = item0
+                        ok = True
+            except Exception:
+                ok = False
+            if not ok:
+                misses.append(sym)   # 429/空手/例外都進補抓清單
+            if pace and i < last:
+                await asyncio.sleep(pace)
+        remaining = misses
+        attempt += 1
+        if remaining and attempt <= retries and pace:
+            # 換手前指數退避（pace*2^attempt，封頂 8s），讓 60s 滑窗釋出更多額度再補抓
+            await asyncio.sleep(min(pace * (2 ** attempt), 8.0))
+    # 依 canonical 順序回（與 live universe 排序一致）
+    return [captured[s] for s in candidates if s in captured]
 
 
 async def _run_cycle(source=None, n: int = _UNIVERSE_N) -> dict:
@@ -166,6 +257,7 @@ async def _run_cycle(source=None, n: int = _UNIVERSE_N) -> dict:
             source = None
 
     bn = get_binance_perp()
+    t0 = time.monotonic()
 
     # 1) universe 因子快照（strength 排名器實際吃到的；cvd_slope_7d 是 0.0 缺口）
     factor_items = await _universe_factors(source, n)
@@ -180,13 +272,16 @@ async def _run_cycle(source=None, n: int = _UNIVERSE_N) -> dict:
     for s, r in zip(syms, cvd_results):
         cvd_map[s] = r if isinstance(r, dict) else None
 
-    # 3) 併記錄（純函式 _build_item）
+    # 3) 併記錄（純函式 _build_item），並抽出每幣 captured_ts 算橫斷面跨度
     items = []
+    cap_ts_list = []
     for it in factor_items:
         sym = it.get("symbol")
         if not sym:
             continue
-        items.append(_build_item(sym, it, cvd_map.get(sym)))
+        cts = it.get("_captured_ts")   # _universe_factors 暫存的取到時刻（可能 None）
+        cap_ts_list.append(cts)
+        items.append(_build_item(sym, it, cvd_map.get(sym), captured_ts=cts))
 
     n_binance_ok = sum(1 for it in items if it.get("binance_ok"))
     return {
@@ -194,6 +289,8 @@ async def _run_cycle(source=None, n: int = _UNIVERSE_N) -> dict:
         "universe_n": n,
         "captured": len(items),
         "binance_ok": n_binance_ok,
+        "span_sec": _span_seconds(cap_ts_list),   # 首→末因子取到的時間跨度（同 T 橫斷面驗證；None=不足2筆）
+        "elapsed_sec": round(time.monotonic() - t0, 1),  # 整輪耗時（含補抓退避；接近 interval 即告警）
         "items": items,
         "note": "shadow-only: binance_cvd_slope_7d 從不寫回 universe/strength/fire；"
                 "補捉 universe 路徑缺的 cvd_slope_7d（現為 coinglass.py:666 的 0.0 stub）"
@@ -207,15 +304,24 @@ async def run_cvd_shadow_loop(source=None, interval_seconds: int = 3600):
     `source`＝daemon 主 source（用其 get_strength_universe 取 universe 因子，bounded
     + 共用 TTL 快取）。Binance CVD 走 binance_perp 單例（免 key、零額度）。
     """
-    # 啟動稍緩，避開開機尖峰（與其他影子 worker 一致）
-    await asyncio.sleep(90)
+    # 啟動延遲 300s（5min）避開開機尖峰：watchlist.refresh 開機那一刻會無節流 burst 掃
+    # 數十幣 /pairs-markets，與影子逐幣搶同一個共用限流器→開機首輪 capture 必爛（前車之鑑
+    # 6/20）。等 5min 讓開機 burst 退潮、共用 TTL 快取暖起來，首輪才打在穩態而非尖峰。
+    await asyncio.sleep(300)
     while True:
         try:
             summary = await _run_cycle(source)
             _append_jsonl(summary)
+            span = summary.get("span_sec")
+            elapsed = summary.get("elapsed_sec")
             print(f"[cvd_shadow] universe_n={summary['universe_n']} "
                   f"captured={summary['captured']} "
-                  f"binance_ok={summary['binance_ok']}")
+                  f"binance_ok={summary['binance_ok']} "
+                  f"span_sec={span} elapsed_sec={elapsed}")
+            # 整輪耗時逼近 interval＝補抓退避吃太久（橫斷面被拉長/下一輪要遲到），留痕示警
+            if isinstance(elapsed, (int, float)) and elapsed > int(interval_seconds) * 0.9:
+                print(f"[cvd_shadow] WARN cycle elapsed={elapsed}s 逼近 interval="
+                      f"{int(interval_seconds)}s（補抓退避過久；橫斷面窗口被拉長）")
         except Exception as e:  # 整輪保護：任何意外吞掉續跑，不拖垮 daemon
             print(f"[cvd_shadow] cycle error: {e}")
         await asyncio.sleep(max(60, int(interval_seconds)))
@@ -241,7 +347,8 @@ def _selftest() -> int:
     assert item["binance_cvd_slope"] == 8.9
     assert item["binance_bars"] == 168
     assert item["binance_ok"] is True
-    print("  ✅ 正常併記：0.0 stub 與 Binance 值並排、binance_ok=True")
+    assert item["captured_ts"] is None                      # 未傳＝誠實 None（不捏造，紅線③）
+    print("  ✅ 正常併記：0.0 stub 與 Binance 值並排、binance_ok=True、captured_ts 預設 None")
 
     # 2) Binance 取數失敗（cvd=None）→ 誠實記 None、binance_ok=False（不捏造，紅線③）
     item2 = _build_item("ETH", factors, None)
@@ -265,7 +372,27 @@ def _selftest() -> int:
     assert "BTC" in s and "binance_cvd_slope_7d" in s
     print("  ✅ 記錄可 JSON 序列化")
 
-    print("自測通過：影子 item 併記（0.0 缺口並排/誠實 None/因子白名單）+ 可序列化 ✅")
+    # 5) captured_ts 有傳就忠實帶進 item（同 T 橫斷面驗證需要）
+    item_ts = _build_item("BTC", factors, cvd, captured_ts="2026-01-01T00:00:05+00:00")
+    assert item_ts["captured_ts"] == "2026-01-01T00:00:05+00:00"
+    print("  ✅ captured_ts 忠實帶入 item")
+
+    # 6) _span_seconds：≥2 筆算首→末跨度；<2 筆或全 None → 誠實 None（不捏造，紅線③）
+    span = _span_seconds([
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:42+00:00",
+        None,
+        "2026-01-01T00:00:18+00:00",
+    ])
+    assert span == 42.0, span                               # max(42) - min(0)
+    assert _span_seconds([]) is None
+    assert _span_seconds(["2026-01-01T00:00:00+00:00"]) is None   # 僅 1 筆
+    assert _span_seconds([None, None]) is None
+    assert _span_seconds(["bad-ts", "also-bad"]) is None    # 解析不出 → None，不丟例外
+    print("  ✅ _span_seconds：首末跨度正確、不足2筆/壞值誠實 None")
+
+    print("自測通過：影子 item 併記（0.0 缺口並排/誠實 None/因子白名單/captured_ts）"
+          "+ span 跨度 + 可序列化 ✅")
     return 0
 
 
@@ -276,6 +403,11 @@ if __name__ == "__main__":
     # 一次性 live 試跑（唯讀；需 .env 的 CoinGlass 金鑰才取得到 universe 因子）
     import os
     from pathlib import Path
+    # 直接以路徑執行本檔時 sys.path[0] 是 l3_dispatcher/，專案根不在路徑上 →
+    # import market_intel_mcp 會失敗；補上專案根讓「python l3_dispatcher\cvd_shadow.py」可直跑。
+    _root = str(Path(__file__).resolve().parent.parent)
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     # ⚠️ 環境陷阱：MARKET_INTEL_BACKEND 預設 "mock"（settings.py:19），且 daemon 是用

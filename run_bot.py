@@ -284,6 +284,11 @@ async def amain(args: argparse.Namespace) -> int:
     #      symbol_gate、不發 TG）。純讀，寫 macro_confluence.jsonl + 獨立 macro_history.db。
     from l3_dispatcher.macro_confluence import (
         run_macro_confluence_loop as _run_macro_confluence)
+    # v62: #20 CVD 影子接線層 — 每小時抓 universe top-20 的免key Binance taker CVD，與
+    #      coinglass.py get_strength_universe 路徑硬塞的 stub（cvd_slope_7d=0.0）並排記錄到
+    #      cvd_shadow.jsonl。影子鐵則：只記錄、永不回寫 factors_live/strength/fire/signals、
+    #      不發 TG。忠實度閘已 🟢（v61）；晉升「真填 stub」須另過 EV 閘（後續 increment）。
+    from l3_dispatcher.cvd_shadow import run_cvd_shadow_loop as _run_cvd_shadow
     # v55: OKX 模擬盤自動操盤手（task #4/#39）— 鏡像新紙上加密訊號到 OKX 模擬盤實單。
     #      預設「雙鑰待命」：DEMO_OPERATOR_ACTIVE 未開時整個 worker 完全閒置、零 OKX 互動
     #      （連 ex 都不建）→ 接進 daemon 本身是安全的；真要開單須另外把旗標設 1。
@@ -375,6 +380,9 @@ async def amain(args: argparse.Namespace) -> int:
         # v56: 綜合宏觀指標合成影子層（每小時一輪 → macro_confluence.jsonl + macro_history.db；
         #       純影子觀測，不發 Telegram、永不影響 strength/fire/symbol_gate/下單）
         ("macro_confluence", lambda: _run_macro_confluence(source)),
+        # v62: #20 CVD 影子層（每小時一輪 → cvd_shadow.jsonl；純觀測補缺的 cvd_slope_7d，
+        #      不發 Telegram、永不影響 strength/fire/symbol_gate/signals/下單）
+        ("cvd_shadow", lambda: _run_cvd_shadow(source)),
         # v55: OKX 模擬盤操盤手（DEMO_OPERATOR_ACTIVE 未開＝完全閒置、零 OKX 互動）。
         #      開啟後鏡像新紙上加密訊號到模擬盤實單，純驗證持倉真實性（零真錢）。
         ("okx_demo_operator", lambda: _run_demo_operator(
