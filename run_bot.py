@@ -128,6 +128,12 @@ async def amain(args: argparse.Namespace) -> int:
     print(f"[startup] refreshing trading tier...")
     refresh_result = await watchlist.refresh(source)
     print(f"[startup] trading tier: {refresh_result['chosen']}")
+    # task#64：開機 tier refresh 是「冷快取全池」最具代表性的截斷量測（每檔各打一次
+    # /pairs-markets，遇 429/空 data 會 silently 丟）。純觀測，零訊號數學影響。
+    _utel = refresh_result.get("universe_telemetry") or {}
+    if _utel:
+        print(f"[startup] universe truncation: {_utel.get('n_universe')}/{_utel.get('n_pool')} "
+              f"returned (dropped {_utel.get('n_dropped')}, errored={_utel.get('errored')})")
 
     # === 開機訊息（v23-6: 30 分鐘內重啟不重推，避免部署期洗版系統主題）===
     if not args.no_startup_msg:
