@@ -1,17 +1,17 @@
-"""⚙️ 調參 Session（v31，task #27）— 自動分析紙上帳，產參數調整建議。
+"""⚙️ 調參 Session（v31 task#27 → v56 task#52 收斂）— 自動分析紙上帳，產**純描述**報告。
 
-界線（使用者決定）：**只建議、不自動套用**。報告推系統主題，套用需人工
-（未來可接 /settings）。每日一次。這是「AI 自我評估、提優化」的一環，
-但保留人類對參數變更的最終決定權。
+v56 收斂（task#52，防兩套並存發自相矛盾訊號）：
+    本檔過去吐「祈使建議」（建議縮短/收緊/下調…）。但動參數的唯一合法路徑已收斂為
+    **champion/challenger 離線回放 → L2 四關閘**（l3_dispatcher.champion_challenger +
+    backtest.l2_stat_gates）；把關靠統計嚴謹度而非人工逐次點頭，也不靠這裡的口語建議。
+    因此本檔**移除所有祈使建議，改為純描述**（出場劇本分布、期望值、勝率），只負責：
+      (1) 每日把已平倉樣本蒸餾進教訓庫 lessons.jsonl（rebuild，derived view）；
+      (2) 推一份『純描述』系統主題報告（含 quadrant 彙總 + 誠實樣本不足橫幅）；
+      (3) 明確指向：要真的改參數，走 champion/challenger + L2，不在這裡。
+    → 杜絕「自動優化器要調 A、調參報告卻喊調 B」的自相矛盾。
 
-分析維度（每個 setup 各算）：
+分析維度（每個 setup 各算，純描述、不下指令）：
     期望值（R/筆）、勝率、樣本數、出場劇本分布（TP全收/部分止盈後出場/止損/逾時）
-建議邏輯（規則式，保守）：
-    - 樣本 <20：只報「樣本不足，繼續累積」
-    - 逾時比例高 → 建議縮短持倉時限或放寬 TP
-    - 止損比例高且期望值負 → 建議收緊進場條件（提高 min_votes）或放寬 SL
-    - TP1 命中高但 TP3 少 → 建議下調 TP3 R 或加大 TP1 平倉比例
-    - 期望值正且穩 → 維持，可考慮加碼
 """
 from __future__ import annotations
 
@@ -73,34 +73,55 @@ def _backtest_anchor(setup: str) -> str | None:
             f"期望值 {exp:+.2f}R、勝率 {bt['win_rate']*100:.0f}%、PF {bt['profit_factor']:.2f} {tone}")
 
 
-def suggest(a: dict) -> list[str]:
-    """規則式參數建議（保守）。回建議清單。"""
+def describe(a: dict) -> list[str]:
+    """**純描述**現象（出場劇本分布／期望值偏態），不下任何祈使參數指令。
+
+    v56（task#52）：刻意不再回「建議縮短/收緊/下調…」。動參數的唯一合法路徑＝
+    champion/challenger 離線回放過 L2 四關（見模組 docstring）。這裡只把「看到什麼」
+    講清楚，讓那條 L2 路徑去決定「該不該改、改了統計上有沒有顯著更好」。
+    """
     if a["n"] < MIN_SAMPLE:
-        tips = [f"樣本僅 {a['n']}/{MIN_SAMPLE} 筆 — 繼續累積，暫不調參"]
+        notes = [f"樣本僅 {a['n']}/{MIN_SAMPLE} 筆 — 樣本不足，僅供觀察、未達統計顯著"]
         anchor = _backtest_anchor(a["setup"])
         if anchor:
-            tips.append(anchor)
-        return tips
-    s, tips = a, []
+            notes.append(anchor)
+        return notes
+    s, notes = a, []
     to_pct = s["timeouts"] / s["n"]
     stop_pct = s["stops"] / s["n"]
     if to_pct >= 0.3:
-        tips.append(f"逾時出場佔 {to_pct*100:.0f}% 偏高 → 建議縮短 HOLD_MAX_HOURS 或下調 TP 目標（價格走不到）")
+        notes.append(f"逾時出場佔 {to_pct*100:.0f}%（出場劇本分布；現象描述）")
     if stop_pct >= 0.5 and s["expectancy_r"] < 0:
-        tips.append(f"止損佔 {stop_pct*100:.0f}% 且期望值負（{s['expectancy_r']:+.2f}R）→ "
-                    f"建議收緊進場（提高 min_votes/cross-check 門檻）或重檢 SL%")
+        notes.append(f"止損佔 {stop_pct*100:.0f}% 且期望值為負（{s['expectancy_r']:+.2f}R）")
     if s["tp1_only"] / s["n"] >= 0.4 and s["tp_full"] / s["n"] <= 0.15:
-        tips.append(f"多數只到 TP1（{s['tp1_only']}/{s['n']}）少到 TP3 → "
-                    f"建議下調 TP3 R 倍數，或加大 TP1 平倉比例鎖更多利潤")
+        notes.append(f"多數只到 TP1（{s['tp1_only']}/{s['n']}）、少到 TP3（分批吃利分布）")
     if s["expectancy_r"] >= 0.2 and s["win_rate"] >= 45:
-        tips.append(f"期望值正（{s['expectancy_r']:+.2f}R）勝率 {s['win_rate']}% — 表現穩健，維持參數")
-    if not tips:
-        tips.append(f"期望值 {s['expectancy_r']:+.2f}R、勝率 {s['win_rate']}% — 無明顯偏態，維持觀察")
-    return tips
+        notes.append(f"期望值正（{s['expectancy_r']:+.2f}R）、勝率 {s['win_rate']}%（描述，"
+                     f"是否顯著請以 L2 閘判定）")
+    if not notes:
+        notes.append(f"期望值 {s['expectancy_r']:+.2f}R、勝率 {s['win_rate']}% — 無明顯偏態（純描述）")
+    return notes
+
+
+def _lessons_block() -> str | None:
+    """教訓庫 quadrant 彙總（純描述，含誠實樣本不足橫幅）。失敗回 None（不擋報告）。"""
+    try:
+        from l3_dispatcher.lessons_store import summarize_by_quadrant
+        s = summarize_by_quadrant()
+    except Exception:
+        return None
+    if not s or not s.get("by_quadrant"):
+        return None
+    lines = [f"📚 <b>教訓庫</b>（lessons.jsonl｜共 {s['total']} 筆，僥倖單已排除於正向集）"]
+    for q, b in sorted(s["by_quadrant"].items(), key=lambda kv: -kv[1]["n"]):
+        suff = "" if b["sample_sufficient"] else " ⚠️樣本不足"
+        lines.append(f"  [{q}] n={b['n']}｜正向 {b['n_positive']}｜僥倖 {b['n_lucky']}"
+                     f"｜賠 {b['n_loss']}｜avg_r {b['avg_r']}{suff}")
+    return "\n".join(lines)
 
 
 def build_report(days: int = 60) -> str | None:
-    """掃所有 setup 產調參建議報告。無資料回 None。"""
+    """掃所有 setup 產**純描述**報告 + 教訓庫彙總。無資料回 None。"""
     setups = ["intraday", "ambush", "us_breakout", "deepdive"]
     blocks = []
     any_data = False
@@ -113,14 +134,20 @@ def build_report(days: int = 60) -> str | None:
                 f"期望值 <code>{a['expectancy_r']:+.2f}R</code>")
         dist = (f"  出場：TP全收 {a['tp_full']}／止損 {a['stops']}／"
                 f"逾時 {a['timeouts']}／僅TP1 {a['tp1_only']}")
-        tips = "\n".join(f"  💡 {t}" for t in suggest(a))
-        blocks.append(f"{head}\n{dist}\n{tips}")
-    if not any_data:
+        notes = "\n".join(f"  • {t}" for t in describe(a))
+        blocks.append(f"{head}\n{dist}\n{notes}")
+    lessons = _lessons_block()
+    if not any_data and not lessons:
         return None
-    return ("⚙️ <b>調參 Session 報告</b>（紙上帳分析，僅建議不自動套用）\n"
-            "━━━━━━━━━━━━━━━━\n" + "\n\n".join(blocks) +
-            "\n\n<i>採納方式：到 /settings 或 .env 調整對應參數。"
-            "AI 持續評估，參數變更權保留給你。</i>")
+    body_parts = []
+    if any_data:
+        body_parts.append("\n\n".join(blocks))
+    if lessons:
+        body_parts.append(lessons)
+    return ("⚙️ <b>調參 Session 報告</b>（紙上帳『純描述』，不下參數指令）\n"
+            "━━━━━━━━━━━━━━━━\n" + "\n\n".join(body_parts) +
+            "\n\n<i>⚠️ 本報告只描述現象。動參數的唯一合法路徑＝champion/challenger "
+            "離線回放過 L2 四關（統計嚴謹度把關，非人工逐次點頭）；不在此報告、也不靠口語建議。</i>")
 
 
 async def run_auto_tuner_loop(tg, interval_seconds: int = 86400,
@@ -134,6 +161,14 @@ async def run_auto_tuner_loop(tg, interval_seconds: int = 86400,
         if nxt <= now:
             nxt += dt.timedelta(days=1)
         await asyncio.sleep((nxt - now).total_seconds())
+        # v56 task#52：每日先把已平倉樣本蒸餾進教訓庫（derived view，DB 為真相源）
+        try:
+            from l3_dispatcher.lessons_store import rebuild_lessons_file
+            res = rebuild_lessons_file()
+            print(f"[auto_tuner] lessons rebuilt: {res['n']} 筆"
+                  f"（正向 {res['n_positive']}／僥倖 {res['n_lucky']}／賠 {res['n_loss']}）")
+        except Exception as e:
+            print(f"[auto_tuner] lessons rebuild error: {type(e).__name__}: {e}")
         try:
             rep = build_report()
             if rep and tg is not None:
