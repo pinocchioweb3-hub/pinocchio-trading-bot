@@ -484,7 +484,7 @@ def _compute_htf_alignment(s4: dict, s1d: dict) -> dict:
             out["note"] = ("⚠️ HTF 部分對齊：方向或進場位置其一不利，"
                            "需謹慎、縮小倉位、等更佳位置")
     else:
-        _v = {"aligned": "✅ HTF 對齊：1d 趨勢與 4h 訊號一致且位置有利，順勢進場勝率較高",
+        _v = {"aligned": "✅ HTF 對齊：1d 趨勢與 4h 訊號一致且位置有利，順勢進場條件較佔優（傾向，非勝率保證）",
               "conflict": "⛔ HTF 衝突：4h 訊號與 1d 趨勢/位置相悖（接刀風險），除非有強力獨立確認否則應降權或觀望",
               "unknown": "ℹ️ HTF 對齊未知：1d 結構或區位資料不足，無法判定"}
         out["note"] = _v.get(out["verdict"], "")

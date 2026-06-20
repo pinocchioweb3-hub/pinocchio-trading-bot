@@ -514,7 +514,7 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
     rg = sym_state.get("regime") or {}
     if rg.get("label") and rg["label"] != "資料不足":
         parts.append(f"## 🧭 市場狀態（4h regime）：{rg['label']}")
-        parts.append("（趨勢態：順勢突破/續勢勝率高；盤整態：區間高賣低買、對順勢追單降權；"
+        parts.append("（趨勢態：順勢突破/續勢較順風（教科書傾向，非勝率保證）；盤整態：區間高賣低買、對順勢追單降權；"
                      "高波動：縮小倉位。請依此狀態調整策略選擇與信心，不要不分狀態硬套同一招。）\n")
 
     # v33：Wyckoff 階段（heuristic，定宏觀方向偏置 + 關鍵事件）
@@ -528,7 +528,7 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
         if wy.get("box_lo") and wy.get("box_hi"):
             parts.append(f"- 交易區間(TR)：{wy['box_lo']:,.6g} ~ {wy['box_hi']:,.6g}"
                          f"（{wy.get('caveat','')}）")
-        parts.append("（Wyckoff 定方向偏置與『該不該等』；Spring/UTAD 是高勝率反轉前置，"
+        parts.append("（Wyckoff 定方向偏置與『該不該等』；Spring/UTAD 是經典反轉前置（勝算傾向較佳、非保證），"
                      "但須 CVD/OI 同向驗證避免假突破。）\n")
 
     # M2：多時框對齊驗證（HTF 1d → LTF 4h）— 高層偏置閘，deepdive 須據此調整信心
@@ -544,9 +544,9 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
             seg.append(f"現價在 1d {ha['price_1d_zone']} 區")
         if seg:
             parts.append("- " + "／".join(seg))
-        parts.append("（規則：順 1d 趨勢、且在 1d 折價區做多／溢價區做空＝高勝率；"
+        parts.append("（規則：順 1d 趨勢、且在 1d 折價區做多／溢價區做空＝較順風（條件佔優、非勝率保證）；"
                      "逆勢或追高殺低＝接刀。此為輔助偏置非硬性否決——若逆 HTF 仍要做，"
-                     "必須有強力獨立數據確認並在文中標註勝率較低、縮小倉位。）\n")
+                     "必須有強力獨立數據確認並在文中標註勝算較差、縮小倉位。）\n")
 
     # 多時框型態
     pattern = sym_state.get("pattern", {})
