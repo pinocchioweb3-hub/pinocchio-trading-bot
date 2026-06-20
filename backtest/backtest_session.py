@@ -72,7 +72,15 @@ def _liquid_symbols(cap: int = DEFAULT_SYMBOL_CAP) -> list[str]:
         from l3_dispatcher.watchlist import _market_candidates
         pool = _market_candidates(min_vol_usd=30_000_000, cap=cap)
         if pool:
-            return pool[:cap]
+            # 來源邊界（task#73-C parity）：濾掉 scanner.db 的代幣化美股/商品
+            # （instCategory!=1）；fail-open：分類快取空→不過濾（is_crypto_base 回 True）
+            try:
+                from l3_dispatcher.market_scanner import is_crypto_base
+                pool = [s for s in pool if is_crypto_base(s)]
+            except Exception:
+                pass
+            if pool:
+                return pool[:cap]
     except Exception:
         pass
     return ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX"][:cap]

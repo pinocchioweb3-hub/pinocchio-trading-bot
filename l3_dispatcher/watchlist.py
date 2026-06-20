@@ -89,6 +89,22 @@ class WatchlistManager:
         #      掃描器未就緒（冷啟動）時 fallback 固定清單
         market = _market_candidates()
         if market:
+            # 來源邊界（task#73-C）：scanner.db 含 OKX 代幣化美股/商品（instCategory!=1，
+            # 如 MU/NVDA/CL），它們不屬加密 SMC 射程。只濾掉「掃描器來的 market」，
+            # 不動 candidate_pool（後者是人工策劃的加密主流幣，可能含 OKX 未上永續者，
+            # 濾它會回退覆蓋）。fail-open：取不到分類就不過濾（寧納勿空宇宙）。
+            try:
+                from l3_dispatcher.market_scanner import (
+                    ensure_crypto_allowset, is_crypto_base)
+                await ensure_crypto_allowset()
+                _before_n = len(market)
+                market = [s for s in market if is_crypto_base(s)]
+                _dropped = _before_n - len(market)
+                if _dropped:    # no-silent-cap：次級網也留痕（與 scanner 主閘對齊）
+                    print(f"[watchlist] 來源濾除 {_dropped} 檔非加密"
+                          f"（代幣化美股/商品），純加密候選 {len(market)} 檔")
+            except Exception:
+                pass
             pool = list(dict.fromkeys(list(self.candidate_pool) + market))
         else:
             pool = list(self.candidate_pool)

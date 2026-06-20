@@ -34,6 +34,81 @@ FUNDING_HOT = float(os.getenv("SCAN_FUNDING_HOT", "0.003"))         # +0.3%
 ALERT_COOLDOWN_S = int(os.getenv("SCAN_ALERT_COOLDOWN_S", "21600")) # 6h
 SNAPSHOT_KEEP_DAYS = 3
 
+# ── 來源邊界：純加密永續允許集（task#73-C 治本）─────────────────────────────
+# OKX 已把「代幣化美股」(instCategory=3：AAPL/NVDA/MU/QQQ…) 與「商品」(=4：
+# CL 原油/XAU 黃金/NG…) 上架為 -USDT-SWAP。掃描器只看 -USDT-SWAP 後綴，會把這
+# 103/372 檔非加密標的當加密幣吸進 scanner.db → 污染廣度統計、誤發異常告警，並經
+# 候選池 → 交易層 → fire_tier → 模擬下單／deepdive。它們不屬加密 SMC 模型射程
+# （美股走獨立 1h 突破引擎、用真實股市數據）。instCategory=="1" ＝純加密，於此濾除。
+INSTRUMENTS_URL = f"{OKX}/api/v5/public/instruments"
+CRYPTO_ALLOWSET_TTL_S = int(os.getenv("SCAN_INSTRUMENTS_TTL_S", "21600"))  # 6h
+# 防截斷下限：OKX /public/instruments 實測單回應回全 269 檔純加密（無分頁）。萬一未來
+# API 改成分頁/截斷，回一個「非空但可疑過小」的集合，不得拿它覆蓋既有健康集合（保留舊、
+# 留痕）。冷啟動（舊集合為空）不套此下限，確保首次填充永不被擋（fail-open 大原則）。
+_ALLOWSET_MIN_PLAUSIBLE = int(os.getenv("SCAN_INSTRUMENTS_MIN", "50"))
+_CRYPTO_INSTIDS: set[str] = set()    # {'BTC-USDT-SWAP', …}  instCategory=='1'
+_CRYPTO_BASES: set[str] = set()      # {'BTC', …}（給 watchlist 的 base 級判定）
+_ALLOWSET_TS: float = 0.0
+
+
+def _extract_crypto_instids(rows: list[dict]) -> set[str]:
+    """從 OKX instruments 回應抽出『純加密 USDT 永續』instId（instCategory=='1'）。
+    純函式、零網路、可離線測試。缺 instCategory / 非 USDT 永續一律不收。"""
+    return {d["instId"] for d in rows
+            if d.get("instCategory") == "1"
+            and str(d.get("instId", "")).endswith("-USDT-SWAP")}
+
+
+def _is_crypto_perp(inst_id: str, allow: set[str]) -> bool:
+    """來源邊界判定：inst_id 是否為應納入的純加密 USDT 永續。
+    allow 為空（冷啟動取不到 instruments）→ fail-open（True）：寧可暫時納入也不清空
+    宇宙；呼叫端會印出警告（紅線③：no silent cap）。"""
+    if not inst_id.endswith("-USDT-SWAP"):
+        return False
+    if not allow:
+        return True
+    return inst_id in allow
+
+
+def is_crypto_base(base: str) -> bool:
+    """base 級判定（給 watchlist 候選池用）：BTC→True、MU/CL→False。
+    base 允許集空 → fail-open（True，寧納勿空宇宙）。"""
+    if not _CRYPTO_BASES:
+        return True
+    return base in _CRYPTO_BASES
+
+
+async def ensure_crypto_allowset(client=None) -> None:
+    """確保純加密允許集新鮮（TTL 內為 no-op）。失敗保留舊快取、絕不清空。
+    instruments 變動極少，預設每 6h 才刷新一次；可傳入共用 client 省一次連線。"""
+    global _CRYPTO_INSTIDS, _CRYPTO_BASES, _ALLOWSET_TS
+    if _CRYPTO_INSTIDS and (time.time() - _ALLOWSET_TS) < CRYPTO_ALLOWSET_TTL_S:
+        return
+    own = client is None
+    try:
+        c = client or httpx.AsyncClient(timeout=25)
+        try:
+            r = await c.get(INSTRUMENTS_URL, params={"instType": "SWAP"})
+            rows = r.json().get("data", [])
+        finally:
+            if own:
+                await c.aclose()
+        instids = _extract_crypto_instids(rows)
+        if not instids:
+            return    # 守護：壞回應/空集不得清空允許集（保留舊）
+        # 防截斷：已有健康集合卻收到可疑過小的新集合 → 保留舊、留痕（冷啟動不套下限）
+        if _CRYPTO_INSTIDS and len(instids) < _ALLOWSET_MIN_PLAUSIBLE:
+            print(f"[scanner] instruments 回應僅 {len(instids)} 檔純加密"
+                  f"（< 合理下限 {_ALLOWSET_MIN_PLAUSIBLE}），疑截斷/API 變更 → "
+                  f"保留舊允許集 {len(_CRYPTO_INSTIDS)} 檔")
+            return
+        _CRYPTO_INSTIDS = instids
+        _CRYPTO_BASES = {i.split("-")[0] for i in instids}
+        _ALLOWSET_TS = time.time()
+    except Exception as e:
+        print(f"[scanner] instruments allowset refresh failed "
+              f"(keep {len(_CRYPTO_INSTIDS)}): {type(e).__name__}: {e}")
+
 
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, isolation_level=None)
@@ -88,6 +163,7 @@ def init_db() -> None:
 async def fetch_market_snapshot() -> dict[str, dict]:
     """3 次請求 → {base_symbol: {last, vol24h_usd, oi_usd, funding, chg24h_pct}}"""
     async with httpx.AsyncClient(timeout=25) as c:
+        await ensure_crypto_allowset(c)
         r1, r2, r3 = await asyncio.gather(
             c.get(f"{OKX}/api/v5/market/tickers", params={"instType": "SWAP"}),
             c.get(f"{OKX}/api/v5/public/open-interest", params={"instType": "SWAP"}),
@@ -97,10 +173,15 @@ async def fetch_market_snapshot() -> dict[str, dict]:
     ois = {d["instId"]: d for d in r2.json().get("data", [])}
     fundings = {d["instId"]: d for d in r3.json().get("data", [])}
 
+    allow = _CRYPTO_INSTIDS
+    n_noncrypto = 0
     out: dict[str, dict] = {}
     for t in tickers:
         inst_id = t.get("instId", "")
         if not inst_id.endswith("-USDT-SWAP"):
+            continue
+        if not _is_crypto_perp(inst_id, allow):    # 來源邊界：濾除代幣化美股/商品
+            n_noncrypto += 1
             continue
         base = inst_id.split("-")[0]
         try:
@@ -118,6 +199,13 @@ async def fetch_market_snapshot() -> dict[str, dict]:
             }
         except (TypeError, ValueError):
             continue
+    # no silent cap（紅線③）：把過濾結果留痕，永不靜默砍宇宙
+    if not allow:
+        print("[scanner] instruments 允許集為空（冷啟動／取用失敗）→ "
+              "fail-open 暫納全部 USDT 永續（含代幣化美股/商品），下輪刷新後收斂")
+    elif n_noncrypto:
+        print(f"[scanner] 來源濾除 {n_noncrypto} 檔非加密永續"
+              f"（代幣化美股/商品 instCategory!=1），純加密 {len(out)} 檔")
     return out
 
 

@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import os
 import sqlite3
 import time
 
@@ -76,6 +77,18 @@ _BREADTH_RISKOFF = 35
 # 生效）。仍全程影子、不影響下單。
 _MIN_PRESENT_MASS = 0.25
 _SCORE_METHOD = "v2_renorm_present_mass"
+
+# task#71 暖機（startup-burst 飢餓治本）：daemon 開機時 daily macro / 全市場掃描 /
+# 各 worker 首輪幾乎同時打 CoinGlass → 429 → macro_confluence 首輪嚴重缺料 →
+# present_mass < _MIN_PRESENT_MASS → 分數 floor-bound（低品質、被地板綁定），且要乾
+# 等一整個 interval（預設 1h）才有下一輪。治本＝①把啟動延遲從 90s 拉長到 ~6 分鐘讓
+# 尖峰先散②若首輪仍 floor-bound，用短間隔重試（不乾等一小時），拿到一輪「非 floor-
+# bound」健康分數或用盡重試額度後，才回到正常 hourly 節奏。純觀測：不改任何分數數
+# 學、不回填、floor-bound 行照常落盤帶 score_method provenance（紅線③）。皆可由環
+# 境變數覆寫（測試/調參用）。
+_WARMUP_DELAY_S_DEFAULT = 360       # 啟動延遲（取代舊固定 90s）
+_WARMUP_RETRY_S_DEFAULT = 300       # 暖機期 floor-bound 的短重試間隔
+_WARMUP_MAX_RETRIES_DEFAULT = 3     # 暖機短重試次數上限（之後回正常節奏）
 
 
 # ===========================================================================
@@ -821,19 +834,51 @@ async def run_macro_confluence_loop(source=None, interval_seconds: int = 3600):
 
     影子鐵則：永不影響 strength/fire/下單、不發 Telegram、整輪包 try/except 續跑。
     用 asyncio.sleep 讓出事件迴圈，不吞例外成 busy-loop。
+
+    task#71 暖機：啟動延遲拉長以避開開機尖峰；首輪若 floor-bound（present_mass <
+    _MIN_PRESENT_MASS，表示尖峰仍未散、CoinGlass 大量 429）改短間隔重試，拿到一輪
+    健康分數或用盡額度後回正常 hourly 節奏。詳見模組頂部 _WARMUP_* 常數說明。
     """
-    # 啟動稍緩，避開開機尖峰（讓 daily macro / 掃描先跑）
-    await asyncio.sleep(90)
+    def _env_int(key: str, default: int) -> int:
+        try:
+            return int(os.getenv(key, str(default)))
+        except (TypeError, ValueError):
+            return default
+
+    warmup_delay = max(0, _env_int("MACRO_CONFLUENCE_WARMUP_S", _WARMUP_DELAY_S_DEFAULT))
+    retry_s = _env_int("MACRO_CONFLUENCE_WARMUP_RETRY_S", _WARMUP_RETRY_S_DEFAULT)
+    warmup_retries_left = max(0, _env_int(
+        "MACRO_CONFLUENCE_WARMUP_MAX_RETRIES", _WARMUP_MAX_RETRIES_DEFAULT))
+
+    # 啟動延遲（取代舊固定 90s）：讓 daily macro / 全市場掃描 / 各 worker 首輪散開
+    await asyncio.sleep(warmup_delay)
     while True:
+        floor_bound = False
         try:
             summary = await _run_cycle(source)
             _append_jsonl(summary)
+            # floor-bound＝有料權重總和不足地板（嚴重缺料/開機尖峰飢餓）。仍照常落盤、
+            # 帶 score_method provenance，僅用來決定「暖機期是否短重試」，不改任何數學。
+            floor_bound = (summary.get("present_mass") or 0.0) < _MIN_PRESENT_MASS
+            _warm_tag = (" [floor-bound→暖機短重試]"
+                         if (floor_bound and warmup_retries_left > 0) else "")
             print(f"[macro_confluence] score={summary.get('macro_confluence_score')} "
                   f"bias={summary.get('bias')} "
                   f"n_present={summary.get('n_present')} "
+                  f"present_mass={summary.get('present_mass')} "
                   f"risk_off={summary.get('risk_off')} "
-                  f"hist+{summary.get('history_inserted', 0)}")
+                  f"hist+{summary.get('history_inserted', 0)}{_warm_tag}")
         except Exception as e:  # 整輪保護：任何意外吞掉續跑，不拖垮 daemon
             print(f"[macro_confluence] cycle error: {type(e).__name__}: {e}")
+
+        # 暖機期：floor-bound 且仍有重試額度 → 短間隔重試，不乾等一整個 interval。
+        # 注意僅限開機暖機窗：拿到健康分數或用盡額度即清零，之後（數小時後）若再
+        # floor-bound 屬真實資料缺口、由 provenance 誠實標註、下輪自癒，不再短重試
+        # （避免在 CoinGlass 真故障時反覆加打已下線的 API）。
+        if floor_bound and warmup_retries_left > 0:
+            warmup_retries_left -= 1
+            await asyncio.sleep(max(60, retry_s))
+            continue
+        warmup_retries_left = 0
         # 確定性間隔睡眠（>=60s），讓出事件迴圈，非 busy-loop
         await asyncio.sleep(max(60, int(interval_seconds)))
