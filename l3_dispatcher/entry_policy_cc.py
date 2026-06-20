@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
+from math import sqrt
 from statistics import mean
 
 # Windows 主控台預設 cp950，印 emoji/繁中報告會 UnicodeEncodeError → 強制 UTF-8
@@ -95,6 +96,42 @@ class EntryPolicy:
 CHAMPION = EntryPolicy("champion(現行深限價可到期)", "limit_expire")
 CHALLENGER_CONVERT = EntryPolicy("D_深限價到期轉市價", "limit_convert")
 CHALLENGER_MARKET = EntryPolicy("市價即進", "market")
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  涵蓋率非劣性晉升（task#63）── 解「D 永不晉升 → live 涵蓋率回補卡死」
+# ════════════════════════════════════════════════════════════════════════
+# 背景：promote 的舊路徑＝EV 超越性（chal_mean_r > champ_mean_r ∧ L2 四關）。但 task#59
+#   （n=1350）已證入場積極度 **EV-neutral**——D 的價值是把成交率 35%→94%（餵飽餓死桶），
+#   不是 EV。故 D 永遠過不了 EV 超越性 → 永不 promote → trade_monitor 的「到期轉市價」分支
+#   在 production 永不觸發 → entry_expired 結構性卡死（即使 task#62 把桶填滿）。
+#   治本＝為**可落地的回補臂 D(limit_convert)** 加第二條晉升路徑：當 D 的 EV 對 champion
+#   **統計非劣**（配對單尾 95% 下界 > −margin）且**實質回補涵蓋率**且樣本足，即允許晉升。
+#   （market 在 paper_journal record 層是 no-op＝幽靈晉升，故**不**走涵蓋率路徑，僅限 D。）
+NONINF_MARGIN_R = 0.05      # 非劣性邊界：可容忍的每筆提出 EV 讓步上限（R）。task#59 觀測 D vs
+                           #   champion 差異 ≈ −0.004R、四組 EV 全幅 ≈0.077R → 0.05R 為合理冷漠區。
+COV_PROMOTE_MIN_PP = 20.0   # 涵蓋率回補晉升的最低成交率增益（百分點）。task#59 D 回補 +59pp。
+COV_PROMOTE_MIN_N = 30      # 涵蓋率晉升所需最低對齊樣本（＝L2 minTRL n≥30 精神，防小樣本）。
+_T95_ONESIDED = 1.70        # 保守單尾 95% t 臨界（df≥29 → t≈1.699；n≥30 保證 df≥29，略偏保守）。
+
+
+def _noninferior_ev(champ_r: list[float], chal_r: list[float],
+                    margin: float = NONINF_MARGIN_R) -> tuple[bool, float | None]:
+    """配對單尾非劣性檢定：challenger 的 per-proposed EV 是否**非劣於** champion。
+
+    H0（劣性）：mean(chal − champ) ≤ −margin    H1（非劣）：mean(chal − champ) > −margin
+    用配對差異（同一批計畫逐筆相減 → 變異更小）的單尾 95% 下界 lower＝md − t·SE。
+    lower > −margin → 判非劣（True）。回 (是否非劣, 下界 lower 四捨五入)；樣本不足 → (False, None)。
+    """
+    n = len(champ_r)
+    if n < 2 or len(chal_r) != n:
+        return (False, None)
+    d = [chal_r[i] - champ_r[i] for i in range(n)]
+    md = sum(d) / n
+    var = sum((x - md) ** 2 for x in d) / (n - 1)
+    se = sqrt(var / n) if var > 0 else 0.0
+    lower = md - _T95_ONESIDED * se
+    return (lower > -margin, round(lower, 4))
 
 
 @dataclass(frozen=True)
@@ -226,6 +263,10 @@ class EntryPolicyVerdict:
     l2_passed: bool
     l2_summary: str
     promote: bool                   # ＝超越性（self-check ∧ L2 四關 ∧ 配對平均更好）
+    # ── task#63 涵蓋率非劣性晉升（僅 D／limit_convert）──
+    ev_noninferior: bool = False    # D 的 per-proposed EV 是否統計非劣於 champion（配對單尾）
+    ev_noninf_lo: float | None = None  # 配對差異(chal−champ) 單尾 95% 下界（>−margin 即非劣）
+    coverage_promote: bool = False  # ＝涵蓋率非劣性晉升（self-check ∧ 非劣 ∧ 實質回補涵蓋率 ∧ n≥30）
     reasons: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -236,11 +277,19 @@ def compare_entry_policy(plans: list[EntryPlan],
                          champion: EntryPolicy = CHAMPION,
                          hypothesis: str = "", append_ledger: bool = True,
                          registered_at_ms: int | None = None) -> EntryPolicyVerdict:
-    """成對重放 champion vs challenger（同一批計畫、逐筆 per-proposed 對齊），過 L2 四關才 promote。
+    """成對重放 champion vs challenger（同一批計畫、逐筆 per-proposed 對齊），兩條晉升路徑。
 
-    promote ＝ self_check_ok AND L2.passed AND chal_mean_r > champ_mean_r（超越性）。
-    （L2 的 minTRL fail-closed：對齊樣本 <30 → 一律擋下，正是現況的誠實答案。
-      但即使不 promote，coverage_delta_pp 已揭示 challenger 救回多少涵蓋率＝餵桶價值。）
+    路徑①（promote，EV 超越性）＝ self_check_ok AND L2.passed AND chal_mean_r > champ_mean_r。
+      （L2 的 minTRL fail-closed：對齊樣本 <30 → 一律擋下，正是現況的誠實答案。）
+    路徑②（coverage_promote，涵蓋率非劣性；task#63，**僅 D／limit_convert**）＝
+      self_check_ok AND (not promote) AND EV 對 champion 統計非劣（配對單尾 95% 下界 >−margin）
+      AND coverage_delta_pp ≥ COV_PROMOTE_MIN_PP AND n_aligned ≥ COV_PROMOTE_MIN_N。
+      存在理由：task#59 證入場積極度 EV-neutral → D 永遠過不了路徑①，但 D 的價值是把
+      成交率 35%→94%（餵飽餓死桶＋讓 live trade_monitor 到期轉市價分支能真正啟用）。
+      故對「可落地的回補臂 D」另開一條「EV 不變差、涵蓋率變好」的嚴謹晉升路徑。
+      （market 在 record 層是 no-op＝幽靈晉升，刻意排除於路徑②。）
+    兩條路徑互斥（coverage_promote 帶 not promote 條件）；即使皆不成立，coverage_delta_pp
+    仍揭示 challenger 救回多少涵蓋率＝餵桶價值。
     """
     from backtest.l2_stat_gates import TrialLedger, evaluate_candidate
 
@@ -305,6 +354,32 @@ def compare_entry_policy(plans: list[EntryPlan],
         reasons.append(f"ℹ️ 涵蓋率回補：challenger 成交率 {champ_fr}%→{chal_fr}%"
                        f"（+{cov_delta}pp）＝餵飽餓死桶的價值（即使未 promote 仍成立）")
 
+    # 4) task#63 涵蓋率非劣性晉升路徑（僅 D／limit_convert，唯一可落地的回補臂）。
+    #    當 EV 超越性不成立（D 本就 EV-neutral）、但 D 的 EV 對 champion 統計非劣 ∧ 實質回補
+    #    涵蓋率 ∧ 樣本足 → 允許晉升，讓 live trade_monitor 的到期轉市價分支能真正啟用。
+    ev_ni, ev_ni_lo = _noninferior_ev(champ_r, chal_r)
+    coverage_promote = bool(
+        self_ok and not promote and challenger.kind == "limit_convert"
+        and n_al >= COV_PROMOTE_MIN_N and ev_ni
+        and cov_delta is not None and cov_delta >= COV_PROMOTE_MIN_PP)
+    if coverage_promote:
+        reasons.append(
+            f"✅ 涵蓋率非劣性晉升（D）：EV 對 champion 統計非劣（配對單尾 95% 下界 {ev_ni_lo}R "
+            f"> −{NONINF_MARGIN_R}R）＋實質回補涵蓋率（+{cov_delta}pp ≥ {COV_PROMOTE_MIN_PP}pp）"
+            f"＋對齊樣本 {n_al} ≥ {COV_PROMOTE_MIN_N} → 啟用 D 以解 live entry_expired 卡死")
+    elif (not promote and challenger.kind == "limit_convert"
+          and cov_delta is not None and cov_delta >= COV_PROMOTE_MIN_PP):
+        # 涵蓋率夠但非劣性/樣本未過 → 誠實說明為何「還不」晉升（紅線③：不捏造已達標）
+        why = []
+        if n_al < COV_PROMOTE_MIN_N:
+            why.append(f"對齊樣本 {n_al} < {COV_PROMOTE_MIN_N}")
+        if not ev_ni:
+            why.append(f"EV 非劣未過（下界 {ev_ni_lo}R ≤ −{NONINF_MARGIN_R}R）")
+        if not self_ok:
+            why.append("self-check 失敗")
+        reasons.append(f"⏸️ D 已實質回補涵蓋率(+{cov_delta}pp)，但尚未達涵蓋率晉升門檻："
+                       + "、".join(why) + "（續累積樣本）")
+
     return EntryPolicyVerdict(
         bucket_key=bucket_key, champion=champion.name, challenger=challenger.name,
         n_aligned=n_al, n_skipped=n_skip,
@@ -313,6 +388,7 @@ def compare_entry_policy(plans: list[EntryPlan],
         champ_fill_rate=champ_fr, chal_fill_rate=chal_fr, coverage_delta_pp=cov_delta,
         self_check_ok=self_ok, self_check_detail=sc_detail,
         l2_passed=v.passed, l2_summary=v.summary, promote=promote,
+        ev_noninferior=ev_ni, ev_noninf_lo=ev_ni_lo, coverage_promote=coverage_promote,
         reasons=tuple(reasons))
 
 
@@ -335,9 +411,11 @@ def render_verdict(v: EntryPolicyVerdict) -> str:
          f"  per-proposed 平均 R：champion {v.champ_mean_r}  vs  challenger {v.chal_mean_r}",
          f"  self-check：{'✅' if v.self_check_ok else '❌'} {v.self_check_detail}",
          f"  L2 四關：{'✅' if v.l2_passed else '❌'} {v.l2_summary}",
+         f"  EV 非劣性（配對單尾 95% 下界）：{'✅' if v.ev_noninferior else '❌'} "
+         f"{v.ev_noninf_lo}R（門檻 >−{NONINF_MARGIN_R}R）",
          "",
-         "【晉升判定（self-check ∧ L2 四關 ∧ per-proposed 配對更好）】",
-         f"  → {'✅ 允許晉升此入場積極度' if v.promote else '❌ 不晉升'}"]
+         "【晉升判定（路徑①EV超越性 ∨ 路徑②涵蓋率非劣性[僅D]）】",
+         f"  → {'✅ 路徑① EV 超越性晉升' if v.promote else ('✅ 路徑② 涵蓋率非劣性晉升(D)' if v.coverage_promote else '❌ 不晉升')}"]
     for r in v.reasons:
         L.append(f"     • {r}")
     L.append("═" * 68)
@@ -484,8 +562,68 @@ def _selftest() -> bool:
         # render 不爆
         chk("render 不爆", isinstance(render_verdict(v), str) and len(render_verdict(v)) > 0)
 
+    # ── _noninferior_ev 純函式單元 ──────────────────────────────────────
+    ni_eq, lo_eq = _noninferior_ev([0.0] * 30, [0.0] * 30)
+    chk("非劣檢定：相同序列→非劣(下界≈0)", ni_eq and lo_eq is not None and abs(lo_eq) < 1e-9)
+    ni_close, _ = _noninferior_ev([0.0] * 30, [-0.02] * 30)   # 讓步 0.02R < 邊界 0.05R
+    chk("非劣檢定：小讓步(−0.02R)仍非劣", ni_close)
+    ni_bad, lo_bad = _noninferior_ev([0.0] * 30, [-0.2] * 30)  # 讓步 0.2R > 邊界
+    chk("非劣檢定：大讓步(−0.2R)非非劣", (not ni_bad) and lo_bad is not None and lo_bad < -0.05)
+    chk("非劣檢定：樣本<2→(False,None)", _noninferior_ev([0.0], [0.0]) == (False, None))
+
+    # ── 涵蓋率非劣性晉升（task#63）：30 筆趨勢跑走，champion 0% 成交、D 到期轉市價回補 ──
+    def _trend_breakeven(n_bars=200):
+        """bull；限價 95 永不觸（low 恆 >95）；到期(第12根)收盤 106<tp110 → D 轉市價；
+        之後長期橫盤 106 → 逾時平倉≈進場價＝per-proposed R≈−成本（D 對 champion EV 非劣）。"""
+        path = [(101.0, 99.0, 100.0)]
+        for i in range(1, 13):
+            base = 100.0 + i * 0.5            # i=12 → 106；low=base−0.2 恆 >95
+            path.append((base + 0.4, base - 0.2, base))
+        path += [(106.3, 105.7, 106.0)] * (n_bars - len(path))   # 橫盤，永不觸 110/80
+        return _mk_candles(path)
+
+    def _trend_crash(n_bars=200):
+        """同上但 D 轉市價後崩到止損 80 → D 大幅 EV-劣（非劣性應擋下）。"""
+        path = [(101.0, 99.0, 100.0)]
+        for i in range(1, 13):
+            base = 100.0 + i * 0.5
+            path.append((base + 0.4, base - 0.2, base))
+        path += [(80.5, 79.5, 80.0)] * (n_bars - len(path))      # 轉市價後即崩到止損
+        return _mk_candles(path)
+
+    def _cov_verdict(series, n_plans, kind_policy):
+        plans_t = [EntryPlan(f"t{i}", "BTC", "bull", 0, 95, 80, 110, reality_filled=False)
+                   for i in range(n_plans)]
+        cbp_t = {f"t{i}": series for i in range(n_plans)}
+        with tempfile.TemporaryDirectory() as td:
+            led = TrialLedger(Path(td) / "trial_ledger.jsonl")
+            return compare_entry_policy(plans_t, cbp_t, kind_policy,
+                                        bucket_key="BTC|price_up_oi_up", ledger=led,
+                                        hypothesis="cov-selftest")
+
+    v_cov = _cov_verdict(_trend_breakeven(), 30, CHALLENGER_CONVERT)
+    chk("涵蓋率晉升：champion 0% 成交", v_cov.champ_fill_rate == 0.0)
+    chk("涵蓋率晉升：D 高成交率回補(≥20pp)",
+        v_cov.coverage_delta_pp is not None and v_cov.coverage_delta_pp >= COV_PROMOTE_MIN_PP)
+    chk("涵蓋率晉升：D EV 對 champion 非劣", v_cov.ev_noninferior)
+    chk("涵蓋率晉升：EV 超越性 promote=False（D 本就 EV-neutral）", v_cov.promote is False)
+    chk("涵蓋率晉升：coverage_promote=True（路徑②啟用 D）", v_cov.coverage_promote is True)
+
+    v_bad = _cov_verdict(_trend_crash(), 30, CHALLENGER_CONVERT)
+    chk("非劣擋下：D 大幅 EV-劣 → ev_noninferior=False", v_bad.ev_noninferior is False)
+    chk("非劣擋下：coverage_promote=False（雖回補涵蓋率亦不晉升）", v_bad.coverage_promote is False)
+
+    v_small = _cov_verdict(_trend_breakeven(), 20, CHALLENGER_CONVERT)
+    chk("樣本<30：coverage_promote=False（minTRL 精神 fail-closed）",
+        v_small.coverage_promote is False and v_small.n_aligned == 20)
+
+    v_mkt = _cov_verdict(_trend_breakeven(), 30, CHALLENGER_MARKET)
+    chk("market 不走涵蓋率路徑：coverage_promote=False（record 層 no-op）",
+        v_mkt.coverage_promote is False)
+
     print("  自測通過：重放(市價/限價/D/bear/追單閘/退界) + self-check 單向防呆 + "
-          "compare 涵蓋率回補 + L2 鏈 ✅" if ok_all else "  ❌ 有失敗項")
+          "compare 涵蓋率回補 + 非劣檢定 + 涵蓋率非劣性晉升(D路徑②) + L2 鏈 ✅"
+          if ok_all else "  ❌ 有失敗項")
     return ok_all
 
 

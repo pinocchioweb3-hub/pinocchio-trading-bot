@@ -12,8 +12,9 @@
         完全不讀本表；改的是『限價單到期要不要追市價』這種模擬盤掛單行為，不跨越執行閘。
     紅線②（對外發布逐次人工）：本表是本機檔（data_dir()，非專案目錄），不對外、不進公開 repo。
     紅線③（不捏造）：每次裁決**一律寫稽核**（promote 與 hold 都留痕）；活躍表**只在
-        verdict.promote is True 時更新**。今日對齊樣本 <30 → L2 minTRL fail-closed → 0 晉升
-        → 本表恆為空 → resolve 回 None → 模擬盤維持現行深限價可到期行為（零行為改變）。
+        verdict.promote（EV 超越性）或 verdict.coverage_promote（涵蓋率非劣性，task#63 僅 D）
+        為真時更新**。今日對齊樣本 <30 → L2 minTRL fail-closed、且涵蓋率晉升 n<30 同樣擋下 →
+        0 晉升 → 本表恆為空 → resolve 回 None → 模擬盤維持現行深限價可到期行為（零行為改變）。
 
 設計約束（與 auto_param_store 同規格，便於 paper_journal 在進場當下輕量解析）：
     - 依賴極輕（只用 stdlib + botpaths）；不可反向依賴 entry_policy_cc / l2_stat_gates（避免 import 環）。
@@ -169,7 +170,15 @@ def apply_verdict(verdict, *, symbol: str, quadrant: str,
                   challenger_kind: str, champion_kind: str | None = None,
                   at_ms: int, active_path: str | Path | None = None,
                   audit_path: str | Path | None = None) -> dict:
-    """消費一個 EntryPolicyVerdict（duck-typed）：**一律寫稽核**；**只在 promote 時改活躍表**。
+    """消費一個 EntryPolicyVerdict（duck-typed）：**一律寫稽核**；**只在晉升時改活躍表**。
+
+    晉升＝兩條路徑任一（task#63）：
+        ① verdict.promote          ＝EV 超越性（self-check ∧ L2 四關 ∧ 配對平均更好）。
+        ② verdict.coverage_promote ＝涵蓋率非劣性（僅 D／limit_convert：EV 對 champion 統計
+                                     非劣 ∧ 實質回補涵蓋率 ∧ n≥30）。解 D 因 EV-neutral 永過不了
+                                     路徑①、導致 live trade_monitor 到期轉市價分支卡死的結構問題。
+        兩路皆假 → action=hold（活躍表不動），但稽核仍揭示 coverage_delta_pp＝救回多少涵蓋率。
+        晉升依據記入 promote_basis（"ev_superiority"｜"coverage_noninferiority"）＝透明可回溯。
 
     ⚠️ EntryPolicyVerdict 的 .champion/.challenger 是『名稱字串』非政策 kind（見 entry_policy_cc.py），
        故挑戰者的 kind **必須由呼叫端顯式傳入**：
@@ -187,6 +196,11 @@ def apply_verdict(verdict, *, symbol: str, quadrant: str,
     """
     bkey = bucket_key(symbol, quadrant)
     promote = bool(getattr(verdict, "promote", False))
+    cov_promote = bool(getattr(verdict, "coverage_promote", False))
+    # task#63：晉升＝EV 超越性 ∨ 涵蓋率非劣性（僅 D）。依據透明留痕、可事後回滾。
+    activate = promote or cov_promote
+    promote_basis = ("ev_superiority" if promote
+                     else ("coverage_noninferiority" if cov_promote else None))
 
     chal_ok = _valid_kind(challenger_kind)
     champ_kind_norm = champion_kind if _valid_kind(champion_kind) else None
@@ -199,18 +213,20 @@ def apply_verdict(verdict, *, symbol: str, quadrant: str,
     to_kind = prev_kind
     note = ""
 
-    if promote and chal_ok and challenger_kind != DEFAULT_KIND:
+    if activate and chal_ok and challenger_kind != DEFAULT_KIND:
         action = "promote"
         to_kind = challenger_kind
         buckets[bkey] = {
             "kind": challenger_kind,
             "policy_name": getattr(verdict, "challenger", None),
             "promoted_at_ms": int(at_ms),
+            "promote_basis": promote_basis,
             "champ_mean_r": getattr(verdict, "champ_mean_r", None),
             "chal_mean_r": getattr(verdict, "chal_mean_r", None),
             "champ_fill_rate": getattr(verdict, "champ_fill_rate", None),
             "chal_fill_rate": getattr(verdict, "chal_fill_rate", None),
             "coverage_delta_pp": getattr(verdict, "coverage_delta_pp", None),
+            "ev_noninf_lo": getattr(verdict, "ev_noninf_lo", None),
             "n_aligned": getattr(verdict, "n_aligned", None),
             "l2_bucket_key": getattr(verdict, "bucket_key", bkey),
             "champion_kind": champ_kind_norm,
@@ -222,10 +238,10 @@ def apply_verdict(verdict, *, symbol: str, quadrant: str,
             action = "hold"
             to_kind = prev_kind
             note = f"活躍表寫入失敗，未生效（fail-safe）：{type(e).__name__}"
-    elif promote and not chal_ok:
-        note = f"verdict.promote 為真但 challenger_kind 非法（{challenger_kind!r}）→ 拒寫（fail-safe）"
-    elif promote and challenger_kind == DEFAULT_KIND:
-        note = "verdict.promote 為真但 challenger＝預設行為（limit_expire）→ 無需覆寫"
+    elif activate and not chal_ok:
+        note = f"verdict 晉升為真但 challenger_kind 非法（{challenger_kind!r}）→ 拒寫（fail-safe）"
+    elif activate and challenger_kind == DEFAULT_KIND:
+        note = "verdict 晉升為真但 challenger＝預設行為（limit_expire）→ 無需覆寫"
 
     rec = {
         "at_ms": int(at_ms),
@@ -233,6 +249,8 @@ def apply_verdict(verdict, *, symbol: str, quadrant: str,
         "bucket": bkey,
         "l2_bucket_key": getattr(verdict, "bucket_key", bkey),
         "promote": promote,
+        "coverage_promote": cov_promote,
+        "promote_basis": promote_basis,
         "from_kind": prev_kind,
         "to_kind": to_kind,
         "challenger_kind": challenger_kind if chal_ok else None,
@@ -244,6 +262,8 @@ def apply_verdict(verdict, *, symbol: str, quadrant: str,
         "champ_fill_rate": getattr(verdict, "champ_fill_rate", None),
         "chal_fill_rate": getattr(verdict, "chal_fill_rate", None),
         "coverage_delta_pp": getattr(verdict, "coverage_delta_pp", None),
+        "ev_noninferior": getattr(verdict, "ev_noninferior", None),
+        "ev_noninf_lo": getattr(verdict, "ev_noninf_lo", None),
         "n_aligned": getattr(verdict, "n_aligned", None),
         "self_check_ok": getattr(verdict, "self_check_ok", None),
         "l2_passed": getattr(verdict, "l2_passed", None),
@@ -414,6 +434,33 @@ def _selftest() -> bool:
                           at_ms=5, active_path=ap, audit_path=au)
         assert r["action"] == "promote"
         assert resolve_entry_policy("DOGE", "price_up_oi_up", active_path=ap) == "market"
+
+        # 6b) task#63 涵蓋率非劣性晉升：promote=False 但 coverage_promote=True → 仍落地（D）。
+        #     依據＝coverage_noninferiority，且 bucket 留痕 promote_basis（紅線③透明）。
+        r = apply_verdict(
+            _v(False, bucket_key="ADA|price_up_oi_up", challenger="D_深限價到期轉市價",
+               coverage_promote=True, ev_noninferior=True, ev_noninf_lo=-0.01),
+            symbol="ADA", quadrant="price_up_oi_up",
+            challenger_kind="limit_convert", champion_kind="limit_expire",
+            at_ms=8, active_path=ap, audit_path=au)
+        assert r["action"] == "promote", r
+        assert resolve_entry_policy("ADA", "price_up_oi_up", active_path=ap) == "limit_convert"
+        _last = json.loads(au.read_text(encoding="utf-8").strip().splitlines()[-1])
+        assert _last["promote_basis"] == "coverage_noninferiority", _last
+        assert _last["coverage_promote"] is True and _last["promote"] is False
+        # 活躍桶也留下晉升依據
+        _bkt = json.loads(ap.read_text(encoding="utf-8"))["buckets"]["ADA|price_up_oi_up"]
+        assert _bkt["promote_basis"] == "coverage_noninferiority", _bkt
+
+        # 6c) 反例：promote=False 且 coverage_promote=False → hold（活躍表不動）
+        r = apply_verdict(
+            _v(False, bucket_key="LTC|price_up_oi_up", challenger="D_深限價到期轉市價",
+               coverage_promote=False),
+            symbol="LTC", quadrant="price_up_oi_up",
+            challenger_kind="limit_convert", champion_kind="limit_expire",
+            at_ms=9, active_path=ap, audit_path=au)
+        assert r["action"] == "hold"
+        assert resolve_entry_policy("LTC", "price_up_oi_up", active_path=ap) is None
 
         # 7) rollback → 回退預設
         r = rollback("BTC", "price_up_oi_up", at_ms=6, reason="selftest",

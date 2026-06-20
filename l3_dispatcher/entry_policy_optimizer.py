@@ -262,7 +262,11 @@ def _optimize_bucket(symbol: str, quadrant: str, plans: list[EntryPlan],
                                  registered_at_ms=_LEDGER_EPOCH_MS)
         evaluated.append((chal, v))
 
-    # 選定：優先「已晉升且 per-proposed 平均 R 最高」；皆未晉升 → 取涵蓋率回補最大者當 hold 留痕。
+    # 選定（task#63 三層優先序）：
+    #   ① EV 超越性晉升者中 per-proposed 平均 R 最高（promoted）。
+    #   ② 否則涵蓋率非劣性晉升者中 涵蓋率回補最大（cov_promoted，僅 D／limit_convert）——
+    #      解 D 因 EV-neutral 永過不了①、導致 live trade_monitor 到期轉市價分支卡死。
+    #   ③ 皆未晉升 → 取涵蓋率回補最大者當 hold 留痕（揭示餵桶價值，活躍表不動）。
     def _mean(v):
         return v.chal_mean_r if getattr(v, "chal_mean_r", None) is not None else -1e9
 
@@ -270,8 +274,15 @@ def _optimize_bucket(symbol: str, quadrant: str, plans: list[EntryPlan],
         return v.coverage_delta_pp if getattr(v, "coverage_delta_pp", None) is not None else -1e9
 
     promoted = [(c, v) for c, v in evaluated if v.promote]
-    chosen = (max(promoted, key=lambda cv: _mean(cv[1])) if promoted
-              else (max(evaluated, key=lambda cv: _cov(cv[1])) if evaluated else None))
+    cov_promoted = [(c, v) for c, v in evaluated if getattr(v, "coverage_promote", False)]
+    if promoted:
+        chosen = max(promoted, key=lambda cv: _mean(cv[1]))
+    elif cov_promoted:
+        chosen = max(cov_promoted, key=lambda cv: _cov(cv[1]))
+    elif evaluated:
+        chosen = max(evaluated, key=lambda cv: _cov(cv[1]))
+    else:
+        chosen = None
 
     applied = None
     if chosen is not None:
@@ -334,7 +345,9 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
         cv = b["chosen"]
         chal_pol, v = cv
         kzh = eps._KIND_ZH.get(chal_pol.kind, chal_pol.kind)
-        verb = "✅晉升" if v.promote else "⏸️維持"
+        verb = ("✅晉升(EV超越性)" if v.promote
+                else ("✅晉升(涵蓋率非劣性)" if getattr(v, "coverage_promote", False)
+                      else "⏸️維持"))
         cov = (f"，成交率 {v.champ_fill_rate}%→{v.chal_fill_rate}%(+{v.coverage_delta_pp}pp)"
                if v.coverage_delta_pp is not None else "")
         mr = (f"{v.champ_mean_r:+.3f}→{v.chal_mean_r:+.3f}R"
@@ -343,11 +356,13 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
                      f"\n  L2：{v.l2_summary}")
     lines.append("")
     lines.append(eps.render_active(active_path))
-    lines.append("<i>動入場積極度唯一合法路徑＝過 L2 四關（minTRL/DSR/PBO/FDR）；只寫模擬盤入場政策"
-                 "覆寫表（紅線①真錢執行層永不讀），可事後 rollback。樣本未達門檻前覆寫表恆空、"
-                 "零行為變更。entry_expired 樣本即使不 promote，重放也已回補其『若用 D 會怎樣』的標籤。"
-                 "\n⚠️現階段＝學習＋揭示半（每日累積 L2 證據）；進場執行層消費此覆寫表為下一步接線，"
-                 "在消費端接上前，本表為觀測/待接狀態，不改任何模擬盤進場行為。</i>")
+    lines.append("<i>晉升此覆寫表有兩條合法路徑：①EV 超越性（過 L2 四關 minTRL/DSR/PBO/FDR ∧ 配對"
+                 "更好）②涵蓋率非劣性（task#63，僅 D／limit_convert：EV 對 champion 統計非劣 ∧ 實質"
+                 "回補涵蓋率 ∧ n≥30）。消費端**已接線生效**（paper_journal 進場自解析覆寫、trade_monitor"
+                 " 到期轉市價）——但**只驅動模擬盤 paper／demo，真錢執行層永不讀**（紅線①）。今日對齊"
+                 "樣本未達門檻 → 覆寫表恆空 → resolve 回 None → 模擬盤維持現行深限價可到期行為"
+                 "（byte-identical，零行為變更）。entry_expired 樣本即使未晉升，重放也已回補其"
+                 "『若用 D 會怎樣』的標籤＝餵飽餓死桶。透明可事後 rollback。</i>")
     return "\n".join(lines)
 
 
