@@ -92,6 +92,7 @@ class WatchlistManager:
             pool = list(dict.fromkeys(list(self.candidate_pool) + market))
         else:
             pool = list(self.candidate_pool)
+        n_pool = len(pool)   # task#64：請求進宇宙的候選檔數（截斷遙測基準）
 
         # 走公開介面，不依賴 source 的私有方法
         universe = await source.get_strength_universe(
@@ -102,9 +103,21 @@ class WatchlistManager:
             elapsed = asyncio.get_event_loop().time() - t0
             return {"chosen": list(self.trading), "dropped": [], "added": [],
                     "scored": [], "elapsed_sec": round(elapsed, 2),
-                    "ts": self.last_refresh, "error": universe.get("message")}
+                    "ts": self.last_refresh, "error": universe.get("message"),
+                    "universe_telemetry": {"n_pool": n_pool, "n_universe": 0,
+                                           "n_dropped": 0, "errored": True}}
 
         items = universe.get("items", [])
+
+        # task#64：宇宙截斷遙測（純觀測，零訊號數學影響）。
+        # get_strength_universe 對 pool 內每檔各打一次 /pairs-markets；遇 429/錯誤會
+        # silently `continue`（見 coinglass.py），使回傳 items 少於請求數＝模型對市場
+        # 部分失明。這裡用「請求數 vs 回傳數」算出被丟幾檔，先量測截斷率再決定是否治本。
+        # items / chosen 照常往下走 → 不改候選覆蓋、不過回測閘、不碰任何下單數學。
+        n_universe = len(items)
+        n_dropped = max(0, n_pool - n_universe)
+        universe_telemetry = {"n_pool": n_pool, "n_universe": n_universe,
+                              "n_dropped": n_dropped, "errored": False}
 
         # 硬性過濾（低流動性、極端漲跌、過熱費率）
         # 註：ret_7d_pct 由 mi_get_strength_universe 用 ret_24h × 5 估算
@@ -136,6 +149,7 @@ class WatchlistManager:
                 "dropped": [], "added": [], "scored": scored,
                 "elapsed_sec": round(elapsed, 2),
                 "ts": self.last_refresh,
+                "universe_telemetry": universe_telemetry,
                 "warn": f"strict filters left 0 candidates (vol={skipped_reasons['vol']} "
                         f"ret={skipped_reasons['ret']} funding={skipped_reasons['funding']}); "
                         f"keeping previous list",
@@ -174,6 +188,7 @@ class WatchlistManager:
             "short_tier": list(self.short_tier),
             "elapsed_sec": round(elapsed, 2),
             "ts": self.last_refresh,
+            "universe_telemetry": universe_telemetry,   # task#64 截斷遙測（純觀測）
         }
 
 
@@ -186,7 +201,10 @@ async def run_refresh_loop(manager: WatchlistManager, source,
     # 啟動立即 refresh
     print(f"[refresh] initial refresh starting...")
     result = await manager.refresh(source)
-    print(f"[refresh] chose {len(result['chosen'])} symbols, elapsed={result['elapsed_sec']}s")
+    _tel = result.get("universe_telemetry") or {}
+    _drop = (f", universe {_tel['n_universe']}/{_tel['n_pool']} (dropped {_tel['n_dropped']})"
+             if _tel.get("n_dropped") else "")
+    print(f"[refresh] chose {len(result['chosen'])} symbols, elapsed={result['elapsed_sec']}s{_drop}")
     if callback:
         await callback(result)
 
@@ -201,6 +219,9 @@ async def run_refresh_loop(manager: WatchlistManager, source,
         await asyncio.sleep(wait)
 
         result = await manager.refresh(source)
-        print(f"[refresh] re-ranked: added={result['added']}  dropped={result['dropped']}")
+        _tel = result.get("universe_telemetry") or {}
+        _drop = (f"  universe_dropped={_tel['n_dropped']}/{_tel['n_pool']}"
+                 if _tel.get("n_dropped") else "")
+        print(f"[refresh] re-ranked: added={result['added']}  dropped={result['dropped']}{_drop}")
         if callback:
             await callback(result)
