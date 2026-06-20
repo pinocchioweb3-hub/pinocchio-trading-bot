@@ -689,9 +689,14 @@ async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3
 
 
 def _record_deepdive_plan(sym: str, plan: dict | None,
-                          signal_msg_id: int | None = None) -> dict | None:
+                          signal_msg_id: int | None = None,
+                          sym_state: dict | None = None) -> dict | None:
     """v33：把 deepdive 可執行計畫存進紙上帳（等待觸發），回給圖表用的 plan dict。
-    不可做單 / 缺關鍵價位 / 已有同標的 open 倉 → 不重複建單。任何錯誤回 None，不阻塞。"""
+    不可做單 / 缺關鍵價位 / 已有同標的 open 倉 → 不重複建單。任何錯誤回 None，不阻塞。
+
+    v56：sym_state（compute_per_symbol_state 的完整資料）若有提供，會把其中『已抓好的』
+    per-symbol 觀測（snapshot 的 OI/資金費/CVD/大戶比/btc_regime/200MA + 4h regime 趨勢
+    方向）餵進進場快照的 regime/context 影子向量——治本 deepdive oi_price_quadrant 恆 None。"""
     if not plan or not plan.get("actionable"):
         return None
     direction = plan.get("direction")
@@ -718,10 +723,25 @@ def _record_deepdive_plan(sym: str, plan: dict | None,
         # v56 step1：進場那刻凍結計畫快照（純觀測，失敗回 None 不阻塞建單）
         try:
             from .plan_snapshot import build_plan_snapshot
-            # v56 step4：deepdive 無 per-symbol snapshot，仍補市場層 context
-            # （廣度/均資費，本地 DB 讀）；純觀測，零下單數學。
             from .regime_vector import assemble as _asm_rg
-            _rv, _ctx = _asm_rg(None, direction=direction)
+            # v56 治本：過去這裡傳 _asm_rg(None)，deepdive 永遠沒有 per-symbol 觀測 →
+            #   oi_price_quadrant 恆 None，優化器 (symbol,quadrant) 分桶退化成 per-symbol-only，
+            #   架空「per-symbol×per-regime」目標。改重用 deepdive 早已抓好的同一份資料：
+            #     • snapshot（mi_get_snapshot：oi_delta_pct/funding/cvd_slope/cvd 背離/大戶比/
+            #       btc_regime/above_4h_200ma，欄名已對齊 assemble，零新網路請求）
+            #     • per-symbol 4h regime 的 trend_dir（上/下）→ 推『市場已觀測價格方向』給象限分類
+            #   純資料重用，零訊號/下單數學變更；任何缺料安全降級為 None（與舊行為等價）。
+            _snap_for_rv = None
+            try:
+                _ss = (sym_state or {}).get("snapshot")
+                if isinstance(_ss, dict) and not _ss.get("error"):
+                    _snap_for_rv = dict(_ss)   # 淺拷貝，不污染 sym_state 下游用途（圖表等）
+                    _td = ((sym_state or {}).get("regime") or {}).get("trend_dir")
+                    if _td is not None:
+                        _snap_for_rv["regime_trend_dir"] = _td
+            except Exception:
+                _snap_for_rv = None
+            _rv, _ctx = _asm_rg(_snap_for_rv, direction=direction)
             plan_snap = build_plan_snapshot(
                 source="macro_deepdive", direction=direction,
                 entry_price=entry, planned_stop=stop,
@@ -804,7 +824,8 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
                             # v33: 把可執行計畫接進紙上帳（看得到的報單→可追蹤可算勝率），
                             #      存原始訊號 message_id 供持倉回連。失敗不阻塞。
                             plan = meta.get("plan")
-                            chart_plan = _record_deepdive_plan(sym, plan, sig_mid)
+                            chart_plan = _record_deepdive_plan(sym, plan, sig_mid,
+                                                               sym_state=sym_state)
                             # v18-F: 附 SMC 標記圖（v33 帶計畫線；失敗不阻塞）
                             try:
                                 from .chart_render import render_symbol_chart

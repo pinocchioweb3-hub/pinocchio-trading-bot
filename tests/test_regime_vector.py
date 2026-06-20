@@ -138,6 +138,49 @@ def test_assemble_from_dataclass():
     assert ctx["htf_aligned"] is True   # 在 200MA 下 + 做空 = 同向
 
 
+# --- 4c. _price_trend 後備：regime_trend_dir（治本 deepdive 象限恆 None）---
+def test_price_trend_from_regime_trend_dir():
+    # 既有來源優先：有 breakout_1h_high 就不看 regime_trend_dir
+    assert rv._price_trend({"breakout_1h_high": True, "regime_trend_dir": "下"}) == "up"
+    assert rv._price_trend({"us_breakout_dir": "bear", "regime_trend_dir": "上"}) == "down"
+    # 無突破旗標時，退用 4h regime 趨勢方向（classify_regime.trend_dir：上/下）
+    assert rv._price_trend({"regime_trend_dir": "上"}) == "up"
+    assert rv._price_trend({"regime_trend_dir": "下"}) == "down"
+    assert rv._price_trend({"regime_trend_dir": "up"}) == "up"     # 也容英文
+    assert rv._price_trend({"regime_trend_dir": "down"}) == "down"
+    # 盤整（trend_dir=None）或缺料 → 不明回 None（不硬湊）
+    assert rv._price_trend({"regime_trend_dir": None}) is None
+    assert rv._price_trend({}) is None
+    assert rv._price_trend(None) is None
+
+
+# --- 4d. assemble 端到端：deepdive 風格 snap（snapshot+regime_trend_dir）填出象限 ---
+def test_assemble_deepdive_style_populates_quadrant():
+    # 模擬 macro deepdive 重用的資料：mi_get_snapshot 的欄 + 注入的 regime_trend_dir。
+    # 關鍵回歸：過去 deepdive 傳 None → 象限恆 None；現在應能填實。
+    snap = {
+        "oi_delta_pct": 6.0, "funding": 0.0009, "cvd_slope": 0.3,
+        "cvd_price_divergence": "none", "top_trader_ratio": 1.1,
+        "btc_regime": "trend_down", "above_4h_200ma": False,
+        "regime_trend_dir": "下",            # 4h regime 趨勢向下（市場觀測）
+        # 注意：無 breakout_1h_high / us_breakout_dir（deepdive 沒有這些旗標）
+    }
+    rgv, ctx = rv.assemble(snap, direction="bull", include_market=False)
+    assert rgv["oi_price_quadrant"] == "price_down_oi_up"   # 價跌(下)×OI升(6%) = 新空進場
+    assert rgv["funding_state"] == "hot"
+    assert ctx["oi_delta_pct"] == 6.0
+    assert ctx["btc_above_200ma_4h"] is False               # trend_down → False
+    # 逆勢做多(bull)入跌勢：htf_aligned 應為 False（在 200MA 下做多＝不同向）
+    assert ctx["htf_aligned"] is False
+
+
+# --- 4e. assemble：deepdive 缺價格方向（盤整）→ 象限安全降級 None（不造假）---
+def test_assemble_deepdive_range_quadrant_none():
+    snap = {"oi_delta_pct": 6.0, "regime_trend_dir": None}   # OI 有、但盤整無方向
+    rgv, _ = rv.assemble(snap, direction="bull", include_market=False)
+    assert rgv["oi_price_quadrant"] is None                 # 方向不明不硬湊
+
+
 # --- 5. assemble(None) 只取市場層，per-symbol 欄全 None ---
 def test_assemble_none_snap_market_only(monkeypatch):
     import l3_dispatcher.market_scanner as ms

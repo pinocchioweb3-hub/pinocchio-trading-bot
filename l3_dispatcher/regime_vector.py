@@ -116,13 +116,26 @@ def _htf_aligned(above_4h_200ma, direction):
 
 
 def _price_trend(snap):
-    """由已算好的欄位推短線價格方向（只認確定的『上』；不確定回 None）。"""
+    """由已算好的欄位推短線價格方向（只認確定方向；不確定回 None）。
+
+    來源優先序（皆為『已算好的觀測值』，本函式不重算任何趨勢）：
+      1. breakout_1h_high＝True（dispatcher 直發路徑的 1h 突破旗標）→ up
+      2. us_breakout_dir（美股突破方向）bull→up / bear→down
+      3. regime_trend_dir（per-symbol 4h regime 的 classify_regime.trend_dir：上/下；
+         盤整為 None）——v56：deepdive 等無突破旗標的來源用此後備，治本『象限恆 None』。
+         注意：這是『市場已觀測到的趨勢方向』，非我方下單方向；逆勢單也照市場實況分桶。
+    """
     if _get(snap, "breakout_1h_high") is True:
         return "up"
     us_dir = _get(snap, "us_breakout_dir")
     if us_dir == "bull":
         return "up"
     if us_dir == "bear":
+        return "down"
+    td = _get(snap, "regime_trend_dir")
+    if td in ("上", "up", "bull"):
+        return "up"
+    if td in ("下", "down", "bear"):
         return "down"
     return None
 
