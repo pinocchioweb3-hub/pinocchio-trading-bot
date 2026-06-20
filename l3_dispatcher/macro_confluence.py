@@ -56,7 +56,7 @@ _WEIGHTS = {
     "liquidation": 8 / 100.0,     # 0.08  清算失衡（空清算多→軋空燃料）
     "whales": 6 / 100.0,         # 0.06  HL 巨鯨淨倉
     "coinbase_premium": 6 / 100.0,  # 0.06  美國現貨買壓（v58 8→6 騰權重）
-    "coin_netflow": 4 / 100.0,    # 0.04  交易所淨流（流入＝賣壓；v58 6→4 騰權重）
+    "coin_netflow": 4 / 100.0,    # 0.04  現貨主動淨買賣(taker buy−sell,正=偏多;v58 6→4)
     "btc_dominance": 4 / 100.0,   # 0.04  BTC 市占（避險／資金外溢山寨）
     "altcoin_season": 2 / 100.0,  # 0.02  山寨季氛圍
     "btc_vs_m2": 2 / 100.0,       # 0.02  流動性估值（最弱輔助）
@@ -68,6 +68,15 @@ _WEIGHTS = {
 # breadth<這個門檻 → 掛 risk_off 旗標
 _BREADTH_RISKOFF = 35
 
+# 重正規化（task#69）：合成分數除以「有料分量的權重總和」而非全 1.0，避免缺料
+# 分量（sub=0）把分數系統性拉向中性而稀釋（約 30% macro 訊號曾因三死分量+缺料
+# 靜默扁平化）。地板防止「只有稀疏/低權重分量在線」時過度放大；0.25 ≈ breadth
+# (0.12)+dxy(0.14) 常駐基線，故地板僅在嚴重缺料輪次才綁定。score_method 標記讓
+# jsonl 行自我區分新舊口徑（紅線③：不回填既有已收斂 snapshot，新口徑只對未來
+# 生效）。仍全程影子、不影響下單。
+_MIN_PRESENT_MASS = 0.25
+_SCORE_METHOD = "v2_renorm_present_mass"
+
 
 # ===========================================================================
 # 確定性規則：把每個分量原始值映射到 [-1, +1] 的「對多方燃料方向強度」。
@@ -75,6 +84,13 @@ _BREADTH_RISKOFF = 35
 # ===========================================================================
 def _clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
+
+
+def _num(x) -> bool:
+    """是否為『真實數值』（int/float 且非 bool）。用於缺料偵測：判定某分量是否
+    有資料進場（present），與其 sub_score 是否為 0 無關——『有料但中性』(如 DXY
+    持平=0.0) 仍算 present，其權重須計入重正規化分母，否則中性觀測反放大他項。"""
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
 def score_etf(cum_7d_flow_usd) -> float:
@@ -159,21 +175,25 @@ def score_whales(net_long_pct) -> float:
 
 
 def score_coinbase_premium(premium_value) -> float:
-    """Coinbase 溢價 → [-1,+1]。>0＝美國現貨買盤強＝偏多(+)；<0＝偏空。
-    ±50（bps／點，視單位）視為滿格。缺料/非數字回 0.0（中性化）。
+    """Coinbase 溢價率 → [-1,+1]。>0＝美國現貨買盤強＝偏多(+)；<0＝偏空。
+    輸入為 premium_rate（**百分比 %**，client get_coinbase_premium_index 的
+    latest）；±0.5% 視為滿格（task#69 實測量級校準；舊 ÷50 誤把 % 當 bps 故此
+    分量近乎恆 0）。缺料/非數字回 0.0（中性化）。
     """
     if not isinstance(premium_value, (int, float)):
         return 0.0
-    return _clamp(premium_value / 50.0)
+    return _clamp(premium_value / 0.5)
 
 
 def score_coin_netflow(netflow_usd) -> float:
-    """交易所淨流 → [-1,+1]。>0＝流入交易所＝潛在賣壓＝偏空(反號,-)；
-    <0＝提幣冷錢包＝偏多(+)。±$5 億視為滿格。缺料/非數字回 0.0（中性化）。
+    """現貨主動淨買賣流（taker buy−sell USD）→ [-1,+1]。>0＝主動買盤淨多＝
+    偏多(+)、<0＝主動賣盤淨多＝偏空(−)。**不反號**（client 端 net_flow_usd
+    已是主動單方向流，與舊『流入交易所＝賣壓』假設相反，task#69 治本）。
+    ±$6.5 億視為滿格（實測量級校準）。缺料/非數字回 0.0（中性化）。
     """
     if not isinstance(netflow_usd, (int, float)):
         return 0.0
-    return _clamp(-netflow_usd / 500_000_000.0)
+    return _clamp(netflow_usd / 650_000_000.0)
 
 
 def score_btc_dominance(dominance_pct) -> float:
@@ -242,6 +262,32 @@ def score_agg_cvd_slope(slope) -> float:
     return _clamp(slope)
 
 
+def _btc_vs_m2_deviation(series, window: int = 30, max_stale_days: int = 45):
+    """從 get_bitcoin_vs_m2 的 series 算『近 window 根 BTC 漲幅% − M2 漲幅%』偏離。
+    取尾端 last 與 last-window 兩點（非 first-vs-last 全史，避免長窗永遠飽和）。
+
+    這是蒐集層 derive 輔助（非純 scorer：會讀 wall clock 做時效防呆）。資料過期
+    （last 點 > max_stale_days 天）一律回 None＝誠實缺料（紅線③：一個恆飽和的
+    錯接分量比『誠實缺席』更糟）。資料不足/欄位壞/分母為 0 → None。
+    """
+    if not series or len(series) < window + 1:
+        return None
+    last = series[-1]
+    prev = series[-1 - window]
+    if not isinstance(last, dict) or not isinstance(prev, dict):
+        return None
+    ts = last.get("ts") or 0
+    if ts and ts > 1e12:          # 毫秒 → 秒
+        ts = ts / 1000.0
+    if ts and (time.time() - ts) > max_stale_days * 86400:
+        return None               # 過期 → 誠實缺料
+    p, m = last.get("price"), last.get("m2")
+    p0, m0 = prev.get("price"), prev.get("m2")
+    if not all(isinstance(x, (int, float)) and x for x in (p, m, p0, m0)):
+        return None
+    return (p - p0) / p0 * 100.0 - (m - m0) / m0 * 100.0
+
+
 def compute_confluence(components: dict) -> dict:
     """把各分量原始輸入用確定性規則合成 macro_confluence_score + 明細。**純函式**。
 
@@ -253,9 +299,12 @@ def compute_confluence(components: dict) -> dict:
         orderbook_imbalance_value, spot_perp_ratio_value, agg_cvd_slope_value
     回傳
         macro_confluence_score: float ∈ [-100,+100]（+偏多/risk-on，-偏空/risk-off）
-        components: {name: {raw, sub_score∈[-1,1], weight, contribution}}
+            ＝ Σ(sub*weight) / max(有料權重總和, _MIN_PRESENT_MASS) × 100（重正規化）
+        components: {name: {raw, sub_score∈[-1,1], weight, contribution, present}}
         risk_off: bool（breadth 風險趨避旗標）
-        n_present: 有明確（非中性 0）分量數
+        n_present: 有料（有資料進場）分量數（含有料但中性=0 者）
+        present_mass: 有料分量的權重總和（重正規化分母，套地板前）
+        score_method: 計分口徑標記（區分新舊 jsonl 行；紅線③不回填舊 snapshot）
         bias: 'risk_on' | 'risk_off' | 'neutral'（依分數帶）
 
     ⚠️ 此分數為 SHADOW 專用：永不乘進/加進 strength_score、永不進 fire/下單。
@@ -302,23 +351,57 @@ def compute_confluence(components: dict) -> dict:
             c.get("agg_cvd_slope_value")),
     }
 
+    # 缺料偵測（present＝該分量有資料進場，與 sub 是否為 0 無關）。breadth 與
+    # liquidation 依其 scorer 的「無訊號」語意特判：breadth 須 n_total≥30、
+    # liquidation 須 long/short 至少一者為數值且總額>0，否則視為缺料不計分母。
+    _b = c.get("breadth")
+    breadth_present = isinstance(_b, dict) and (_b.get("n_total") or 0) >= 30
+    _ll, _sl = c.get("liq_long_usd"), c.get("liq_short_usd")
+    liq_total = (_ll if _num(_ll) else 0.0) + (_sl if _num(_sl) else 0.0)
+    liq_present = bool(_num(_ll) or _num(_sl)) and liq_total > 0
+    present_map = {
+        "etf": _num(c.get("etf_cum_7d_flow_usd")),
+        "dxy": _num(c.get("dxy_change_pct")),
+        "breadth": breadth_present,
+        "funding": _num(c.get("avg_funding_8h")),
+        "oi": _num(c.get("oi_delta_pct")),
+        "liquidation": liq_present,
+        "whales": _num(c.get("whale_net_long_pct")),
+        "coinbase_premium": _num(c.get("coinbase_premium_value")),
+        "coin_netflow": _num(c.get("coin_netflow_usd")),
+        "btc_dominance": _num(c.get("btc_dominance_pct")),
+        "altcoin_season": _num(c.get("altcoin_season_index")),
+        "btc_vs_m2": _num(c.get("btc_vs_m2_deviation_pct")),
+        "orderbook_imbalance": _num(c.get("orderbook_imbalance_value")),
+        "spot_perp_ratio": _num(c.get("spot_perp_ratio_value")),
+        "agg_cvd_slope": _num(c.get("agg_cvd_slope_value")),
+    }
+
     detail: dict[str, dict] = {}
     weighted_sum = 0.0
+    present_mass = 0.0
     n_present = 0
     for name, (sub, raw) in subs.items():
         w = _WEIGHTS.get(name, 0.0)
+        present = bool(present_map.get(name, False))
         contrib = sub * w
         weighted_sum += contrib
-        if abs(sub) > 1e-9:
+        if present:
+            present_mass += w
             n_present += 1
         detail[name] = {
             "raw": raw,
             "sub_score": round(sub, 4),
             "weight": w,
             "contribution": round(contrib, 4),
+            "present": present,
         }
 
-    score = round(_clamp(weighted_sum, -1.0, 1.0) * 100, 2)
+    # 重正規化：除以有料權重總和（地板 _MIN_PRESENT_MASS 防稀疏過度放大）。
+    # 缺料分量 sub=0 不再把分數系統性稀釋向中性。
+    denom = max(present_mass, _MIN_PRESENT_MASS)
+    norm = (weighted_sum / denom) if denom > 0 else 0.0
+    score = round(_clamp(norm, -1.0, 1.0) * 100, 2)
     if risk_off:
         bias = "risk_off"
     elif score >= 20:
@@ -333,6 +416,8 @@ def compute_confluence(components: dict) -> dict:
         "components": detail,
         "risk_off": bool(risk_off),
         "n_present": n_present,
+        "present_mass": round(present_mass, 4),
+        "score_method": _SCORE_METHOD,
         "bias": bias,
     }
 
@@ -357,7 +442,7 @@ def render_dashboard(summary: dict | None) -> str:
         name_zh = {"etf": "ETF淨流", "dxy": "美元DXY", "breadth": "市場廣度",
                    "funding": "資金費率", "oi": "未平倉OI",
                    "liquidation": "清算失衡", "whales": "巨鯨淨倉",
-                   "coinbase_premium": "CB溢價", "coin_netflow": "交易所淨流",
+                   "coinbase_premium": "CB溢價", "coin_netflow": "現貨淨買賣",
                    "btc_dominance": "BTC市占", "altcoin_season": "山寨季",
                    "btc_vs_m2": "M2流動性", "orderbook_imbalance": "掛單牆",
                    "spot_perp_ratio": "現貨/合約量比", "agg_cvd_slope": "官方CVD"}
@@ -629,7 +714,7 @@ async def _collect_components(source) -> dict:
     # 缺料一律不寫鍵 → compute 端 score_* 收 None 回 0.0 → 不計 n_present 分母。
     # 全程影子：只寫 out dict 供純函式合成 + 顯示，永不入 strength/fire/下單。
     # ----------------------------------------------------------------------
-    # --- CB 溢價（美國現貨買壓代理）---
+    # --- CB 溢價（美國現貨買壓代理；latest=premium_rate 百分比%）---
     try:
         r = await source.get_coinbase_premium_index("1h", 24)
         if isinstance(r, dict) and not r.get("error"):
@@ -637,7 +722,7 @@ async def _collect_components(source) -> dict:
     except Exception:
         pass
 
-    # --- 交易所淨流（流入＝賣壓）---
+    # --- 現貨主動淨買賣流（taker buy−sell；正＝買盤淨多偏多，不反號）---
     try:
         r = await source.get_coin_netflow("BTC", "1h", 24)
         if isinstance(r, dict) and not r.get("error"):
@@ -661,21 +746,15 @@ async def _collect_components(source) -> dict:
     except Exception:
         pass
 
-    # --- BTC vs M2（此端點無 'latest'，僅 series；須自 series 算近端偏離）---
+    # --- BTC vs M2（此端點無 'latest'，僅 series；用近端窗偏離 + 時效防呆）---
+    # 改 first-vs-last 全史 → 近 30 根尾端窗（避免長窗永遠飽和）；資料過期一律
+    # 回 None＝誠實缺料不寫鍵（紅線③：恆飽和的錯接分量比『誠實缺席』更糟）。
     try:
-        r = await source.get_bitcoin_vs_m2("global", 60)
+        r = await source.get_bitcoin_vs_m2("global", 120)
         if isinstance(r, dict) and not r.get("error"):
-            s = r.get("series") or []
-            if s:
-                last = s[-1]
-                first = s[0]
-                p, m = last.get("price"), last.get("m2")
-                p0, m0 = first.get("price"), first.get("m2")
-                # 確定性偏離 = BTC 漲幅% − M2 漲幅%（正＝BTC 相對 M2 超漲，負＝落後）
-                if all(isinstance(x, (int, float)) and x for x in (p, m, p0, m0)):
-                    btc_chg = (p - p0) / p0 * 100.0
-                    m2_chg = (m - m0) / m0 * 100.0
-                    out["btc_vs_m2_deviation_pct"] = btc_chg - m2_chg
+            dev = _btc_vs_m2_deviation(r.get("series") or [])
+            if dev is not None:
+                out["btc_vs_m2_deviation_pct"] = dev
     except Exception:
         pass
 

@@ -1281,10 +1281,15 @@ class CoinGlassSource:
                                          limit: int = 24) -> dict:
         """Coinbase 溢價指數歷史：美國現貨買壓代理（>0＝美國買盤強＝偏多）。
 
+        v4 正確路徑為 /api/coinbase-premium-index（無 /history 後綴；舊碼帶
+        /history 一律 404 → 此分量長期靜默缺料，task#69 治本修正）。
+        回傳 latest 取 premium_rate（**百分比 %**，非 USD 絕對值），缺則退
+        premium(USD)/close。scorer 端據此單位校準（±0.5% 視為滿格）。
+
         回 {"source","latest","series":[{ts,value}]}；失敗回 make_error dict。
         """
         r = await self._get(
-            "/api/coinbase-premium-index/history",
+            "/api/coinbase-premium-index",
             {"interval": interval, "limit": min(max(limit, 1), 500)},
             tool="mi_get_coinbase_premium",
         )
@@ -1309,36 +1314,45 @@ class CoinGlassSource:
 
     async def get_coin_netflow(self, symbol: str = "BTC",
                                interval: str = "1h", limit: int = 24) -> dict:
-        """交易所淨流（futures/coin/netflow）：>0＝資金流入交易所（潛在賣壓）、
-        <0＝流出（提幣冷錢包＝偏多）。注意文件 overview 曾有 typo `furures`，
-        實際路徑為 /api/futures/coin/netflow。
+        """現貨交易所淨買賣流（spot/coin/netflow）：net_flow_usd = 主動買額 −
+        主動賣額（taker buy − sell，已實測等價），故 >0＝現貨主動買盤淨多＝
+        偏多(+)、<0＝主動賣盤淨多＝偏空(−)。語意是「現貨主動單方向流」，
+        **不可 negate**（與舊『流入交易所＝賣壓』假設相反）。
 
-        回 {"symbol","source","latest","series":[{ts,value}]}；失敗回 make_error。
+        v4 正確路徑 /api/spot/coin/netflow，回傳為單一 DICT（非 list；舊碼
+        for d in data 把它當 list 迭代字串鍵→AttributeError 靜默吞→此分量
+        長期死料，task#69 治本）。取 net_flow_usd_24h（缺則退 12h）。
+
+        回 {"symbol","source","latest","window","mcap_ratio",
+        "series":[{ts,value}]}；失敗回 make_error。
         """
         agg_sym = self._agg_symbol(symbol)
         r = await self._get(
-            "/api/futures/coin/netflow",
+            "/api/spot/coin/netflow",
             {"symbol": agg_sym, "interval": interval,
              "limit": min(max(limit, 1), 500)},
             tool="mi_get_coin_netflow", symbol=symbol,
         )
         if r.get("error"):
             return r
-        data = r.get("data") or []
-        series = []
-        for d in data:
-            v = self._to_float(
-                d.get("netflow_usd") if d.get("netflow_usd") is not None
-                else (d.get("netflow") if d.get("netflow") is not None
-                      else d.get("close")))
-            if v is not None:
-                series.append({"ts": self._extract_ts(d), "value": v})
-        if not series:
+        data = r.get("data")
+        if not isinstance(data, dict):
             return make_error(tool="mi_get_coin_netflow", symbol=symbol,
                               source="coinglass", code="EMPTY_DATA",
-                              message="no netflow data")
-        return {"symbol": symbol, "source": "coinglass",
-                "latest": series[-1]["value"], "series": series}
+                              message="netflow payload not a dict")
+        window = "24h"
+        val = self._to_float(data.get("net_flow_usd_24h"))
+        if val is None:
+            val = self._to_float(data.get("net_flow_usd_12h"))
+            window = "12h"
+        if val is None:
+            return make_error(tool="mi_get_coin_netflow", symbol=symbol,
+                              source="coinglass", code="EMPTY_DATA",
+                              message="no netflow value")
+        ratio = self._to_float(data.get("net_flow_usd_24h_market_cap_ratio"))
+        return {"symbol": symbol, "source": "coinglass", "latest": val,
+                "window": window, "mcap_ratio": ratio,
+                "series": [{"ts": self._extract_ts(data), "value": val}]}
 
     async def get_bitcoin_dominance(self, limit: int = 30) -> dict:
         """BTC.D（比特幣市占率）歷史：上升＝資金回流 BTC（山寨偏弱）。
@@ -1408,8 +1422,11 @@ class CoinGlassSource:
         回 {"source","region","series":[{ts,price,m2}]}；失敗回 make_error dict。
         """
         reg = "us" if str(region).lower() == "us" else "global"
-        path = ("/api/index/bitcoin-vs-us-m2" if reg == "us"
-                else "/api/index/bitcoin-vs-global-m2")
+        # v4 正確路徑帶 -growth 後綴（舊碼無後綴一律 404 → 此分量長期死料，
+        # task#69 治本）。M2 欄位依區域為 global_m2_supply / us_m2_supply。
+        path = ("/api/index/bitcoin-vs-us-m2-growth" if reg == "us"
+                else "/api/index/bitcoin-vs-global-m2-growth")
+        m2_field = "us_m2_supply" if reg == "us" else "global_m2_supply"
         r = await self._get(path, {"limit": min(max(limit, 1), 500)},
                             tool="mi_get_btc_vs_m2")
         if r.get("error"):
@@ -1419,7 +1436,9 @@ class CoinGlassSource:
         for d in data:
             price = self._to_float(d.get("price"))
             m2 = self._to_float(
-                d.get("m2") if d.get("m2") is not None else d.get("m2_supply"))
+                d.get(m2_field) if d.get(m2_field) is not None
+                else (d.get("m2") if d.get("m2") is not None
+                      else d.get("m2_supply")))
             if price is None and m2 is None:
                 continue
             series.append({"ts": self._extract_ts(d), "price": price, "m2": m2})
