@@ -289,6 +289,12 @@ async def amain(args: argparse.Namespace) -> int:
     #      cvd_shadow.jsonl。影子鐵則：只記錄、永不回寫 factors_live/strength/fire/signals、
     #      不發 TG。忠實度閘已 🟢（v61）；晉升「真填 stub」須另過 EV 閘（後續 increment）。
     from l3_dispatcher.cvd_shadow import run_cvd_shadow_loop as _run_cvd_shadow
+    # v69: #66(Q2) 消息面 Phase 0 影子捕捉 — 每小時把當下新聞原子事實(NewsAtom)+既有
+    #      narrative_alignment 量化傾向(免費探針)並排記到 news_factor.jsonl。影子鐵則：
+    #      只記錄、永不寫 strength/check score/fire/symbol_gate/snapshot 決策欄、永不給
+    #      方向票、不發 TG。讀 news_feed.db + narrative.db（唯讀）。消息面進訊號層須另過
+    #      閘②回測 + 閘③人工拍板（屬後續 Phase）；本 worker 純攢資料供日後離線 event-study。
+    from news_feed.news_score import run_news_shadow_loop as _run_news_shadow
     # v55: OKX 模擬盤自動操盤手（task #4/#39）— 鏡像新紙上加密訊號到 OKX 模擬盤實單。
     #      預設「雙鑰待命」：DEMO_OPERATOR_ACTIVE 未開時整個 worker 完全閒置、零 OKX 互動
     #      （連 ex 都不建）→ 接進 daemon 本身是安全的；真要開單須另外把旗標設 1。
@@ -383,6 +389,10 @@ async def amain(args: argparse.Namespace) -> int:
         # v62: #20 CVD 影子層（每小時一輪 → cvd_shadow.jsonl；純觀測補缺的 cvd_slope_7d，
         #      不發 Telegram、永不影響 strength/fire/symbol_gate/signals/下單）
         ("cvd_shadow", lambda: _run_cvd_shadow(source)),
+        # v69: #66(Q2) 消息面 Phase 0 影子捕捉（每小時一輪 → news_factor.jsonl；純觀測，
+        #      讀 news_feed.db+narrative.db，永不寫 strength/check/fire/symbol_gate/snapshot
+        #      決策欄、永不給方向票、不發 TG）。先攢資料供日後閘② event-study 離線檢定。
+        ("news_shadow", lambda: _run_news_shadow()),
         # v55: OKX 模擬盤操盤手（DEMO_OPERATOR_ACTIVE 未開＝完全閒置、零 OKX 互動）。
         #      開啟後鏡像新紙上加密訊號到模擬盤實單，純驗證持倉真實性（零真錢）。
         ("okx_demo_operator", lambda: _run_demo_operator(
