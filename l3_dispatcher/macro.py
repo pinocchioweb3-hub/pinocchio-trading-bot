@@ -776,6 +776,18 @@ def _record_deepdive_plan(sym: str, plan: dict | None,
             _extra_ctx = _deepdive_extra_context(sym, sym_state)
             _rv, _ctx = _asm_rg(_snap_for_rv, direction=direction,
                                 extra_context=_extra_ctx or None)
+            # task#70：若 macro_confluence_score 真進了 context，附帶其『計分口徑』
+            #   provenance（v1 稀釋 vs v2 重正規化），讓復盤引擎日後 A/B 不混兩種口徑。
+            #   純觀測中繼欄，獨立於 _CONTEXT_KEYS（不進可學維度）、永不影響任何下單。
+            #   只在分數確進 context 時讀（避免凍結一個對不上分數的口徑）；缺/壞→不寫。
+            _ctx_prov = None
+            try:
+                if isinstance(_ctx, dict) and _ctx.get("macro_confluence_score") is not None:
+                    _mp = _deepdive_macro_provenance()
+                    if isinstance(_mp, dict):
+                        _ctx_prov = {"macro_confluence_score": _mp}
+            except Exception:
+                _ctx_prov = None
             # v56-2：vol_trend 過去誤填來源標籤 "deepdive"（來源已存於 source 欄）。改與
             #   direct_fire/waiting_trigger 同口徑——用共用的 vol_regime_from_atr() 把 deepdive
             #   早已抓好的 snapshot.atr_pct_7d 分桶成 ATR 波動度（趨勢方向另由 oi_price_quadrant
@@ -792,6 +804,7 @@ def _record_deepdive_plan(sym: str, plan: dict | None,
                 tp1=tp1, tp2=_tp2, tp3=_tp3,
                 signal_msg_id=signal_msg_id, regime=_vol_regime,
                 regime_vector=_rv, context=_ctx,
+                context_provenance=_ctx_prov,
                 news_context=_news)
         except Exception:
             plan_snap = None
@@ -1119,11 +1132,12 @@ def _macro_confluence_dashboard_line() -> str:
         return ""
 
 
-def _read_macro_confluence_score():
-    """純讀 macro_confluence.jsonl 末行的 macro_confluence_score（市場層宏觀背景，
-    進場時凍結用）。檔缺/空/壞 JSON/無此鍵/非數值 → None（誠實留空，紅線③）。
-    零 API、零重算，與 _macro_confluence_dashboard_line 同源同 tail-read 樣式，
-    只取原始分數而非渲染字串。供 _deepdive_extra_context 萃取進場快照用。"""
+def _read_macro_confluence_record():
+    """純讀 macro_confluence.jsonl 末行整筆 dict（市場層宏觀背景，進場時凍結用）。
+    檔缺/空/壞 JSON/末行非 dict → None。零 API、零重算，與
+    _macro_confluence_dashboard_line 同源同 tail-read 樣式（讀末 64KB 取末完整行）。
+    供 _read_macro_confluence_score（取分數）與 _deepdive_macro_provenance（取計分口徑）
+    共用同一讀檔邏輯。內部 import data_dir 以利測試 monkeypatch。"""
     try:
         import json as _json
         from botpaths import data_dir
@@ -1140,8 +1154,58 @@ def _read_macro_confluence_score():
         if not lines:
             return None
         rec = _json.loads(lines[-1])
-        v = rec.get("macro_confluence_score")
-        return v if isinstance(v, (int, float)) else None
+        return rec if isinstance(rec, dict) else None
+    except Exception:
+        return None
+
+
+def _read_macro_confluence_score():
+    """純讀 macro_confluence.jsonl 末行的 macro_confluence_score（市場層宏觀背景，
+    進場時凍結用）。檔缺/空/壞 JSON/無此鍵/非數值 → None（誠實留空，紅線③）。
+    零 API、零重算，只取原始分數而非渲染字串。供 _deepdive_extra_context 萃取進場
+    快照用。委派 _read_macro_confluence_record 取末行，契約不變（須 int/float 才回）。"""
+    rec = _read_macro_confluence_record()
+    if not isinstance(rec, dict):
+        return None
+    v = rec.get("macro_confluence_score")
+    return v if isinstance(v, (int, float)) else None
+
+
+def _deepdive_macro_provenance():
+    """task#70：取 macro_confluence_score 末行的『計分口徑』provenance——純觀測中繼資料，
+    供復盤引擎日後 A/B 回測時把 v1 稀釋分與 v2 重正規化分『分桶』，不混為一談。
+
+    為什麼需要：task#69 把 macro_confluence 計分從 v1（對全 15 分量加權求和，缺料拉中性）
+    改為 v2（只除有料分量權重＝重正規化）。同一個 macro_confluence_score 欄在不同口徑下
+    語意不同；若復盤引擎把跨口徑的歷史分數混在一起回測，會得出污染結論。本 helper 把口徑
+    隨快照一起凍結，讓日後能依 score_method 切片。
+
+    回傳 dict（僅在末行確有合法 macro_confluence_score 時）：
+      score_method : 末行 score_method；缺＝舊 v1 行隱含 'v1'（紅線③：永不回填舊封存）
+      present_mass : 有料分量權重總和（v1 行多半無此鍵 → None）
+      n_present    : 有料分量數（v1 行可能無此鍵 → None）
+      floor_bound  : present_mass 是否低於 _MIN_PRESENT_MASS 地板（觸地板＝重正規化分母被
+                     夾、分數偏放大，復盤須降權看待）；present_mass 非數值 → None
+    無合法分數（檔缺/空/壞/無分數）→ None（呼叫端據此不寫 provenance 欄）。
+    純讀、exception-safe；絕不進任何 rr/expected_r/方向/下單路徑。"""
+    try:
+        rec = _read_macro_confluence_record()
+        if not isinstance(rec, dict):
+            return None
+        if not isinstance(rec.get("macro_confluence_score"), (int, float)):
+            return None
+        from .macro_confluence import _MIN_PRESENT_MASS
+        pm = rec.get("present_mass")
+        pm_num = pm if isinstance(pm, (int, float)) else None
+        np_ = rec.get("n_present")
+        np_num = int(np_) if isinstance(np_, (int, float)) else None
+        sm = rec.get("score_method")
+        return {
+            "score_method": sm if isinstance(sm, str) and sm else "v1",
+            "present_mass": pm_num,
+            "n_present": np_num,
+            "floor_bound": (pm_num < _MIN_PRESENT_MASS) if pm_num is not None else None,
+        }
     except Exception:
         return None
 

@@ -173,3 +173,105 @@ def test_extra_context_keys_are_schema_subset(monkeypatch):
     }
     out = macro._deepdive_extra_context("BTC", sym_state)
     assert set(out.keys()) <= set(ps._CONTEXT_KEYS)
+
+
+# ------------------------------------------- _read_macro_confluence_record（task#70）
+def test_read_record_reads_last_line(tmp_path, monkeypatch):
+    import botpaths
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+    _write_mc(tmp_path, [
+        {"macro_confluence_score": 3.0, "score_method": "v1", "ts": 1},
+        {"macro_confluence_score": 7.5, "score_method": "v2_renorm_present_mass",
+         "present_mass": 0.7, "n_present": 12, "ts": 2},   # 末行優先
+    ])
+    rec = macro._read_macro_confluence_record()
+    assert isinstance(rec, dict)
+    assert rec["macro_confluence_score"] == 7.5
+    assert rec["score_method"] == "v2_renorm_present_mass"
+
+
+def test_read_record_missing_file(tmp_path, monkeypatch):
+    import botpaths
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+    assert macro._read_macro_confluence_record() is None
+
+
+def test_read_record_non_dict_last_line(tmp_path, monkeypatch):
+    """末行是合法 JSON 但非 dict（數字/list）→ None（不讓壞型別外漏）。"""
+    import botpaths
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+    (tmp_path / "macro_confluence.jsonl").write_text("[1, 2, 3]\n", encoding="utf-8")
+    assert macro._read_macro_confluence_record() is None
+
+
+# ------------------------------------------- _deepdive_macro_provenance（task#70）
+def test_macro_provenance_v2_full(tmp_path, monkeypatch):
+    """v2 列：score_method/present_mass/n_present 全帶、present_mass≥地板→floor_bound False。"""
+    import botpaths
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+    _write_mc(tmp_path, [{"macro_confluence_score": 8.99,
+                          "score_method": "v2_renorm_present_mass",
+                          "present_mass": 0.70, "n_present": 12}])
+    p = macro._deepdive_macro_provenance()
+    assert p == {"score_method": "v2_renorm_present_mass",
+                 "present_mass": 0.70, "n_present": 12, "floor_bound": False}
+
+
+def test_macro_provenance_v1_fallback(tmp_path, monkeypatch):
+    """舊 v1 列（只有分數、無 score_method/present_mass/n_present）→ 隱含 'v1'、其餘 None。"""
+    import botpaths
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+    _write_mc(tmp_path, [{"macro_confluence_score": 3.0, "bias": "neutral"}])
+    p = macro._deepdive_macro_provenance()
+    assert p == {"score_method": "v1", "present_mass": None,
+                 "n_present": None, "floor_bound": None}
+
+
+def test_macro_provenance_floor_bound_true(tmp_path, monkeypatch):
+    """present_mass < _MIN_PRESENT_MASS（0.25）→ floor_bound True（分母觸地板、分數偏放大）。"""
+    import botpaths
+    from l3_dispatcher.macro_confluence import _MIN_PRESENT_MASS
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+    _write_mc(tmp_path, [{"macro_confluence_score": 50.0,
+                          "score_method": "v2_renorm_present_mass",
+                          "present_mass": _MIN_PRESENT_MASS - 0.05, "n_present": 2}])
+    p = macro._deepdive_macro_provenance()
+    assert p["floor_bound"] is True
+
+
+def test_macro_provenance_no_score_returns_none(tmp_path, monkeypatch):
+    """末行無合法數值分數（缺鍵/非數值）→ None（呼叫端據此不寫 provenance 欄）。"""
+    import botpaths
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+    _write_mc(tmp_path, [{"bias": "up", "score_method": "v2_renorm_present_mass"}])
+    assert macro._deepdive_macro_provenance() is None
+    _write_mc(tmp_path, [{"macro_confluence_score": "高",
+                          "score_method": "v2_renorm_present_mass"}])
+    assert macro._deepdive_macro_provenance() is None
+
+
+def test_macro_provenance_missing_file_returns_none(tmp_path, monkeypatch):
+    import botpaths
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+    assert macro._deepdive_macro_provenance() is None
+
+
+def test_macro_provenance_bad_json_returns_none(tmp_path, monkeypatch):
+    import botpaths
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+    (tmp_path / "macro_confluence.jsonl").write_text("{broken\n", encoding="utf-8")
+    assert macro._deepdive_macro_provenance() is None
+
+
+def test_macro_provenance_non_numeric_present_mass(tmp_path, monkeypatch):
+    """present_mass 壞型別（字串）→ present_mass None、floor_bound None（不臆測、不拋例外）。"""
+    import botpaths
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+    _write_mc(tmp_path, [{"macro_confluence_score": 5.0,
+                          "score_method": "v2_renorm_present_mass",
+                          "present_mass": "x", "n_present": "y"}])
+    p = macro._deepdive_macro_provenance()
+    assert p["score_method"] == "v2_renorm_present_mass"
+    assert p["present_mass"] is None
+    assert p["n_present"] is None
+    assert p["floor_bound"] is None

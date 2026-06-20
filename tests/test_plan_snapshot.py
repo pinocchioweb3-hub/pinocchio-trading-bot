@@ -137,6 +137,55 @@ def test_news_at_entry_non_dict_coerced_to_none():
         assert snap["news_at_entry"] is None, f"壞型別 {bad!r} 應退為 None"
 
 
+# --- 2c. context_provenance：未給 → None；給 dict → 原樣打包，且嚴格與決策/可學維度分離（task#70）---
+def test_context_provenance_default_none():
+    snap = ps.build_plan_snapshot(
+        source="macro_deepdive", direction="bull",
+        entry_price=100.0, planned_stop=90.0, tp1=110.0, tp2=120.0, tp3=130.0)
+    # 未帶口徑 provenance → 誠實 None（鍵恆在值可空）
+    assert "context_provenance" in snap and snap["context_provenance"] is None
+
+
+def test_context_provenance_passthrough_and_does_not_perturb_decision():
+    prov = {"macro_confluence_score": {
+        "score_method": "v2_renorm_present_mass", "present_mass": 0.7,
+        "n_present": 12, "floor_bound": False}}
+    with_prov = ps.build_plan_snapshot(
+        source="macro_deepdive", direction="bull",
+        entry_price=100.0, planned_stop=90.0, tp1=110.0, tp2=120.0, tp3=130.0,
+        context={"macro_confluence_score": 6.5},
+        context_provenance=prov)
+    without = ps.build_plan_snapshot(
+        source="macro_deepdive", direction="bull",
+        entry_price=100.0, planned_stop=90.0, tp1=110.0, tp2=120.0, tp3=130.0,
+        context={"macro_confluence_score": 6.5})
+    # 原樣打包進觀測欄
+    assert with_prov["context_provenance"] == prov
+    # 鐵則：provenance 一律不擾動 rr/expected_r/方向
+    assert with_prov["direction"] == "bull"
+    assert with_prov["rr_to_tp"] == without["rr_to_tp"]
+    assert with_prov["expected_r"] == without["expected_r"]
+    # 與可學維度嚴格分離：不洩進 context_at_entry、不改 missing_context_keys
+    assert with_prov["context_at_entry"] == without["context_at_entry"]
+    assert with_prov["missing_context_keys"] == without["missing_context_keys"]
+    assert "context_provenance" not in with_prov["context_at_entry"]
+
+
+def test_context_provenance_not_in_context_keys():
+    # 治本鐵則：provenance 是中繼觀測欄，絕不可進可學 schema（否則優化器會把它當特徵）
+    assert "context_provenance" not in ps._CONTEXT_KEYS
+    assert "context_provenance" not in ps._REGIME_KEYS
+
+
+def test_context_provenance_non_dict_coerced_to_none():
+    # 防呆：誤傳非 dict（字串/數字/list）→ 一律 None，不讓壞型別污染 schema
+    for bad in ("oops", 123, ["x"], 0):
+        snap = ps.build_plan_snapshot(
+            source="x", direction="bull", entry_price=100.0, planned_stop=90.0,
+            tp1=110.0, tp2=120.0, tp3=130.0, context_provenance=bad)
+        assert snap["context_provenance"] is None, f"壞型別 {bad!r} 應退為 None"
+
+
 # --- 3. _safe_rr 多空與除零 ---
 def test_safe_rr():
     assert ps._safe_rr("bull", 100, 90, 120) == 2.0

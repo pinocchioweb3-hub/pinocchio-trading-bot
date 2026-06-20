@@ -141,7 +141,8 @@ def build_plan_snapshot(*, source: str, direction: str,
                         entry_filled_at_ms: int | None = None,
                         regime_vector=None, context=None,
                         expected_stop_scenario=None,
-                        news_context=None) -> dict | None:
+                        news_context=None,
+                        context_provenance=None) -> dict | None:
     """組裝一份進場計畫快照（純資料、exception-safe，失敗回 None）。
 
     參數：
@@ -159,6 +160,13 @@ def build_plan_snapshot(*, source: str, direction: str,
                             原樣打包成 news_at_entry 觀測欄。**純觀測**：絕不進 rr/expected_r/
                             score/方向判定；閘②回測未過前對任何下單數學影響嚴格為零。維持本
                             函式『純資料、不呼叫策略/不做活查詢』鐵則——活查詢在呼叫端做。
+      context_provenance    context_at_entry 各欄的『計分口徑』中繼資料（task#70）；呼叫端
+                            算好後傳入，本函式只原樣打包成 context_provenance 觀測欄。
+                            **與 _CONTEXT_KEYS 嚴格分離**——不是可學維度、不進 missing_context_keys、
+                            絕不參與 rr/expected_r/方向。存在理由：當某欄（如 macro_confluence_score）
+                            的計分口徑跨版本改變（v1 稀釋→v2 重正規化），復盤引擎日後 A/B 必須能
+                            依口徑切片而非把兩種語意混為一談。舊快照無此鍵＝該欄口徑隱含最早版本，
+                            紅線③：永不回填封存快照。
     """
     try:
         now = int(time.time() * 1000)
@@ -212,6 +220,9 @@ def build_plan_snapshot(*, source: str, direction: str,
             # task#66 Q2 Phase 0：消息面進場觀測（純觀測欄；缺料/未接 → None，誠實留空）。
             # 永不參與上面任何 rr/expected_r/方向欄——只供復盤引擎事後歸因『進場那刻消息面偏哪』。
             "news_at_entry": news_context if isinstance(news_context, dict) else None,
+            # task#70：context_at_entry 各欄的計分口徑 provenance（純觀測中繼欄；與 _CONTEXT_KEYS
+            # 嚴格分離、不進 missing_context_keys、永不參與 rr/expected_r/方向）。缺/壞型別 → None。
+            "context_provenance": context_provenance if isinstance(context_provenance, dict) else None,
         }
     except Exception:
         return None
