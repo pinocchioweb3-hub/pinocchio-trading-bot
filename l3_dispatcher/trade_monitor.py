@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -80,12 +81,37 @@ async def _get_recent_5m_bars(source, symbol: str, n: int = 4) -> dict[str, Any]
         return None
 
 
-def _check_trade(trade: dict, bars: list[dict]) -> list[tuple[str, float, float]]:
+def _resolve_pt_alloc(pt: dict) -> dict | None:
+    """task#53(step8)：從紙上倉位的凍結 tp_alloc 解出每段 TP 比例覆寫。
+
+    回 {"tp1":a,"tp2":b,"tp3":c}（驗證三段、非負、加總 1.0±1e-3）；任何缺失/壞值 →
+    None（呼叫端沿用預設 TP_SIZE_PCT＝今日行為）。只影響 paper/demo 的分批大小。
+    """
+    raw = pt.get("tp_alloc")
+    if not raw:
+        return None
+    try:
+        vals = json.loads(raw) if isinstance(raw, str) else raw
+        if (not isinstance(vals, (list, tuple)) or len(vals) != 3
+                or any((v is None or float(v) < 0) for v in vals)
+                or abs(sum(float(v) for v in vals) - 1.0) > 1e-3):
+            return None
+        return {"tp1": float(vals[0]), "tp2": float(vals[1]), "tp3": float(vals[2])}
+    except Exception:
+        return None
+
+
+def _check_trade(trade: dict, bars: list[dict],
+                 tp_size_pct: dict | None = None) -> list[tuple[str, float, float]]:
     """純函式：給定 trade + 5m bars，回所有應觸發的 (event_label, trigger_price, size_pct) tuples。
 
     順序：先檢查 TP（依 entry 後價格高低）→ 再檢查 stop → 再檢查 timeout。
     若已 hit 的 leg label 就跳過。
+
+    tp_size_pct: 每段 TP 比例覆寫 dict（紙上桶級覆寫）；None→用模組預設 TP_SIZE_PCT
+    （實倉路徑永遠 None＝零行為變更）。
     """
+    sizes = tp_size_pct if tp_size_pct is not None else TP_SIZE_PCT
     direction = trade["direction"]
     legs_hit = set(trade["legs_hit"] or [])
     size_remaining = trade["size_remaining"]
@@ -106,7 +132,7 @@ def _check_trade(trade: dict, bars: list[dict]) -> list[tuple[str, float, float]
     for tp_label, tp_price in tps.items():
         if tp_price is None or tp_label in legs_hit:
             continue
-        size_pct = TP_SIZE_PCT[tp_label]
+        size_pct = sizes[tp_label]
         if direction == "bull" and bar_high >= tp_price:
             events.append((tp_label, tp_price, size_pct))
             legs_hit.add(tp_label)
@@ -484,8 +510,8 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
         is_us = pt.get("setup", "") == "us_breakout"
         lines = us_lines if is_us else paper_lines
 
-        # TP/SL（與實倉同一套純函式）
-        for label, price, size in _check_trade(pt, bars):
+        # TP/SL（與實倉同一套純函式）；紙上額外帶桶級 TP 分配覆寫（task#53）
+        for label, price, size in _check_trade(pt, bars, _resolve_pt_alloc(pt)):
             r = apply_paper_event(pt["id"], label, size, price)
             icon = "🎯" if label.startswith("tp") else "🛑"
             closed_str = "（已平倉）" if r["closed"] else ""

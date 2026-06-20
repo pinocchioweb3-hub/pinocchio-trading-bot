@@ -36,13 +36,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass, field
 
 from botconfig import CONFIG
 from botpaths import db_path
+
+# v56：Windows 主控台預設 cp950，--selftest 印 emoji/繁中會 UnicodeEncodeError → 強制 UTF-8
+# （與 champion_challenger.py 同口徑；只影響互動式自測輸出，不影響稽核正確性/daemon）
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 DB_PATH = db_path("trade_journal.db")
 
@@ -71,18 +81,24 @@ def load_closed(limit: int = 50, days: int = 120) -> list[dict]:
     """讀最近 N 筆已平倉紙上單（排除 entry_expired：那是掛單從未成交、非真實交易）。"""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA busy_timeout=8000")
+    cutoff = int(time.time() * 1000) - days * 86400 * 1000
+    # task#53(step8): 帶上 tp_alloc 供 recompute_r 用該筆凍結分配回算 timeout 腿。
+    # 舊庫無此欄 → OperationalError 退回不含 tp_alloc 的查詢（has_alloc=False，沿用預設）。
+    _base = ("id, symbol, setup, direction, entry_price, stop_price, "
+             "tp1, tp2, tp3, entry_at, exit_at, legs_hit, exit_reason, "
+             "realized_r, pnl_usd, entry_filled_pct")
+    _where = ("FROM paper_trades "
+              "WHERE status='closed' AND IFNULL(exit_reason,'') != 'entry_expired' "
+              "AND entry_at >= ? ORDER BY exit_at DESC LIMIT ?")
+    has_alloc = True
     try:
-        cutoff = int(time.time() * 1000) - days * 86400 * 1000
-        rows = conn.execute(
-            "SELECT id, symbol, setup, direction, entry_price, stop_price, "
-            "tp1, tp2, tp3, entry_at, exit_at, legs_hit, exit_reason, "
-            "realized_r, pnl_usd, entry_filled_pct "
-            "FROM paper_trades "
-            "WHERE status='closed' AND IFNULL(exit_reason,'') != 'entry_expired' "
-            "AND entry_at >= ? "
-            "ORDER BY exit_at DESC LIMIT ?",
-            (cutoff, limit),
-        ).fetchall()
+        try:
+            rows = conn.execute(f"SELECT {_base}, tp_alloc {_where}",
+                                (cutoff, limit)).fetchall()
+        except sqlite3.OperationalError:
+            has_alloc = False
+            rows = conn.execute(f"SELECT {_base} {_where}",
+                                (cutoff, limit)).fetchall()
     finally:
         conn.close()
     out = []
@@ -96,11 +112,33 @@ def load_closed(limit: int = 50, days: int = 120) -> list[dict]:
             "realized_r": r[13] if r[13] is not None else 0.0,
             "pnl_usd": r[14] if r[14] is not None else 0.0,
             "entry_filled_pct": r[15] if r[15] is not None else 1.0,
+            "tp_alloc": (r[16] if has_alloc else None),
         })
     return out
 
 
 # ── 2. 算術自洽重算（離線）──────────────────────────────────────
+def _resolve_splits(trade: dict) -> dict:
+    """task#53(step8)：取該筆凍結的 TP 分配（進場時 auto_param_store 覆寫值），用於重算。
+
+    回 {"tp1":a,"tp2":b,"tp3":c}；缺失/壞值 → 預設 SPLITS（＝今日行為，完全向後相容）。
+    為何重要：timeout 腿的 leg_r 是從帳本 realized_r 反推的，反推時用的分批比例若與
+    當初記帳所用不符，會誤判竄改。故必須用「該筆當初凍結的分配」回算。
+    """
+    raw = trade.get("tp_alloc")
+    if not raw:
+        return SPLITS
+    try:
+        vals = json.loads(raw) if isinstance(raw, str) else raw
+        if (not isinstance(vals, (list, tuple)) or len(vals) != 3
+                or any((v is None or float(v) < 0) for v in vals)
+                or abs(sum(float(v) for v in vals) - 1.0) > 1e-3):
+            return SPLITS
+        return {"tp1": float(vals[0]), "tp2": float(vals[1]), "tp3": float(vals[2])}
+    except Exception:
+        return SPLITS
+
+
 def recompute_r(trade: dict, timeout_price: float | None = None) -> dict:
     """用帳本自己記錄的腿重算 realized_r。
 
@@ -120,6 +158,7 @@ def recompute_r(trade: dict, timeout_price: float | None = None) -> dict:
         return {"recomputed_r": None, "unverifiable": True,
                 "legs": [], "remaining_after": 1.0, "bad_sl_dist": True}
 
+    splits = _resolve_splits(trade)   # task#53: 用該筆凍結分配（缺→預設 SPLITS）
     remaining = 1.0
     r_sum = 0.0            # 所有「價格精確」腿（tp/stop，或有給 timeout_price 時的 timeout）的 R 和
     nt_r_sum = 0.0         # 僅「非 timeout」腿的精確 R 和（供 timeout 隱含出場價回推用）
@@ -129,7 +168,7 @@ def recompute_r(trade: dict, timeout_price: float | None = None) -> dict:
     has_timeout = False
     for leg in legs:
         if leg in ("tp1", "tp2", "tp3"):
-            size = SPLITS[leg]
+            size = splits[leg]
         elif leg in ("stop", "timeout"):
             size = round(remaining, 3)  # 剩餘全平
         else:

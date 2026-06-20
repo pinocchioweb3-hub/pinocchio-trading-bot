@@ -72,9 +72,19 @@ def init_db() -> None:
             ("signal_msg_id", "ALTER TABLE paper_trades ADD COLUMN signal_msg_id INTEGER"),
             # v56: 進場計畫快照 JSON（復盤引擎 L1 前置——凍結預期劇本/止損劇本/當下上下文）
             ("plan_snapshot", "ALTER TABLE paper_trades ADD COLUMN plan_snapshot TEXT"),
+            # task#53(step8): 進場時凍結的 TP 分配覆寫（auto_param_store 晉升的活躍值），
+            # JSON 三元組如 [0.6,0.25,0.15]；None=用預設 CONFIG.tp_size_split。只驅動 paper/demo。
+            ("tp_alloc", "ALTER TABLE paper_trades ADD COLUMN tp_alloc TEXT"),
         ):
             if col not in existing:
-                conn.execute(ddl)
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError as e:
+                    # 跨進程一次性遷移視窗的良性競態：另一進程已先加同欄
+                    # （單進程 daemon 內因 init_db 無 await 不會交錯，這只防外部 CLI 同跑）。
+                    # 只吞「duplicate column name」，其餘 OperationalError 照常拋出。
+                    if "duplicate column name" not in str(e).lower():
+                        raise
     finally:
         conn.close()
 
@@ -174,6 +184,16 @@ def _recently_closed_dup(symbol: str, setup: str, direction: str,
         return None
 
 
+def _quadrant_from_snapshot(plan_snapshot: dict | None) -> str:
+    """從進場計畫快照取 OI×價象限（與 lessons_store/auto_optimizer 解析一致）。
+    任何缺失/型別錯 → 'unknown'（fail-safe，永不阻塞建單）。"""
+    try:
+        regime = (plan_snapshot or {}).get("regime_at_entry") or {}
+        return regime.get("oi_price_quadrant") or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def record_paper_entry(symbol: str, setup: str, direction: str,
                        entry_price: float, stop_price: float,
                        tp1: float, tp2: float, tp3: float,
@@ -205,6 +225,14 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
         ps_json = json.dumps(plan_snapshot, ensure_ascii=False) if plan_snapshot else None
     except Exception:
         ps_json = None
+    # task#53(step8): 進場時凍結此桶 (symbol×象限) 的活躍 TP 分配覆寫（若 auto_param_store
+    # 已晉升過）。fail-safe：任何錯誤 → None（沿用預設分配＝今日行為）。只驅動 paper/demo。
+    try:
+        from l3_dispatcher.auto_param_store import resolve_tp_alloc
+        _ov = resolve_tp_alloc(symbol, _quadrant_from_snapshot(plan_snapshot))
+        tp_alloc_json = json.dumps(list(_ov)) if _ov else None
+    except Exception:
+        tp_alloc_json = None
     conn = _conn()
     try:
         now_ms = int(time.time() * 1000)
@@ -214,20 +242,22 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                 """INSERT INTO paper_trades
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at,
-                    entry_splits, entry_filled_pct, entry_state, signal_msg_id, plan_snapshot)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?, ?)""",
+                    entry_splits, entry_filled_pct, entry_state, signal_msg_id, plan_snapshot,
+                    tp_alloc)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?, ?, ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
-                 now_ms, fire_id, regime, now_ms, json.dumps(splits), signal_msg_id, ps_json),
+                 now_ms, fire_id, regime, now_ms, json.dumps(splits), signal_msg_id, ps_json,
+                 tp_alloc_json),
             )
         else:
             cur = conn.execute(
                 """INSERT INTO paper_trades
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at, entry_filled_pct, entry_state,
-                    signal_msg_id, plan_snapshot)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?, ?)""",
+                    signal_msg_id, plan_snapshot, tp_alloc)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?, ?, ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
-                 now_ms, fire_id, regime, now_ms, signal_msg_id, ps_json),
+                 now_ms, fire_id, regime, now_ms, signal_msg_id, ps_json, tp_alloc_json),
             )
         return cur.lastrowid
     finally:
@@ -333,7 +363,7 @@ def get_open_paper() -> list[dict]:
         rows = conn.execute(
             "SELECT id, symbol, setup, direction, entry_price, stop_price, "
             "tp1, tp2, tp3, entry_at, legs_hit, size_remaining, entry_filled_pct, "
-            "signal_msg_id "
+            "signal_msg_id, tp_alloc "
             "FROM paper_trades WHERE status='open' AND entry_state != 'pending' ORDER BY entry_at",
         ).fetchall()
         out = []
@@ -349,6 +379,7 @@ def get_open_paper() -> list[dict]:
                 "risk_usd": RISK_USD,
                 "tg_message_id": None,
                 "signal_msg_id": r[13],
+                "tp_alloc": r[14],
             })
         return out
     finally:

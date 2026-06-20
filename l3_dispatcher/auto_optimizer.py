@@ -1,0 +1,263 @@
+"""復盤引擎 step8（task#53）── 自動優化器（編排層）。
+
+職責（把零散模組串成一條閉環）：
+    已平倉 paper_trades  ──分桶(symbol×quadrant)──▶  champion/challenger 離線回放
+        ──過 L2 四關(minTRL/DSR/PBO/FDR)──▶  verdict.promote?
+            是 → auto_param_store 寫「活躍 TP 分配覆寫」→ 模擬盤下一筆同桶進場即生效
+            否 → 只寫稽核（hold 留痕），活躍表不動
+
+把關＝統計嚴謹度（L2），非人工逐次點頭（INTENT #1）。每日由 auto_tuner 迴圈呼叫。
+
+安全紅線落點：
+    紅線①：本層只動模擬盤 paper／demo 的 TP 分配；真錢執行層完全不讀（config 只驅動
+            signal/paper/demo）。本檔不 import、不呼叫任何下單 API。
+    紅線③：不捏造。今日對齊樣本 <30 → L2 minTRL fail-closed → 0 晉升 → 活躍表恆空 →
+            零行為改變（由 test_auto_optimizer 驗證）；報告誠實標「樣本不足、未晉升」。
+
+L2 家族（multiple-testing）誠實性：
+    每桶把固定 CANDIDATE_GRID 的每個挑戰者各送一次 evaluate_candidate（同 bucket_key、
+    不同 hypothesis → 不同 trial_id）。家族大小＝grid 大小（固定小，避免 FDR/PBO 失真）。
+    用**穩定 hypothesis + 固定 registered_at_ms**（_LEDGER_EPOCH_MS）→ trial_id 穩定 →
+    每日重跑在帳本中「就地更新」而非新增 → n_trials 不會隨天數灌水（idempotent）。
+"""
+from __future__ import annotations
+
+import sqlite3
+import time
+
+from botpaths import db_path as _db_path
+from l3_dispatcher import auto_param_store as aps
+from l3_dispatcher.champion_challenger import AllocPolicy, champion_alloc, compare_allocation
+
+DB_PATH = _db_path("trade_journal.db")
+
+# 固定 epoch：讓同 (bucket, champ, chal) 的 trial_id 跨日穩定 → 重跑不灌水 n_trials。
+_LEDGER_EPOCH_MS = 1_700_000_000_000
+
+# 候選網格（刻意小：grid 大小＝L2 多重檢定家族大小，越大 FDR/PBO 校正越嚴）。
+# 預設 champion＝(0.5,0.3,0.2)；以下皆與其相異，涵蓋「提早收/均衡/讓利潤奔跑」三種傾向。
+CANDIDATE_GRID: list[AllocPolicy] = [
+    AllocPolicy("front_heavy(0.6/0.25/0.15)", (0.6, 0.25, 0.15)),  # 更早落袋
+    AllocPolicy("balanced(0.4/0.3/0.3)", (0.4, 0.3, 0.3)),        # 均衡（≈demo_trader 權重）
+    AllocPolicy("even(0.34/0.33/0.33)", (0.34, 0.33, 0.33)),       # 平均三段
+    AllocPolicy("let_run(0.2/0.3/0.5)", (0.2, 0.3, 0.5)),         # 讓利潤奔跑
+]
+
+# 與 paper_audit.load_closed 對齊的欄位（多帶 tp_alloc，供 alloc-aware 回放對帳）。
+_COLS = ["id", "symbol", "setup", "direction", "entry_price", "stop_price",
+         "tp1", "tp2", "tp3", "entry_at", "exit_at", "legs_hit", "exit_reason",
+         "realized_r", "pnl_usd", "entry_filled_pct", "plan_snapshot", "tp_alloc"]
+
+
+# ── 載入（自含；tp_alloc 欄未遷移時自動退回） ────────────────────────
+def _load_closed_paper(days: int = 120, db=None) -> list[dict]:
+    cutoff = int(time.time() * 1000) - days * 86400 * 1000
+    conn = sqlite3.connect(str(db or DB_PATH))
+    conn.execute("PRAGMA busy_timeout=5000")
+    where = ("WHERE status='closed' AND IFNULL(exit_reason,'')!='entry_expired' "
+             "AND entry_at>=?")
+    try:
+        cols = _COLS
+        try:
+            rows = conn.execute(
+                f"SELECT {', '.join(cols)} FROM paper_trades {where}", (cutoff,)).fetchall()
+        except sqlite3.OperationalError:
+            # tp_alloc 欄尚未遷移（新模組先於 daemon 遷移時）→ 退回不含該欄
+            cols = [c for c in _COLS if c != "tp_alloc"]
+            rows = conn.execute(
+                f"SELECT {', '.join(cols)} FROM paper_trades {where}", (cutoff,)).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        d = dict(zip(cols, r))
+        d.setdefault("tp_alloc", None)
+        out.append(d)
+    return out
+
+
+def _quadrant_of(row: dict) -> str:
+    """與 lessons_store.distill 同規則：plan_snapshot.regime_at_entry.oi_price_quadrant。"""
+    import json
+    try:
+        snap = json.loads(row.get("plan_snapshot") or "") or {}
+    except Exception:
+        snap = {}
+    regime = (snap or {}).get("regime_at_entry") or {}
+    return regime.get("oi_price_quadrant") or "unknown"
+
+
+# ── 單桶優化 ──────────────────────────────────────────────────────────
+def optimize_bucket(symbol: str, quadrant: str, trades: list[dict], *,
+                    at_ms: int, ledger, active_path=None, audit_path=None) -> dict:
+    """單一 (symbol, quadrant) 桶：跑全網格挑戰，過 L2 者由 auto_param_store 落地。"""
+    bkey = aps.bucket_key(symbol, quadrant)
+
+    # champion＝此桶「現行生效」分配：活躍覆寫優先，否則 CONFIG 預設。
+    override = aps.resolve_tp_alloc(symbol, quadrant, active_path=active_path)
+    if override is not None:
+        champ = AllocPolicy("champion(現行覆寫)", tuple(override))
+    else:
+        champ = champion_alloc()
+    champ_key = tuple(round(float(x), 6) for x in champ.tp_alloc)
+
+    evaluated: list[tuple[AllocPolicy, object]] = []
+    for chal in CANDIDATE_GRID:
+        if tuple(round(float(x), 6) for x in chal.tp_alloc) == champ_key:
+            continue  # 與 champion 同 → 無意義，跳過
+        hyp = f"alloc{tuple(champ.tp_alloc)}→{tuple(chal.tp_alloc)}"
+        v = compare_allocation(trades, chal, bucket_key=bkey, ledger=ledger,
+                               champion=champ, hypothesis=hyp,
+                               registered_at_ms=_LEDGER_EPOCH_MS)
+        evaluated.append((chal, v))
+
+    # 選定：優先「已晉升且平均 R 最高」者；皆未晉升 → 取平均 R 最高者當 hold 留痕。
+    def _mean(v):
+        return v.chal_mean_r if getattr(v, "chal_mean_r", None) is not None else -1e9
+
+    promoted = [(c, v) for c, v in evaluated if v.promote]
+    chosen = (max(promoted, key=lambda cv: _mean(cv[1])) if promoted
+              else (max(evaluated, key=lambda cv: _mean(cv[1])) if evaluated else None))
+
+    applied = None
+    if chosen is not None:
+        chal_pol, verdict = chosen
+        applied = aps.apply_verdict(
+            verdict, symbol=symbol, quadrant=quadrant,
+            challenger_alloc=chal_pol.tp_alloc, champion_alloc=champ.tp_alloc,
+            at_ms=at_ms, active_path=active_path, audit_path=audit_path)
+
+    return {"bucket": bkey, "symbol": symbol, "quadrant": quadrant,
+            "n_trades": len(trades), "champion_alloc": list(champ.tp_alloc),
+            "evaluated": evaluated, "chosen": chosen, "applied": applied}
+
+
+# ── 全跑 ──────────────────────────────────────────────────────────────
+def run_optimization(*, days: int = 120, at_ms: int | None = None,
+                     rows: list[dict] | None = None, ledger=None,
+                     active_path=None, audit_path=None, db=None) -> dict:
+    """載入→分桶(symbol×quadrant)→逐桶優化。rows 可注入（測試用，繞過 DB）。"""
+    if at_ms is None:
+        at_ms = int(time.time() * 1000)
+    if rows is None:
+        rows = _load_closed_paper(days=days, db=db)
+    if ledger is None:
+        from backtest.l2_stat_gates import TrialLedger, default_ledger_path
+        ledger = TrialLedger(default_ledger_path())
+
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        groups.setdefault((r.get("symbol"), _quadrant_of(r)), []).append(r)
+
+    buckets = []
+    for (sym, q), trs in sorted(groups.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or "")):
+        buckets.append(optimize_bucket(sym, q, trs, at_ms=at_ms, ledger=ledger,
+                                       active_path=active_path, audit_path=audit_path))
+    n_promoted = sum(1 for b in buckets
+                     if b["applied"] and b["applied"]["action"] == "promote")
+    return {"at_ms": at_ms, "n_buckets": len(buckets), "n_trades": len(rows),
+            "n_promoted": n_promoted, "buckets": buckets}
+
+
+# ── 繁中報告（CEO/調參 Session 透明化） ──────────────────────────────
+def render_report(result: dict | None = None, *, active_path=None) -> str | None:
+    """純描述報告：每桶 champion／最佳挑戰者／是否晉升 + 活躍覆寫表摘要。無資料回 None。"""
+    if result is None:
+        result = run_optimization(active_path=active_path)
+    if not result["buckets"]:
+        return None
+    lines = ["🤖 <b>自動優化器</b>（step8：過 L2 後直接寫模擬盤 TP 分配，即時生效）",
+             "━━━━━━━━━━━━━━━━",
+             f"掃 {result['n_trades']} 筆已平倉紙上單，分 {result['n_buckets']} 桶"
+             f"（symbol×regime）｜本輪晉升 {result['n_promoted']} 桶"]
+    for b in result["buckets"]:
+        champ = "/".join(f"{x*100:.0f}%" for x in b["champion_alloc"])
+        head = f"<b>[{b['bucket']}]</b> {b['n_trades']} 筆｜champion {champ}"
+        if not b["evaluated"]:
+            lines.append(head + "｜（無可比挑戰者）")
+            continue
+        cv = b["chosen"]
+        chal_pol, v = cv
+        cstr = "/".join(f"{x*100:.0f}%" for x in chal_pol.tp_alloc)
+        verb = "✅晉升" if v.promote else "⏸️維持"
+        mr = (f"{v.champ_mean_r:+.3f}→{v.chal_mean_r:+.3f}R"
+              if v.champ_mean_r is not None and v.chal_mean_r is not None else "—")
+        lines.append(f"{head}\n  最佳挑戰者 {cstr}：{verb}（對齊 n={v.n_aligned}，{mr}）"
+                     f"\n  L2：{v.l2_summary}")
+    lines.append("")
+    lines.append(aps.render_active(active_path))
+    lines.append("<i>動參數唯一合法路徑＝過 L2 四關（minTRL/DSR/PBO/FDR）；只驅動模擬盤"
+                 "（紅線①），可事後 rollback。樣本未達門檻前不會有任何覆寫。</i>")
+    return "\n".join(lines)
+
+
+def _selftest() -> bool:
+    """離線、合成樣本、暫存帳本/覆寫檔；驗『小樣本→0 晉升、活躍表恆空』的誠實答案。"""
+    import tempfile
+    from pathlib import Path
+    from backtest.l2_stat_gates import TrialLedger
+
+    def _mk(tid, r, q="price_up_oi_up", sym="BTC"):
+        import json
+        snap = json.dumps({"regime_at_entry": {"oi_price_quadrant": q}})
+        return {"id": tid, "symbol": sym, "setup": "intraday", "direction": "bull",
+                "entry_price": 100.0, "stop_price": 90.0, "tp1": 110.0, "tp2": 120.0,
+                "tp3": 140.0, "entry_at": 0, "exit_at": 10, "legs_hit": "tp1,tp2,stop",
+                "exit_reason": "stop", "realized_r": r, "pnl_usd": r * 100,
+                "entry_filled_pct": 1.0, "plan_snapshot": snap, "tp_alloc": None}
+
+    with tempfile.TemporaryDirectory() as td:
+        ap = Path(td) / "active.json"
+        au = Path(td) / "audit.jsonl"
+        led = TrialLedger(Path(td) / "ledger.jsonl")
+
+        # champion 帳本一致的 R（用預設 0.5/0.3/0.2 回放）：tp1,tp2 然後 stop 剩餘。
+        champ = champion_alloc()
+        a1, a2, _ = champ.tp_alloc
+        rem = 1.0 - a1 - a2
+        r = round(a1 * 1.0 + a2 * 2.0 + rem * (-1.0), 6)
+
+        # (a) 小樣本（<30）→ minTRL fail-closed → 0 晉升、活躍表恆空
+        rows_small = [_mk(i, r) for i in range(10)]
+        res = run_optimization(rows=rows_small, at_ms=1, ledger=led,
+                               active_path=ap, audit_path=au)
+        assert res["n_promoted"] == 0
+        assert aps.resolve_tp_alloc("BTC", "price_up_oi_up", active_path=ap) is None
+        assert not ap.exists()  # 從未寫活躍表
+
+        # (b) 同質大樣本（每筆 R 相同 → 離散=0）→ L2 仍擋 → 0 晉升（誠實）
+        rows_homo = [_mk(100 + i, r) for i in range(40)]
+        res = run_optimization(rows=rows_homo, at_ms=2, ledger=led,
+                               active_path=ap, audit_path=au)
+        assert res["n_promoted"] == 0
+        assert aps.resolve_tp_alloc("BTC", "price_up_oi_up", active_path=ap) is None
+
+        # (c) 分桶正確：不同 quadrant 分開
+        rows_two = [_mk(200 + i, r, q="price_up_oi_up") for i in range(5)] + \
+                   [_mk(300 + i, r, q="price_down_oi_up") for i in range(5)]
+        res = run_optimization(rows=rows_two, at_ms=3, ledger=led,
+                               active_path=ap, audit_path=au)
+        assert res["n_buckets"] == 2
+
+        # (d) 帳本鏈完整（未被自動優化器破壞）
+        ok, _ = led.verify_chain()
+        assert ok
+
+        # (e) 報告不炸
+        assert render_report(res, active_path=ap) is not None
+
+    return True
+
+
+if __name__ == "__main__":
+    import sys
+    if "--selftest" in sys.argv:
+        ok = _selftest()
+        print("selftest:", "PASS" if ok else "FAIL")
+        sys.exit(0 if ok else 1)
+    from dotenv import load_dotenv
+    from pathlib import Path
+    import re as _re
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    rep = render_report()
+    print(_re.sub(r"<[^>]+>", "", rep) if rep else "（無紙上資料）")

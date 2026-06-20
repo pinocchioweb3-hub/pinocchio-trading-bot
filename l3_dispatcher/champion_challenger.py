@@ -31,6 +31,7 @@ self-check（防回放模型有 bug／不誠實）：champion 配置回放必須
 """
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass, field
 
@@ -149,13 +150,39 @@ def replay_series(trades: list[dict], policy: AllocPolicy) -> tuple[list[float],
     return out, bad
 
 
+def _trade_alloc(trade: dict) -> AllocPolicy:
+    """task#53(step8)：取「該筆當初記帳所用的分配」。
+
+    為何必要：自從 auto_param_store 會在進場時凍結桶級 TP 分配覆寫後，不同筆可能用不同
+    分配記帳。self-check 要驗「回放能否重現帳本 realized_r」，就必須用『該筆自己的分配』
+    回放，否則拿預設 champion 回放一筆用覆寫分配記帳的單，會算出不同 R 而誤判竄改。
+    缺 tp_alloc/壞值 → champion_alloc()（＝今日行為，完全向後相容）。
+    """
+    raw = trade.get("tp_alloc")
+    if not raw:
+        return champion_alloc()
+    try:
+        vals = json.loads(raw) if isinstance(raw, str) else raw
+        if (not isinstance(vals, (list, tuple)) or len(vals) != 3
+                or any((v is None or float(v) < 0) for v in vals)
+                or abs(sum(float(v) for v in vals) - 1.0) > 1e-3):
+            return champion_alloc()
+        return AllocPolicy("trade(凍結覆寫)",
+                           (float(vals[0]), float(vals[1]), float(vals[2])))
+    except Exception:
+        return champion_alloc()
+
+
 def _self_check(trades: list[dict]) -> tuple[int, int, list[int]]:
-    """champion 回放是否重現帳本 realized_r。回 (n_checked, n_mismatch, mismatch_ids)。"""
-    champ = champion_alloc()
+    """champion 回放是否重現帳本 realized_r。回 (n_checked, n_mismatch, mismatch_ids)。
+
+    每筆以『該筆當初記帳所用的分配』(_trade_alloc) 回放，而非一律用預設 champion——
+    因 timeout 腿的 leg_r 是用該分配從 realized_r 反推的，配對才自洽（見 _trade_alloc）。
+    """
     n_checked = 0
     mismatch_ids: list[int] = []
     for t in trades:
-        r = replay_trade_r(t, champ)
+        r = replay_trade_r(t, _trade_alloc(t))
         if r is None:
             continue
         n_checked += 1

@@ -169,6 +169,21 @@ async def run_auto_tuner_loop(tg, interval_seconds: int = 86400,
                   f"（正向 {res['n_positive']}／僥倖 {res['n_lucky']}／賠 {res['n_loss']}）")
         except Exception as e:
             print(f"[auto_tuner] lessons rebuild error: {type(e).__name__}: {e}")
+        # task#53(step8)：教訓蒸餾後跑自動優化器——把已平倉 paper 按 (symbol×象限) 分桶，
+        # champion/challenger 離線回放過 L2 四關；verdict.promote=True 才由 auto_param_store
+        # 直接寫「活躍 TP 分配覆寫表」，模擬盤下一筆同桶進場即生效。把關靠統計嚴謹度
+        # （minTRL≥30 fail-closed、DSR/PBO/FDR），非人工逐次點頭。今日樣本<30→0 晉升→零行為變更。
+        try:
+            from l3_dispatcher import auto_optimizer
+            opt = auto_optimizer.run_optimization()
+            print(f"[auto_tuner] auto_optimizer: {opt['n_buckets']} 桶、"
+                  f"{opt['n_promoted']} 晉升")
+            opt_rep = auto_optimizer.render_report(opt)
+            if opt_rep and tg is not None:
+                await tg.send_message(opt_rep, parse_mode="HTML")
+                print("[auto_tuner] auto_optimizer report sent")
+        except Exception as e:
+            print(f"[auto_tuner] auto_optimizer error: {type(e).__name__}: {e}")
         try:
             rep = build_report()
             if rep and tg is not None:
