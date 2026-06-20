@@ -42,7 +42,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from botconfig import CONFIG as _BC
@@ -180,13 +180,32 @@ def _to_float(v) -> float:
         return 0.0
 
 
+def _dec(x) -> Decimal:
+    """float→Decimal 走 str()（取該 float 的最短忠實表示），避免 Decimal(float) 把
+    0.1 之類灌成 0.1000000000000000055…。"""
+    return Decimal(str(x))
+
+
+def _lot_floor(value: float, lot_sz: float) -> float:
+    """把 value 向下取整到 lot_sz 的整數倍，全程 Decimal 精確網格，回傳乾淨 float。
+    取代 `math.floor(value/lot)*lot` 的兩個 float 病灶（OKX 51121 根因）：
+      ① value/lot 的浮點誤差讓 floor 偶爾少掉一格（少報倉位）；
+      ② n*lot 的浮點殘渣（7*0.1=0.7000000000000001）被原樣送進 OKX → 51121。
+    float(Decimal('0.7')) 回的是「乾淨」的雙精度（repr '0.7'），而 7*0.1 不是。"""
+    lot = _dec(lot_sz)
+    n = (_dec(value) / lot).to_integral_value(rounding=ROUND_FLOOR)
+    return float(n * lot)
+
+
 def round_contracts_down(qty_base: float, ct_val: float, lot_sz: float) -> float:
-    """基礎幣數量 → OKX 張數，向下取整到 lot_sz（絕不無中生有放大風險）。"""
+    """基礎幣數量 → OKX 張數，向下取整到 lot_sz（絕不無中生有放大風險）。
+    全程 Decimal：杜絕 float 乘法殘渣讓 OKX 51121，亦修 float 除法誤差導致的偶發少報。"""
     if ct_val <= 0 or lot_sz <= 0:
         raise ValueError("ct_val / lot_sz must be > 0")
-    raw_contracts = qty_base / ct_val
-    n_lots = math.floor(raw_contracts / lot_sz)
-    return n_lots * lot_sz
+    raw_contracts = _dec(qty_base) / _dec(ct_val)
+    lot = _dec(lot_sz)
+    n_lots = (raw_contracts / lot).to_integral_value(rounding=ROUND_FLOOR)
+    return float(n_lots * lot)
 
 
 def realized_risk_usd(contracts: float, ct_val: float, sl_distance: float) -> float:
@@ -200,17 +219,21 @@ def split_tp_contracts(total_contracts: float, lot_sz: float,
     確保各腿加總 == total（不掉張、不超發）。張數不足以分腿時自動退化（前腿可能 0）。"""
     if total_contracts <= 0:
         return [0.0 for _ in weights]
+    # 全程 Decimal 網格：前腿向下取整到 lot、最後一腿吃精確餘數，杜絕 n*lot 浮點殘渣
+    # （0.7000000000000001）被原樣寫進 attachAlgoOrds.sz 觸發 OKX 51121。
+    lot = _dec(lot_sz)
+    total = _dec(total_contracts)
     legs: list[float] = []
-    allocated = 0.0
+    allocated = Decimal(0)
     for w in weights[:-1]:
-        n_lots = math.floor((total_contracts * w) / lot_sz)
-        leg = n_lots * lot_sz
+        n_lots = ((total * _dec(w)) / lot).to_integral_value(rounding=ROUND_FLOOR)
+        leg = n_lots * lot
         # 不能讓前腿吃掉超過剩餘
-        if allocated + leg > total_contracts:
-            leg = 0.0
-        legs.append(leg)
+        if allocated + leg > total:
+            leg = Decimal(0)
+        legs.append(float(leg))
         allocated += leg
-    legs.append(round(total_contracts - allocated, 10))   # 最後一腿 = 餘數
+    legs.append(float(total - allocated))   # 最後一腿 = 精確餘數（守恆，仍是 lot 整數倍）
     return legs
 
 
@@ -450,11 +473,20 @@ def _fmt_px(px: float) -> str:
     return format(d, "f")
 
 
-def _fmt_qty(q: float) -> str:
-    """OKX 數量(張)字串：整數不帶小數點、**絕不科學記號**。"""
-    if q == int(q):
-        return str(int(q))
-    return format(Decimal(str(q)).normalize(), "f")
+def _fmt_qty(q: float, lot_sz: Optional[float] = None) -> str:
+    """OKX 數量(張)字串：整數不帶小數點、**絕不科學記號**。
+
+    帶 lot_sz 時先把數量 snap（denoise）回 lot 網格：第二道防線，杜絕任何 float 乘法殘渣
+    （n*0.1=0.7000000000000001）被原樣寫進 attachAlgoOrds.sz 觸發 OKX 51121。數量在 source
+    （round_contracts_down/split_tp_contracts）已 Decimal 對齊，此處 snap 僅去浮點雜訊、
+    不改實際倉位（HALF_UP 把離格 ε 拉回最近的格點，兩個方向皆然）。"""
+    d = _dec(q)
+    if lot_sz and lot_sz > 0:
+        lot = _dec(lot_sz)
+        d = (d / lot).to_integral_value(rounding=ROUND_HALF_UP) * lot
+    if d == d.to_integral_value():
+        return str(int(d))
+    return format(d.normalize(), "f")
 
 
 def _attach_algo_cl_ord_id(cl_ord_id: str, label: str) -> str:
@@ -486,7 +518,7 @@ def build_okx_entry_params(plan: OrderPlan) -> dict:
     for leg in plan.tp_legs:
         attach.append({
             "attachAlgoClOrdId": _attach_algo_cl_ord_id(plan.cl_ord_id, leg.label),
-            "sz": _fmt_qty(leg.contracts),
+            "sz": _fmt_qty(leg.contracts, plan.lot_sz),
             "tpTriggerPx": _fmt_px(leg.price),
             "tpOrdPx": "-1",            # 市價止盈
             "tpTriggerPxType": "last",
@@ -740,6 +772,27 @@ def _selftest() -> bool:  # noqa: C901 — 自測集中於此
     check(legs == [2.0, 2.0, 3.0], f"分腿向下取整+餘數正確（得 {legs}）")
     legs2 = split_tp_contracts(2.0, 1.0)   # 不足以三分：0,0,2
     check(abs(sum(legs2) - 2.0) < 1e-9, f"小倉位分腿仍守恆（得 {legs2}）")
+
+    # --- 分數 lotSz 浮點對齊（OKX 51121 根因回歸）---
+    # 舊碼 n_lots*lot_sz 對 lot=0.1 會出 0.7000000000000001，原樣送進 attachAlgoOrds.sz → 51121。
+    def _is_grid(x, lot):           # 模擬 OKX 視角：_fmt_qty 出的字串須為 lot 整數倍
+        return (Decimal(_fmt_qty(x, lot)) % Decimal(str(lot))) == 0
+    rc = round_contracts_down(20.83, 0.1, 0.1)        # 208.3 張：舊碼此類值會離格
+    check(_is_grid(rc, 0.1), f"round_contracts_down 對齊 lot=0.1（得 {rc!r}）")
+    legs01 = split_tp_contracts(rc, 0.1)
+    check(all(_is_grid(x, 0.1) for x in legs01) and abs(sum(legs01) - rc) < 1e-9,
+          f"split_tp 各腿對齊 lot=0.1 且守恆（得 {legs01}）")
+    # AVAX 型（lot=0.1）重現：build_order_plan→每個 attach sz 必為 lot 整數倍（否則 51121）
+    pav = build_order_plan("AVAX", "bull", 22.0, 21.4, risk_usd=125.0,
+                           ct_val=1.0, lot_sz=0.1, min_sz=0.1, seq=11)
+    av_szs = [a["sz"] for a in build_okx_entry_params(pav).get("attachAlgoOrds", []) if "sz" in a]
+    check(bool(av_szs) and all((Decimal(s) % Decimal("0.1")) == 0 for s in av_szs),
+          f"AVAX attach sz 全為 lot=0.1 整數倍（得 {av_szs}）")
+    # _fmt_qty denoise（第二道防線）：餵髒值也能 snap 回乾淨格
+    check(_fmt_qty(0.7000000000000001, 0.1) == "0.7",
+          f"_fmt_qty denoise 小值（得 {_fmt_qty(0.7000000000000001, 0.1)}）")
+    check(_fmt_qty(62.400000000000006, 0.1) == "62.4",
+          f"_fmt_qty denoise 大值（得 {_fmt_qty(62.400000000000006, 0.1)}）")
 
     # --- 數字格式：絕不科學記號（finding：小幣價/小量會被 OKX 拒）---
     check("e" not in _fmt_px(0.000012345).lower(),
