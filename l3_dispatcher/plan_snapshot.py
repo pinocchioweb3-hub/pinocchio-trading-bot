@@ -140,7 +140,8 @@ def build_plan_snapshot(*, source: str, direction: str,
                         plan_captured_at_ms: int | None = None,
                         entry_filled_at_ms: int | None = None,
                         regime_vector=None, context=None,
-                        expected_stop_scenario=None) -> dict | None:
+                        expected_stop_scenario=None,
+                        news_context=None) -> dict | None:
     """組裝一份進場計畫快照（純資料、exception-safe，失敗回 None）。
 
     參數：
@@ -153,6 +154,11 @@ def build_plan_snapshot(*, source: str, direction: str,
       confidence            交叉驗證信心（若有）
       regime_vector/context 進階向量；現多為 None，step4 起逐步帶入（鍵恆在值可空）
       expected_stop_scenario 自訂止損劇本；不給則用預設（價格觸及失效價＝planned_stop）
+      news_context          消息面進場觀測（task#66 Q2 Phase 0）；呼叫端用
+                            news_score.capture_entry_news_context() 算好後傳入，本函式只
+                            原樣打包成 news_at_entry 觀測欄。**純觀測**：絕不進 rr/expected_r/
+                            score/方向判定；閘②回測未過前對任何下單數學影響嚴格為零。維持本
+                            函式『純資料、不呼叫策略/不做活查詢』鐵則——活查詢在呼叫端做。
     """
     try:
         now = int(time.time() * 1000)
@@ -203,6 +209,9 @@ def build_plan_snapshot(*, source: str, direction: str,
             "regime_at_entry": regime_at_entry,
             "context_at_entry": context_at_entry,
             "missing_context_keys": missing,  # 進場當下『沒抓到的數據』＝最該回補的因素
+            # task#66 Q2 Phase 0：消息面進場觀測（純觀測欄；缺料/未接 → None，誠實留空）。
+            # 永不參與上面任何 rr/expected_r/方向欄——只供復盤引擎事後歸因『進場那刻消息面偏哪』。
+            "news_at_entry": news_context if isinstance(news_context, dict) else None,
         }
     except Exception:
         return None

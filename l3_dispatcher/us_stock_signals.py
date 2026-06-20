@@ -269,6 +269,9 @@ async def run_us_signal_loop(tg, scan_interval: int = 900):
                                     # v56 step4：影子層 regime/context 觀測（純資料，零下單數學）
                                     from .regime_vector import assemble as _asm_rg
                                     _rv, _ctx = _asm_rg(snap, direction=d.direction.value)
+                                    # v69 task#66 Q2 Phase 0：消息面進場觀測（純觀測，exception-safe → None）。
+                                    from news_feed.news_score import capture_entry_news_context as _cap_news
+                                    _news = _cap_news(sym, d.direction.value)
                                     plan_snap = build_plan_snapshot(
                                         source="us_breakout",
                                         direction=d.direction.value,
@@ -276,7 +279,8 @@ async def run_us_signal_loop(tg, scan_interval: int = 900):
                                         tp1=tps["tp1"], tp2=tps["tp2"],
                                         tp3=tps["tp3"], signal_msg_id=sig_mid,
                                         regime=f"us_{snap.us_session}",
-                                        regime_vector=_rv, context=_ctx)
+                                        regime_vector=_rv, context=_ctx,
+                                        news_context=_news)
                                 except Exception:
                                     plan_snap = None
                                 pid = record_paper_entry(

@@ -313,6 +313,10 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
             # 零下單數學；失敗回兩個空向量不影響建單）。
             from .regime_vector import assemble as _assemble_regime
             _rv, _ctx = _assemble_regime(snap, direction=direction)
+            # v69 task#66 Q2 Phase 0：消息面進場觀測（純觀測，本身 exception-safe → None；
+            # 永不進 rr/方向，閘②未過前對下單數學零影響）。
+            from news_feed.news_score import capture_entry_news_context as _cap_news
+            _news = _cap_news(sym, direction)
             plan_snap = build_plan_snapshot(
                 source="direct_fire", direction=direction,
                 entry_price=entry_price, planned_stop=stop,
@@ -321,6 +325,7 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
                 thesis=decision.get("reason", ""),
                 confidence=(cc.get("confidence") if cc else None),
                 regime_vector=_rv, context=_ctx,
+                news_context=_news,
             )
         except Exception as _e:
             plan_snap = None

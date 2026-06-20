@@ -783,12 +783,16 @@ def _record_deepdive_plan(sym: str, plan: dict | None,
             #   缺 atr → "unknown"（誠實留空，與舊路徑等價）。
             from .plan_snapshot import vol_regime_from_atr
             _vol_regime = vol_regime_from_atr((_snap_for_rv or {}).get("atr_pct_7d"))
+            # v69 task#66 Q2 Phase 0：消息面進場觀測（純觀測，exception-safe → None）。
+            from news_feed.news_score import capture_entry_news_context as _cap_news
+            _news = _cap_news(sym, direction)
             plan_snap = build_plan_snapshot(
                 source="macro_deepdive", direction=direction,
                 entry_price=entry, planned_stop=stop,
                 tp1=tp1, tp2=_tp2, tp3=_tp3,
                 signal_msg_id=signal_msg_id, regime=_vol_regime,
-                regime_vector=_rv, context=_ctx)
+                regime_vector=_rv, context=_ctx,
+                news_context=_news)
         except Exception:
             plan_snap = None
         record_paper_entry(

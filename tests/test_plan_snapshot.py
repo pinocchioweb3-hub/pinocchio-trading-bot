@@ -97,6 +97,46 @@ def test_context_overlay_fills_provided():
     assert snap["rr_to_tp"]["tp1"] == 1.0
 
 
+# --- 2b. news_at_entry：未給 → None；給 dict → 原樣打包，且絕不擾動 rr/方向（task#66 Q2 Phase0）---
+def test_news_at_entry_default_none():
+    snap = ps.build_plan_snapshot(
+        source="direct_fire", direction="bull",
+        entry_price=100.0, planned_stop=90.0, tp1=110.0, tp2=120.0, tp3=130.0)
+    # 未接消息面 → 誠實 None（鍵恆在值可空）
+    assert "news_at_entry" in snap and snap["news_at_entry"] is None
+
+
+def test_news_at_entry_passthrough_and_does_not_perturb_decision():
+    news = {"symbol": "BTC", "direction_observed": "bull",
+            "narrative_lean": {"lean": "bear", "net": -3, "n_hits": 2},
+            "recent_ticker_atoms": [{"ingestion_seq": 21}], "n_ticker_atoms": 1,
+            "note": "observation-only"}
+    with_news = ps.build_plan_snapshot(
+        source="direct_fire", direction="bull",
+        entry_price=100.0, planned_stop=90.0, tp1=110.0, tp2=120.0, tp3=130.0,
+        news_context=news)
+    without = ps.build_plan_snapshot(
+        source="direct_fire", direction="bull",
+        entry_price=100.0, planned_stop=90.0, tp1=110.0, tp2=120.0, tp3=130.0)
+    # 原樣打包進觀測欄
+    assert with_news["news_at_entry"] == news
+    # 鐵則：即使消息面 narrative_lean 偏 bear，方向/rr/expected_r 一律不受影響
+    assert with_news["direction"] == "bull"
+    assert with_news["rr_to_tp"] == without["rr_to_tp"]
+    assert with_news["expected_r"] == without["expected_r"]
+    # news_at_entry 不得污染到任何決策欄（只活在自己的觀測鍵裡）
+    assert "narrative_lean" not in with_news and "news_at_entry" in with_news
+
+
+def test_news_at_entry_non_dict_coerced_to_none():
+    # 防呆：誤傳非 dict（字串/數字/list）→ 一律 None，不讓壞型別污染 schema
+    for bad in ("oops", 123, ["x"], 0):
+        snap = ps.build_plan_snapshot(
+            source="x", direction="bull", entry_price=100.0, planned_stop=90.0,
+            tp1=110.0, tp2=120.0, tp3=130.0, news_context=bad)
+        assert snap["news_at_entry"] is None, f"壞型別 {bad!r} 應退為 None"
+
+
 # --- 3. _safe_rr 多空與除零 ---
 def test_safe_rr():
     assert ps._safe_rr("bull", 100, 90, 120) == 2.0

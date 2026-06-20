@@ -411,12 +411,16 @@ async def _check_waiting_trades(source, tg, bars_cache: dict[str, list],
                 # 此刻才是真實進場時點，市場廣度比訊號當時更貼近實況。純觀測，零下單數學。
                 from .regime_vector import assemble as _asm_rg
                 _rv, _ctx = _asm_rg(None, direction=w["direction"])
+                # v69 task#66 Q2 Phase 0：觸發成交那刻的消息面進場觀測（純觀測，exception-safe → None）。
+                from news_feed.news_score import capture_entry_news_context as _cap_news
+                _news = _cap_news(sym, w["direction"])
                 plan_snap = build_plan_snapshot(
                     source="waiting_trigger", direction=w["direction"],
                     entry_price=live, planned_stop=w["stop_price"],
                     tp1=w["tp1"], tp2=w["tp2"], tp3=w["tp3"],
                     fire_id=w["fire_id"], regime=regime,
-                    regime_vector=_rv, context=_ctx)
+                    regime_vector=_rv, context=_ctx,
+                    news_context=_news)
             except Exception:
                 plan_snap = None
             record_paper_entry(
