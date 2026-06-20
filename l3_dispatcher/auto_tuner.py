@@ -184,6 +184,23 @@ async def run_auto_tuner_loop(tg, interval_seconds: int = 86400,
                 print("[auto_tuner] auto_optimizer report sent")
         except Exception as e:
             print(f"[auto_tuner] auto_optimizer error: {type(e).__name__}: {e}")
+        # task#61(step9)：入場積極度自動優化器——把已平倉/逾時(含 entry_expired) paper 按
+        # (symbol×象限) 分桶，逐根 K 線重放 champion(現行深限價可到期) vs challenger
+        # (D 深限價到期轉市價／市價即進)，過 L2 四關才寫「模擬盤入場政策覆寫表」。
+        # 與 TP 優化器互補：那個調出場分批，這個調進場積極度。納入 entry_expired（缺料樣本）。
+        # 學習＋揭示半：每日累積 L2 證據；覆寫表的進場執行層消費為下一步接線（現為觀測/待接）。
+        # async：需取快取 OHLC 做逐根重放。今日對齊樣本<30→minTRL fail-closed→0 晉升→零行為變更。
+        try:
+            from l3_dispatcher import entry_policy_optimizer as epo
+            eopt = await epo.run_entry_optimization()
+            print(f"[auto_tuner] entry_policy_optimizer: {eopt['n_buckets']} 桶、"
+                  f"{eopt['n_promoted']} 晉升（符合完整重放窗 {eopt.get('n_eligible', '?')} 筆）")
+            eopt_rep = epo.render_report(eopt)
+            if eopt_rep and tg is not None:
+                await tg.send_message(eopt_rep, parse_mode="HTML")
+                print("[auto_tuner] entry_policy_optimizer report sent")
+        except Exception as e:
+            print(f"[auto_tuner] entry_policy_optimizer error: {type(e).__name__}: {e}")
         try:
             rep = build_report()
             if rep and tg is not None:

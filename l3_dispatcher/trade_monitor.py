@@ -101,6 +101,26 @@ def _resolve_pt_alloc(pt: dict) -> dict | None:
         return None
 
 
+def _entry_fill_probe(bars: list[dict], direction: str,
+                      entry_at_ms: int) -> float | None:
+    """task#60 治本：分批限價單成交偵測的「有利極值」探針。
+
+    對齊 _check_trade 的 TP/SL 高低聚合與 backtest._try_limit_fill 的盤中觸價語意：
+      • bull → 取進場後各 bar 的 min(low)（價跌到掛單即成交）
+      • bear → 取進場後各 bar 的 max(high)（價漲到掛單即成交）
+    舊版只看 bars[-1]['close']（最後收盤），會漏掉「窗內觸價、收盤又彈回」的真成交，
+    造成偽 entry_expired、惡化樣本飢餓。此修只校正「是否觸價」的偵測，不改限價/策略。
+
+    只納 ts ≥ entry_at 的 bar：杜絕用掛單成立前的價格行為灌成交（紅線③不灌假成交）。
+    無合格 bar（進場過近、本輪尚無進場後收盤）→ None（本輪不判成交，維持 pending）。
+    """
+    elig = [b for b in bars if b.get("ts", 0) >= entry_at_ms]
+    if not elig:
+        return None
+    return (min(b["low"] for b in elig) if direction == "bull"
+            else max(b["high"] for b in elig))
+
+
 def _check_trade(trade: dict, bars: list[dict],
                  tp_size_pct: dict | None = None) -> list[tuple[str, float, float]]:
     """純函式：給定 trade + 5m bars，回所有應觸發的 (event_label, trigger_price, size_pct) tuples。
@@ -438,6 +458,7 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
     v23-2 美股斷層修復：us_breakout 的事件發 tg_us（🇺🇸 美股主題）—
     進場通知在哪、出場事件就在哪；加密事件留 tg（📈 持倉與績效）。"""
     from .paper_journal import (apply_entry_fill, apply_paper_event, expire_pending,
+                                convert_pending_to_market,
                                 get_open_paper, get_paper_stats, get_pending_entries)
 
     # v26: 先檢查分批限價單的進場成交 — 達到某格區間就推「進場進度」到持倉主題
@@ -453,7 +474,11 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
         fill = None
         if bars:
             live = bars[-1]["close"]
-            fill = apply_entry_fill(pe["id"], live)
+            # task#60 治本：用「進場後有利極值」探針判成交（bull:min(low)／bear:max(high)），
+            #   對齊 _check_trade 與 backtest._try_limit_fill 的盤中觸價語意；舊版只看最後收盤會漏。
+            probe = _entry_fill_probe(bars, pe["direction"], pe["entry_at"])
+            if probe is not None:
+                fill = apply_entry_fill(pe["id"], probe)
             if fill and (tg or tg_us) is not None:
                 dir_zh = "做多" if pe["direction"] == "bull" else "做空"
                 filled_pct = int(fill["filled_pct"] * 100)
@@ -475,8 +500,30 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
         #   partial（已部分成交）不在此處作廢，由 get_open_paper 的 timeout 流程處理。
         state_now = fill["state"] if fill else pe["entry_state"]
         if state_now == "pending" and (now_ms - pe["entry_at"]) >= PENDING_MAX_HOURS * 3600 * 1000:
-            if expire_pending(pe["id"]):
-                age_h = (now_ms - pe["entry_at"]) / 3_600_000
+            age_h = (now_ms - pe["entry_at"]) / 3_600_000
+            # task#61 D：若此桶活躍政策＝「深限價到期轉市價」(limit_convert) 且本輪抓得到現價，
+            #   到期時改以市價追進（救涵蓋率：把未成交非事件轉成有標籤真實結果，餵 L2 學習桶），
+            #   而非直接作廢。過 backtest 兩道理性閘（追價無意義/風險≤0）才轉，否則照常作廢。
+            #   只動模擬盤掛單行為，真錢執行層永不讀（紅線①）。store 空時 kind 恆 None → 永不觸發。
+            converted = None
+            if pe.get("entry_policy_kind") == "limit_convert" and bars:
+                converted = convert_pending_to_market(pe["id"], bars[-1]["close"])
+            if converted is not None:
+                print(f"[trade_monitor] 🔄 pending→market converted: {sym} {pe['direction']} "
+                      f"@ {converted['market_px']:.6g} ({age_h:.1f}h, risk={converted['risk']:.6g})")
+                if (tg or tg_us) is not None:
+                    dir_zh = "做多" if pe["direction"] == "bull" else "做空"
+                    txt = (f"🔄 <b>{sym} {dir_zh} 掛單到期轉市價進場</b>\n"
+                           f"━━━━━━━━━━━━━━━━\n"
+                           f"限價 {age_h:.0f}h 未成交，依入場政策改以市價 "
+                           f"<code>${converted['market_px']:,.6g}</code> 進場（紙上）\n"
+                           f"<i>救涵蓋率：把『未成交非事件』轉為有標籤的真實結果（餵 L2 學習桶）</i>")
+                    target = tg_us if (pe.get("setup") == "us_breakout" and tg_us) else tg
+                    try:
+                        await target.send_message(txt, parse_mode="HTML")
+                    except Exception as e:
+                        print(f"[trade_monitor] convert push error: {e}")
+            elif expire_pending(pe["id"]):
                 print(f"[trade_monitor] 🗑️ pending expired: {sym} {pe['direction']} "
                       f"({age_h:.1f}h ≥ {PENDING_MAX_HOURS}h, 0% filled)")
                 if (tg or tg_us) is not None:

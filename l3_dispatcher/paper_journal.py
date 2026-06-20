@@ -75,6 +75,11 @@ def init_db() -> None:
             # task#53(step8): 進場時凍結的 TP 分配覆寫（auto_param_store 晉升的活躍值），
             # JSON 三元組如 [0.6,0.25,0.15]；None=用預設 CONFIG.tp_size_split。只驅動 paper/demo。
             ("tp_alloc", "ALTER TABLE paper_trades ADD COLUMN tp_alloc TEXT"),
+            # task#61(step B): 進場時凍結此桶 (symbol×象限) 的活躍入場積極度覆寫
+            #   （entry_policy_store 晉升的活躍 kind）。目前只用 'limit_convert'（深限價到期轉市價）；
+            #   None / 'limit_expire'=現行深限價可到期(預設)。只驅動 paper/demo 掛單行為，
+            #   真錢執行層永不讀（紅線①）。供 trade_monitor 在掛單到期時決定「轉市價或作廢」。
+            ("entry_policy_kind", "ALTER TABLE paper_trades ADD COLUMN entry_policy_kind TEXT"),
         ):
             if col not in existing:
                 try:
@@ -204,7 +209,8 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                        split_mode: bool = False,
                        signal_msg_id: int | None = None,
                        skip_cooldown: bool = False,
-                       plan_snapshot: dict | None = None) -> int:
+                       plan_snapshot: dict | None = None,
+                       entry_policy_kind: str | None = None) -> int:
     """v26: split_mode=True 時建分批限價單（entry_state='pending'，等價格逐格成交）；
     否則維持原行為（直接全額成交，entry_state='full'）。
 
@@ -233,6 +239,27 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
         tp_alloc_json = json.dumps(list(_ov)) if _ov else None
     except Exception:
         tp_alloc_json = None
+    # task#61(step B): 解析此桶 (symbol×象限) 的活躍入場積極度覆寫（entry_policy_store 晉升值）。
+    #   呼叫端顯式給 entry_policy_kind → 用之（測試/未來 caller 級落地）；否則自解析（與 tp_alloc 同模式）。
+    #   只在 split_mode（限價分批單）下有意義：market 進場無待成交掛單可轉，故只記 'limit_convert'。
+    #   "market" 覆寫＝訊號當下市價即進，需呼叫端改 split_mode/entry_price 配合，record 層
+    #     無從追溯改寫 → 暫不落地，誠實留痕（NO silent cap）後沿用現行深限價可到期。
+    #   fail-safe：任何錯誤 → None（沿用今日行為）。只驅動 paper/demo（紅線①，真錢永不讀）。
+    eff_entry_policy = None
+    try:
+        _ek = entry_policy_kind
+        if _ek is None:
+            from l3_dispatcher.entry_policy_store import resolve_entry_policy
+            _ek = resolve_entry_policy(symbol, _quadrant_from_snapshot(plan_snapshot))
+        if _ek == "market":
+            print(f"[paper] {symbol} 入場政策覆寫=market 尚未落地（需呼叫端配合），"
+                  f"本筆沿用現行深限價可到期行為（已留痕，紅線③不靜默丟棄）")
+            _ek = None
+        if (_ek == "limit_convert" and split_mode
+                and zone_lo is not None and zone_hi is not None):
+            eff_entry_policy = "limit_convert"
+    except Exception:
+        eff_entry_policy = None
     conn = _conn()
     try:
         now_ms = int(time.time() * 1000)
@@ -243,21 +270,22 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at,
                     entry_splits, entry_filled_pct, entry_state, signal_msg_id, plan_snapshot,
-                    tp_alloc)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?, ?, ?)""",
+                    tp_alloc, entry_policy_kind)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?, ?, ?, ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                  now_ms, fire_id, regime, now_ms, json.dumps(splits), signal_msg_id, ps_json,
-                 tp_alloc_json),
+                 tp_alloc_json, eff_entry_policy),
             )
         else:
             cur = conn.execute(
                 """INSERT INTO paper_trades
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at, entry_filled_pct, entry_state,
-                    signal_msg_id, plan_snapshot, tp_alloc)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?, ?, ?)""",
+                    signal_msg_id, plan_snapshot, tp_alloc, entry_policy_kind)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?, ?, ?, ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
-                 now_ms, fire_id, regime, now_ms, signal_msg_id, ps_json, tp_alloc_json),
+                 now_ms, fire_id, regime, now_ms, signal_msg_id, ps_json, tp_alloc_json,
+                 eff_entry_policy),
             )
         return cur.lastrowid
     finally:
@@ -271,12 +299,13 @@ def get_pending_entries() -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT id, symbol, direction, entry_splits, entry_filled_pct, entry_state, "
-            "entry_at, setup FROM paper_trades WHERE status='open' AND entry_state IN ('pending','partial')"
+            "entry_at, setup, entry_policy_kind FROM paper_trades "
+            "WHERE status='open' AND entry_state IN ('pending','partial')"
         ).fetchall()
         return [{"id": r[0], "symbol": r[1], "direction": r[2],
                  "splits": json.loads(r[3]) if r[3] else [],
                  "filled_pct": r[4], "entry_state": r[5], "entry_at": r[6],
-                 "setup": r[7]} for r in rows]
+                 "setup": r[7], "entry_policy_kind": r[8]} for r in rows]
     finally:
         conn.close()
 
@@ -333,6 +362,66 @@ def expire_pending(paper_id: int) -> bool:
             "WHERE id=? AND status='open' AND entry_state='pending'",
             (now_ms, paper_id))
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def convert_pending_to_market(paper_id: int, market_px: float) -> dict | None:
+    """task#61 D「深限價到期轉市價」：把一張『仍 0% 成交（pending）』的限價分批單，在掛單
+    到期那刻改為以市價 market_px 成交（救涵蓋率 35%→94%，見 entry-depth-ab 定案）。
+
+    嚴格對齊 backtest.entry_placement_ab._limit_variant(convert=True) 的兩道理性閘：
+      ① 追價無意義閘：若市價已穿越 tp1（bull: market_px≥tp1／bear: market_px≤tp1）→ 放棄轉換
+         （價已到目標，追進去等於沒有上行空間）。
+      ② 風險為零/負閘：risk=|market_px−stop|；若 risk≤0（市價已過止損）→ 放棄轉換。
+    放棄轉換 → 回 None（呼叫端續走原 expire_pending 作廢流程，＝per-proposed 計 0R）。
+
+    成交（轉換）→ 改寫 entry_price=market_px、entry_state='full'、entry_filled_pct=1.0、
+    所有 split 標記 filled（附 converted_market 旗標）。**永不動 entry_at**：優化器以『訊號
+    時刻』對齊 K 線重放，動 entry_at 會錯位 ~12h。R 數學：apply_paper_event 以 entry_price
+    欄計 sl_dist，改寫 entry_price 即忠實對映 backtest 的 risk_c=|conv_px−stop_abs|。
+    只動模擬盤掛單行為，真錢執行層永不讀（紅線①）。
+
+    SQL 內建 status='open' AND entry_state='pending' 護欄：partial/full/closed 一律不碰。
+    回 {market_px, risk, prev_entry} 或 None（未轉換）。
+    """
+    init_db()
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT direction, entry_price, stop_price, tp1, entry_splits, entry_state, status "
+            "FROM paper_trades WHERE id=?", (paper_id,)).fetchone()
+        if not row:
+            return None
+        direction, entry_price, stop_price, tp1, splits_json, state, status = row
+        if status != "open" or state != "pending":
+            return None
+        # 閘①：追價無意義（市價已穿越 tp1）。tp1 為 None（理論上不會）時跳過此閘。
+        if tp1 is not None and (
+                (direction == "bull" and market_px >= tp1) or
+                (direction == "bear" and market_px <= tp1)):
+            return None
+        # 閘②：風險為零/負（市價已過止損）
+        risk = abs(market_px - stop_price)
+        if risk <= 0:
+            return None
+        now_ms = int(time.time() * 1000)
+        try:
+            splits = json.loads(splits_json) if splits_json else []
+        except Exception:
+            splits = []
+        for s in splits:
+            s["filled"] = 1
+            s["filled_at"] = now_ms
+            s["converted_market"] = 1
+        cur = conn.execute(
+            "UPDATE paper_trades SET entry_price=?, entry_state='full', "
+            "entry_filled_pct=1.0, entry_splits=? "
+            "WHERE id=? AND status='open' AND entry_state='pending'",
+            (market_px, json.dumps(splits), paper_id))
+        if cur.rowcount <= 0:
+            return None   # 競態：另一路徑已改狀態 → 不轉換（fail-safe）
+        return {"market_px": market_px, "risk": risk, "prev_entry": entry_price}
     finally:
         conn.close()
 
