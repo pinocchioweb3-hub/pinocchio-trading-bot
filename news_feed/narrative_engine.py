@@ -9,10 +9,14 @@
     第 3 層 ✅ 因果鏈 — 敘事內事件的前後因果（A 導致 B）
     第 4 層 ✅ 經濟數據關聯 — _econ_context_lines() 把近期數據（實際/預期/前值）餵進
             敘事 prompt，於因果鏈連結「數據意外→市場反應」（正式 econ×news 回測仍待補）
-    第 5 層 ✅ 餵回訊號層 — narrative_alignment() 提供訊號 vs 主導敘事的順風/逆風註記
+    第 5 層 ⚠️ 僅顯示卡 — narrative_alignment() 產生「訊號 vs 主導敘事順風/逆風」註記，
+            但【目前僅餵 Telegram 顯示卡（telegram_bot/message_format.py:175-176），
+            未進開單路徑】。消息面進訊號層的首次嘗試走 news_score.py 影子層 + 回測閘，
+            在離線回測證明顯著且人工拍板前，對下單數學影響嚴格為零（紅線③：不得宣稱
+            「消息面已進訊號層」）。
 
-本檔交付第 1-5 層：narrative.db 儲存敘事、每日聚類 worker、敘事摘要、
-get_active_narratives() / narrative_alignment() 供訊號層消費。
+本檔交付第 1-4 層的敘事建構，第 5 層僅作顯示：narrative.db 儲存敘事、每日聚類
+worker、敘事摘要、get_active_narratives() / narrative_alignment()（顯示卡專用）。
 """
 from __future__ import annotations
 
