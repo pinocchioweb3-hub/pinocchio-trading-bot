@@ -1282,6 +1282,18 @@ async def run_performance_loop(tg, target_hour_utc: int = 0,
                     await tg.send_photo(card, caption="🗂 最近平倉成績卡（紙上驗證帳，不挑單）")
             except Exception as e:
                 print(f"[performance] report card error: {type(e).__name__}: {e}")
+
+            # v66: 累積 R 走勢圖（朋友回饋 Q1：像交易所跟單系統的績效走勢圖）
+            #      純讀 paper_trades，各引擎分線，誠實標註「紙上模擬・非實盤」。
+            try:
+                from .equity_curve import render_equity_curve
+                curve = render_equity_curve()
+                if curve:
+                    await tg.send_photo(curve, caption=(
+                        "📈 紙上驗證帳累積 R 走勢（非實盤績效・兩引擎分線・"
+                        "美股樣本不足不可作績效宣稱）"))
+            except Exception as e:
+                print(f"[performance] equity curve error: {type(e).__name__}: {e}")
         except Exception as e:
             print(f"[performance] error: {type(e).__name__}: {e}")
 
