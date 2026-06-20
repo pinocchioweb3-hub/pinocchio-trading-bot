@@ -107,6 +107,30 @@ def test_safe_rr():
     assert ps._safe_rr("bull", "x", 90, 120) is None         # 不合法輸入 → None
 
 
+# --- 3b. vol_regime_from_atr 共用口徑：分桶正確、缺料 unknown、與舊內聯式等價 ---
+def test_vol_regime_from_atr_buckets():
+    assert ps.vol_regime_from_atr(9.0) == "extreme"
+    assert ps.vol_regime_from_atr(8.0) == "extreme"     # 邊界含等於
+    assert ps.vol_regime_from_atr(7.99) == "high"
+    assert ps.vol_regime_from_atr(5.0) == "high"        # 邊界含等於
+    assert ps.vol_regime_from_atr(4.99) == "low"
+    assert ps.vol_regime_from_atr(0.0) == "low"         # 0 是合法數值，非缺料
+    assert ps.vol_regime_from_atr(None) == "unknown"    # 缺料誠實留空
+    assert ps.vol_regime_from_atr("x") == "unknown"     # 非數值 → unknown（比舊式更穩，不炸）
+    assert ps.vol_regime_from_atr("6.0") == "high"      # 數字字串容錯
+
+
+def test_vol_regime_from_atr_equivalent_to_legacy_inline():
+    """治本鐵則：共用函式對『數值/None』輸入須與舊 direct_fire 內聯三元式逐一等價，
+    否則重構就偷改了歷史語意。"""
+    def _legacy(atr):
+        return ("unknown" if atr is None else
+                "extreme" if atr >= 8.0 else
+                "high" if atr >= 5.0 else "low")
+    for atr in [None, 0.0, 1.5, 4.999, 5.0, 5.0001, 7.999, 8.0, 8.0001, 12.3, 100.0]:
+        assert ps.vol_regime_from_atr(atr) == _legacy(atr), f"分歧於 atr={atr}"
+
+
 # --- 4a. record_paper_entry round-trip 快照 ---
 def test_record_roundtrips_snapshot():
     _fresh()

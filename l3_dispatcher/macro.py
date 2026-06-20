@@ -688,6 +688,36 @@ async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3
         await asyncio.sleep(interval_seconds)
 
 
+def _deepdive_extra_context(sym: str, sym_state: dict | None) -> dict:
+    """v56-2 治本：從 deepdive 早已抓好的 sym_state 萃取 plan_snapshot 影子 context，
+    純資料重用、零新網路請求（這些值 chart/synthesizer 早已在用，過去卻沒餵進快照）：
+
+      • wyckoff_phase          ← sym_state.wyckoff.phase（classify_wyckoff 4h 階段）
+      • whale_net              ← 該標的 HL 鯨魚淨多倉百分比（per_symbol_aggregate 配對 symbol）
+      • macro_confluence_score ← 市場層宏觀共振分數（讀末行，進場時凍結的宏觀背景）
+
+    缺料 → 該鍵省略（assemble 只覆蓋非 None，未列鍵維持骨架 None＝誠實留空，紅線③）。
+    全程 exception-safe：壞掉只是少記一格 context，絕不影響任何 FIRE/下單/建單路徑。
+    抽成獨立純函式以利單元測試（不必跑整個 deepdive 迴圈）。"""
+    out: dict = {}
+    try:
+        _wyk = ((sym_state or {}).get("wyckoff") or {}).get("phase")
+        if _wyk is not None:
+            out["wyckoff_phase"] = _wyk
+        _wh = (sym_state or {}).get("whales") or {}
+        if isinstance(_wh, dict) and not _wh.get("error"):
+            _sw = next((w for w in _wh.get("per_symbol_aggregate", [])
+                        if isinstance(w, dict) and w.get("symbol") == sym), None)
+            if _sw is not None and _sw.get("net_long_pct") is not None:
+                out["whale_net"] = _sw.get("net_long_pct")
+        _mcs = _read_macro_confluence_score()
+        if _mcs is not None:
+            out["macro_confluence_score"] = _mcs
+    except Exception:
+        return {}
+    return out
+
+
 def _record_deepdive_plan(sym: str, plan: dict | None,
                           signal_msg_id: int | None = None,
                           sym_state: dict | None = None) -> dict | None:
@@ -741,12 +771,23 @@ def _record_deepdive_plan(sym: str, plan: dict | None,
                         _snap_for_rv["regime_trend_dir"] = _td
             except Exception:
                 _snap_for_rv = None
-            _rv, _ctx = _asm_rg(_snap_for_rv, direction=direction)
+            # v56-2 治本：deepdive 早已算好的 extra_context 過去全丟棄 → wyckoff_phase/
+            #   whale_net/macro_confluence_score 恆 None。同樣純資料重用、零新請求、缺料→None。
+            _extra_ctx = _deepdive_extra_context(sym, sym_state)
+            _rv, _ctx = _asm_rg(_snap_for_rv, direction=direction,
+                                extra_context=_extra_ctx or None)
+            # v56-2：vol_trend 過去誤填來源標籤 "deepdive"（來源已存於 source 欄）。改與
+            #   direct_fire/waiting_trigger 同口徑——用共用的 vol_regime_from_atr() 把 deepdive
+            #   早已抓好的 snapshot.atr_pct_7d 分桶成 ATR 波動度（趨勢方向另由 oi_price_quadrant
+            #   承載）。三條加密進場路徑同一語意同一門檻，lessons_store 讀 vol_trend 不再混義；
+            #   缺 atr → "unknown"（誠實留空，與舊路徑等價）。
+            from .plan_snapshot import vol_regime_from_atr
+            _vol_regime = vol_regime_from_atr((_snap_for_rv or {}).get("atr_pct_7d"))
             plan_snap = build_plan_snapshot(
                 source="macro_deepdive", direction=direction,
                 entry_price=entry, planned_stop=stop,
                 tp1=tp1, tp2=_tp2, tp3=_tp3,
-                signal_msg_id=signal_msg_id, regime="deepdive",
+                signal_msg_id=signal_msg_id, regime=_vol_regime,
                 regime_vector=_rv, context=_ctx)
         except Exception:
             plan_snap = None
@@ -1025,6 +1066,33 @@ def _macro_confluence_dashboard_line() -> str:
         return render_dashboard(rec)
     except Exception:
         return ""
+
+
+def _read_macro_confluence_score():
+    """純讀 macro_confluence.jsonl 末行的 macro_confluence_score（市場層宏觀背景，
+    進場時凍結用）。檔缺/空/壞 JSON/無此鍵/非數值 → None（誠實留空，紅線③）。
+    零 API、零重算，與 _macro_confluence_dashboard_line 同源同 tail-read 樣式，
+    只取原始分數而非渲染字串。供 _deepdive_extra_context 萃取進場快照用。"""
+    try:
+        import json as _json
+        from botpaths import data_dir
+        path = data_dir() / "macro_confluence.jsonl"
+        if not path.exists():
+            return None
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            chunk = f.read()
+        lines = [ln for ln in chunk.decode("utf-8", errors="ignore").splitlines()
+                 if ln.strip()]
+        if not lines:
+            return None
+        rec = _json.loads(lines[-1])
+        v = rec.get("macro_confluence_score")
+        return v if isinstance(v, (int, float)) else None
+    except Exception:
+        return None
 
 
 # v36：持倉資產分類（決定 🪙加密 / 🇺🇸美股 / 🥇商品 標記）

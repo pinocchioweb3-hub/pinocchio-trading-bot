@@ -23,6 +23,10 @@ from . import symbol_gate
 from .fire_queue import dequeue_one, mark_failed, mark_sent
 from .risk_manager import should_block
 from .trade_journal import EntryRecord, record_entry
+# vol_regime_from_atr 是 plan_snapshot 的純函式（零策略數學、零 I/O、無循環依賴）；提到頂層
+# import 一次，讓 FIRE 主路徑上的 vol_trend 分桶呼叫維持「此行不可能拋例外」的舊內聯式性質。
+# 較重的 build_plan_snapshot/assemble 仍維持影子層慣例（函式內 lazy import）。
+from .plan_snapshot import vol_regime_from_atr
 
 
 @dataclass
@@ -150,10 +154,9 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
         mark_failed(fire_id, f"plan_compute_error: {e}")
         print(f"[dispatcher] #{fire_id} {sym}/{setup}/{direction} PLAN ERROR: {e}")
         return True
-    atr = snap.get("atr_pct_7d")
-    regime = ("unknown" if atr is None else
-              "extreme" if atr >= 8.0 else
-              "high" if atr >= 5.0 else "low")
+    # v56-2：vol_trend 波動分桶改走共用口徑（與 macro_deepdive/waiting_trigger 同一函式
+    #   同一門檻），避免同一學習欄位跨來源混義；行為與舊內聯三元式完全等價。
+    regime = vol_regime_from_atr(snap.get("atr_pct_7d"))
     cc = decision.get("cross_check")
 
     # === v18-D: 三態判定 — 價格已偏離進場區 → 等待觸發（不立即 FIRE）===

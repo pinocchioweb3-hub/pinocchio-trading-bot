@@ -42,13 +42,38 @@ _CONTEXT_KEYS: tuple[str, ...] = (
     "macro_confluence_score",  # 宏觀共振分數
 )
 
-# regime（行情狀態）向量骨架；step4 會把這些填實，現在先佔位（vol_trend 由 regime 字串帶入）。
+# regime（行情狀態）向量骨架；step4 會把這些填實，現在先佔位。
+# vol_trend 由各加密進場路徑以 vol_regime_from_atr() 統一帶入 ATR 波動分桶（見該函式說明）。
 _REGIME_KEYS: tuple[str, ...] = (
-    "vol_trend",             # 波動/趨勢狀態
+    "vol_trend",             # ATR 波動分桶 extreme/high/low/unknown（趨勢方向看 oi_price_quadrant）
     "funding_state",         # 資金費率狀態
     "oi_price_quadrant",     # OI×價格象限
     "cvd_state",             # CVD 狀態
 )
+
+
+def vol_regime_from_atr(atr) -> str:
+    """以 7 日 ATR%（波動度）把進場當下分桶成 vol_trend——復盤引擎跨進場路徑的唯一口徑。
+
+    為什麼要共用一個函式：direct_fire / waiting_trigger / macro_deepdive 三條加密進場
+    路徑都會寫 regime_at_entry.vol_trend。若各填各的語意（有人填波動分桶、有人填趨勢
+    字串），同一學習欄位就混進兩種意義＝資料污染，正是本復盤引擎最該避免的坑。這裡把
+    唯一真相鎖成一個純函式、門檻只此一份，三處都呼叫它，就不會再漂移。
+
+    語意＝『波動度』而非『趨勢方向』——趨勢方向已由 oi_price_quadrant（OI×價格象限）承載。
+    缺料（atr 為 None 或非數值）→ "unknown"（誠實留空，紅線③，絕不硬塞分桶）。
+    門檻：≥8.0 extreme、≥5.0 high、其餘 low（與歷史 direct_fire 完全一致，行為等價）。
+    """
+    try:
+        a = float(atr)
+    except (TypeError, ValueError):
+        return "unknown"
+    if a >= 8.0:
+        return "extreme"
+    if a >= 5.0:
+        return "high"
+    return "low"
+
 
 _ENGINE_EPOCH_MS: int | None = None
 
