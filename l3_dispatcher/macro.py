@@ -807,6 +807,40 @@ def _record_deepdive_plan(sym: str, plan: dict | None,
     return chart_plan
 
 
+def _deepdive_repush_window(interval_seconds: int) -> int:
+    """deepdive 同幣「重推卡」冷卻窗（秒）。預設 max(24h, 1.5×cadence)，DEEPDIVE_REPUSH_WINDOW_S 可覆寫。
+
+    必須 > deepdive cadence，否則每輪剛好過期 → 同幣每輪重推（PEPE 連推 bug 的時序根因：
+    cadence=6h、symbol_gate 預設窗=1h，1h<<6h 故對中性卡形同無冷卻）。
+    """
+    default = max(86400, int(interval_seconds * 1.5))
+    try:
+        from botconfig import get_str
+        v = int(float(get_str("DEEPDIVE_REPUSH_WINDOW_S", str(default))))
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+def _deepdive_candidates(trading_syms: list, open_syms_set: set,
+                         max_n: int, repush_win: int,
+                         now: int | None = None):
+    """選 deepdive 候選：排除①已開倉同幣 ②近期已推過 deepdive 卡的同幣（不分方向）。
+
+    回 (picked_top_n, recently_pushed_set)。純函式（symbol_gate 唯讀），便於離線測試。
+    第②道是 v67 補的缺口：中性/非可做單卡不建紙上倉也不進 symbol_gate(bull/bear)，
+    過去只靠 open_syms_set 擋＝對中性卡無效 → 同幣每 cadence 重推。
+    """
+    from . import symbol_gate
+    recently = {s for s in trading_syms
+                if s not in open_syms_set
+                and not symbol_gate.should_send(s, "deepdive",
+                                                window_s=repush_win, now=now)}
+    picked = [s for s in trading_syms
+              if s not in open_syms_set and s not in recently]
+    return picked[:max_n], recently
+
+
 async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 21600,
                              max_symbols_per_run: int = 3):
     """每 N 秒（預設 6h）對交易層 top N 個強勢幣做 deep dive，每幣一份計畫。
@@ -829,12 +863,19 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
             #        就像重複單。改為也排除紙上 deepdive 持倉 → 持倉期間不再重發同幣 🎯。
             open_syms_set = ({o["symbol"] for o in get_open_trades()}
                              | open_paper_symbols("deepdive"))
-            # 只跑 trading tier 排除已開單後的 top N
-            candidates = [s for s in (watchlist.trading or []) if s not in open_syms_set]
-            symbols = candidates[:max_symbols_per_run]
-            if open_syms_set:
-                print(f"[deepdive] excluding open trades: {sorted(open_syms_set)} "
-                      f"(candidates: {candidates[:8]})")
+            # v67 治本（PEPE 連推 bug）：中性/非可做單 deepdive 卡不進 symbol_gate（下方 ~852
+            #   行僅 bull/bear 才 claim）也不建紙上倉 → 不在 open_syms_set 內 → 每 cadence 被當
+            #   「唯一未開倉候選」重推同幣（使用者看到的 PEPE 連續三張）。補一道「近期已推同幣
+            #   deepdive 卡」冷卻，不分方向——純顯示去重，零下單/訊號數學變更；真正的 FIRE 訊號
+            #   走 scheduler→dispatcher 另一路，不受此冷卻影響。
+            _repush_win = _deepdive_repush_window(interval_seconds)
+            symbols, _recently = _deepdive_candidates(
+                list(watchlist.trading or []), open_syms_set,
+                max_symbols_per_run, _repush_win)
+            if open_syms_set or _recently:
+                print(f"[deepdive] excluding open: {sorted(open_syms_set)} "
+                      f"| recently-pushed(<={_repush_win // 3600}h): {sorted(_recently)} "
+                      f"(picked: {symbols})")
             if not symbols:
                 print(f"[deepdive] no trading tier symbols (all open or empty), skipping")
             else:
@@ -885,6 +926,12 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
                                 print(f"[deepdive] chart error: {e}")
                             print(f"[deepdive] {sym} sent ({meta.get('output_chars')} chars)"
                                   f"{' +paper' if chart_plan else ''}")
+                            # v67: 真的送出後就標記「此幣已推 deepdive 卡」（不分方向），下個
+                            #      cadence 內不再重推同幣——補中性/非可做單卡缺口（bull/bear 由
+                            #      上方 claim 另記 (sym,dir)，此處再記 (sym,'deepdive') 不衝突）。
+                            #      送失敗(sig_mid None)不標記，留待下輪重試，不靜默漏卡。
+                            if sig_mid:
+                                symbol_gate.mark_sent(sym, "deepdive")
                         else:
                             print(f"[deepdive] {sym} synth failed: {meta.get('error')}")
                         # 避免 Telegram 連續發送被限速
