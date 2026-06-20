@@ -10,6 +10,7 @@
     4. 清算失衡確認（FIRE BULL 時應該有空清算累積）
     5. ETF 流向背離（BTC FIRE 時 ETF 流出 = 跟機構反向）
     6. 情緒極端值（極度貪婪時 FIRE BULL 風險升高）
+    7. 新聞敘事偏向（task#66 Q2 Phase 1；**delta 恆 0 純觀測**，不參與計分）
 """
 from __future__ import annotations
 
@@ -145,6 +146,29 @@ async def cross_check_fire(
             checks.append({"name": "valuation_check", "pass": False, "delta": -10,
                            "note": f"AHR999 {ahr}（高估區）"})
             score -= 10
+
+    # === Check 7: 新聞敘事偏向（task#66 Q2 Phase 1）===
+    # 影子鐵則：**delta 恆 0** — 結構上不可能改 score / pass_ / 方向 / downgraded。
+    # 只把「進場那刻消息面敘事偏哪、與本單方向是否同向」當成『觀測列』釘進 checks 卡，
+    # 供人/CEO 報告看見「系統有在看新聞」。閘②（離線回測 PSR/DSR/CAAR 顯著）通過前，
+    # 新聞對真實/模擬/demo 任何下單數學影響嚴格為零。任何讀取失敗 → 中性觀測列，零影響。
+    try:
+        from news_feed.news_score import narrative_lean_for, _active_narratives_safe
+        _lean = narrative_lean_for(sym, _active_narratives_safe())
+        _ld = _lean.get("lean", "neutral")
+        if _ld == "neutral":
+            _rel = "無命中"
+        elif ((_ld == "bull" and direction == SignalState.BULL)
+              or (_ld == "bear" and direction == SignalState.BEAR)):
+            _rel = "與本單同向"
+        else:
+            _rel = "與本單反向"
+        checks.append({"name": "news_sentiment", "pass": True, "delta": 0,
+                       "note": f"📰 敘事 {_ld}（{_rel}，n_hits={_lean.get('n_hits', 0)}）"
+                               f"｜觀測中・閘②前 delta=0 不進開單"})
+    except Exception:
+        checks.append({"name": "news_sentiment", "pass": True, "delta": 0,
+                       "note": "📰 新聞觀測暫不可用（影子降級，零影響）"})
 
     # === 結論 ===
     score = max(0, min(100, score))
