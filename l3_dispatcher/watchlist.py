@@ -178,6 +178,18 @@ class WatchlistManager:
         except Exception:
             self.short_tier = []
 
+        # task#68：免費 OKX 大宗源強度宇宙「影子比對」（純觀測，零訊號/候選變更）。
+        #   量測 scanner.db 免費源 vs 現行 CoinGlass per-coin 路徑的「覆蓋率 + top-N
+        #   一致度」，為日後「改用免費源解 task#64 冷 burst 截斷（須過回測閘）」累積
+        #   決策證據。重用同一輪 CoinGlass items（不另 burst）、零網路（讀 scanner.db）。
+        #   絕不影響 chosen；任何錯誤吞掉續跑。
+        try:
+            from l3_dispatcher.free_strength_universe import (
+                append_shadow, compare_universes)
+            append_shadow(compare_universes(pool, items, chosen, self.trading_size))
+        except Exception:
+            pass
+
         elapsed = asyncio.get_event_loop().time() - t0
         return {
             "chosen": chosen,
