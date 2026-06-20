@@ -25,6 +25,11 @@ from botpaths import db_path as _db_path
 
 DB_PATH = _db_path("trade_journal.db")
 
+# task#77：由 trade_monitor 寫入的出場 leg 標籤（每筆只該記一次）。用於
+# record_leg 的冪等去重——at-least-once 輪詢若同一根 bar 被掃兩次（重啟/補窗），
+# 同一 (trade_id, leg_label) 不得重複入帳。entry/manual 等非 monitor 標籤不在此列。
+_MONITOR_LEG_LABELS = ("tp1", "tp2", "tp3", "stop", "timeout")
+
 
 # ===========================================================================
 # 連線 + schema
@@ -109,6 +114,10 @@ def init_db() -> None:
             ("entry_zone_hi", "ALTER TABLE trades ADD COLUMN entry_zone_hi REAL"),
             ("fill_price",    "ALTER TABLE trades ADD COLUMN fill_price REAL"),
             ("triggered_at",  "ALTER TABLE trades ADD COLUMN triggered_at INTEGER"),
+            # task#77: 出場偵測檢查點 — 上次已掃到的「最後一根已確認 5m bar」的 ts。
+            #   trade_monitor 每輪改抓「自此 ts 以來」的全部已確認 bar（治 poll 窗盲區），
+            #   只在成功抓到 K 線後前進。NULL（舊資料/首輪）→ 退回真實成交起點 entry_at。
+            ("last_checked_ts", "ALTER TABLE trades ADD COLUMN last_checked_ts INTEGER"),
         ):
             if col not in existing:
                 conn.execute(ddl)
@@ -646,6 +655,25 @@ def record_leg(trade_id: int, leg_label: str, size_pct: float,
             raise ValueError(
                 f"trade {trade_id} status={status}, only 'open' can record legs "
                 f"(signal 未確認/已略過的訊號不能平倉)")
+
+        # task#77 冪等保險：監控腿（tp1/2/3/stop/timeout）每筆單每型只該記一次。
+        #   正常流程已由 legs_hit（get_open_trades 從 trade_legs 重建）阻止重抓重記；
+        #   此為「檢查點式 gap-fill」時代的縱深防禦——萬一檢查點未推進、下輪重抓到同一根
+        #   已確認 bar，也不會把同一條腿記第二次（雙倍 size/PnL）。手動腿不受限（沿用原行為）。
+        if leg_label in _MONITOR_LEG_LABELS:
+            dup = conn.execute(
+                "SELECT 1 FROM trade_legs WHERE trade_id=? AND leg_label=? LIMIT 1",
+                (trade_id, leg_label)).fetchone()
+            if dup:
+                cur_pct, cur_pnl = conn.execute(
+                    "SELECT COALESCE(SUM(size_pct),0), COALESCE(SUM(pnl_usd),0) "
+                    "FROM trade_legs WHERE trade_id=?", (trade_id,)).fetchone()
+                return {"trade_id": trade_id, "leg_label": leg_label,
+                        "leg_pnl_usd": 0.0, "leg_r": 0.0, "duplicate_skipped": True,
+                        "cumulative_pct": round(cur_pct, 2),
+                        "cumulative_pnl_usd": round(cur_pnl, 2),
+                        "trade_status": "closed" if cur_pct >= 0.999 else "open"}
+
         sl_distance = abs(entry_price - stop_price)
 
         # 算 leg R
@@ -1093,7 +1121,7 @@ def get_open_trades() -> list[dict]:
         rows = conn.execute(
             "SELECT id, symbol, setup, direction, entry_price, stop_price, "
             "tp1, tp2, tp3, risk_usd, leverage, margin_usd, entry_at, tg_message_id, "
-            "entry_kind "
+            "entry_kind, last_checked_ts "
             "FROM trades WHERE status='open' ORDER BY entry_at"
         ).fetchall()
         out = []
@@ -1114,8 +1142,26 @@ def get_open_trades() -> list[dict]:
                 "entry_kind": r[14] or "direct_fire",   # v41: 教練追高偵測用
                 "legs_hit": list(hit_labels),
                 "size_remaining": round(1.0 - total_size_hit, 3),
+                "last_checked_ts": r[15],   # task#77 出場偵測檢查點
             })
         return out
+    finally:
+        conn.close()
+
+
+def set_trade_checkpoint(trade_id: int, ts_ms: int) -> None:
+    """task#77：推進出場偵測檢查點到「最後一根已確認 5m bar」的 ts。
+
+    僅在本輪成功抓到 bar 後呼叫；抓取失敗時不呼叫（檢查點不前進＝下輪自然重抓
+    同一段窗，no silent loss）。寫前比大小，永不倒退（防亂序/重抓把檢查點拉回）。
+    """
+    conn = _conn()
+    try:
+        conn.execute(
+            "UPDATE trades SET last_checked_ts=? "
+            "WHERE id=? AND (last_checked_ts IS NULL OR last_checked_ts < ?)",
+            (int(ts_ms), trade_id, int(ts_ms)),
+        )
     finally:
         conn.close()
 

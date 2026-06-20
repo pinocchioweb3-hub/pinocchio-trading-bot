@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .trade_journal import get_open_trades, record_leg
+from .trade_journal import get_open_trades, record_leg, set_trade_checkpoint
 
 
 # TP 分批比例（必須加總 = 1.0）— v23-2: botconfig 同源
@@ -80,6 +80,73 @@ async def _get_recent_5m_bars(source, symbol: str, n: int = 4) -> dict[str, Any]
     except Exception as e:
         print(f"[trade_monitor] fetch 5m {symbol} error: {type(e).__name__}: {e}")
         return None
+
+
+# task#77：出場偵測「檢查點式 gap-fill」常數與輔助。
+#   舊版每輪只抓最近 4 根 5m K（20 分鐘窗）；poll 間隔 15 分鐘穩態下雖無盲區，但
+#   「漏一輪 poll／抓取暫時失敗」就讓事件捲出窗永久全盲（漏記 TP/SL）。改成每筆各自
+#   記「最後一根已確認 bar」的檢查點，每輪抓自檢查點之後的所有已確認 bar。
+FIVE_MIN_MS = 5 * 60 * 1000
+SINCE_FETCH_CAP = 300   # 單次 get_candles 上限（OKX 公開端點上限亦 300）≈ 25h 連續窗
+
+
+async def _get_bars_since(source, symbol: str, since_ms: int, *,
+                          cap: int = SINCE_FETCH_CAP) -> dict[str, Any] | None:
+    """抓「自 since_ms 之後的所有已確認 5m bar」。
+
+    依 gap 推算根數（多取 3 根 buffer 涵蓋成形 bar 與 rounding），單次上限 cap 根。
+    回 None＝抓取失敗（呼叫端不推進檢查點＝下輪自然重抓同段窗，no silent loss）。
+    回 dict：
+      candles            只含 confirm 且 ts>since_ms 的 bar（升序，成形 bar 已剔除）
+      latest_confirmed_ts 本批最後一根已確認 bar 的 ts（推進檢查點用；無新 bar→None）
+      gap_exceeded       gap 超過單次 cap：本輪只掃最近 cap 根窗、檢查點隨之跳至最新，
+                         缺口較舊的那一段（since 起算至約 cap 窗之前）【不】自動回補
+                         （需誠實 log 供人工複查；no silent cap）。
+                         註：常態運行下這段更舊區間多已被前幾輪即時涵蓋過（每 15min 一掃），
+                         只有「停機 > cap 窗」的長離線才可能真漏，故誠實留痕勝過假裝補齊。
+    """
+    now_ms = int(time.time() * 1000)
+    gap_ms = max(0, now_ms - int(since_ms))
+    need = gap_ms // FIVE_MIN_MS + 3
+    gap_exceeded = need > cap
+    limit = max(4, min(need, cap))
+    d = await _get_recent_5m_bars(source, symbol, n=limit)
+    if not d:
+        return None
+    raw = d.get("candles") or []
+    # 只納「已確認」且「晚於檢查點」的 bar：成形 bar 的 high/low 仍會變（下輪確認後再判）；
+    # ts>since_ms 嚴格大於＝不重判檢查點那根（已在上輪保守處理過，防重複入帳）。
+    bars = [b for b in raw
+            if b.get("confirm", True) and b.get("ts", 0) > int(since_ms)]
+    latest_ts = bars[-1]["ts"] if bars else None
+    return {"candles": bars, "latest_confirmed_ts": latest_ts,
+            "gap_exceeded": gap_exceeded}
+
+
+def _fill_start_from_splits(entry_splits_json, entry_at: int) -> int:
+    """split 單真實成交起點＝最早 filled_at；full 單（無 splits）＝entry_at。
+
+    ⚠️絕不用計畫 entry_at 當 split 單的走訪起點——那會在「掛單成立前」的 bar 上誤判
+    SL/TP（前一個 agent 誤判 +11.41R 幽靈 TP 的根因）。檢查點為 NULL（既有列/首輪）時用此退路。
+    """
+    if not entry_splits_json:
+        return entry_at
+    try:
+        splits = (json.loads(entry_splits_json)
+                  if isinstance(entry_splits_json, str) else entry_splits_json)
+    except Exception:
+        return entry_at
+    fts = [s["filled_at"] for s in splits
+           if isinstance(s, dict) and s.get("filled") and s.get("filled_at")]
+    return min(fts) if fts else entry_at
+
+
+def _resolve_since(trade: dict) -> int:
+    """本輪該從哪個 ts 之後抓 bar：優先檢查點；NULL（既有列/首輪）退回真實成交起點。"""
+    ckpt = trade.get("last_checked_ts")
+    if ckpt:
+        return int(ckpt)
+    return _fill_start_from_splits(trade.get("entry_splits"), trade["entry_at"])
 
 
 def _resolve_pt_alloc(pt: dict) -> dict | None:
@@ -203,18 +270,31 @@ async def monitor_once(source, tg=None, tg_fire=None, tg_us=None,
                  None = 不跑教練（selftest 路徑保持純粹）。"""
     opens = get_open_trades()
     events: list[MonitorEvent] = []
-    bars_cache: dict[str, list] = {}  # v16: 實倉/紙上共用同輪 K 線
+    # task#77：實倉/紙上不再共用「同符號一個窗」——每筆各自依檢查點抓自己的窗。
+    #   bars_cache 僅留給 pending/waiting 子流程（各自抓 n=4/n=1）；coach_bars 給教練層。
+    bars_cache: dict[str, list] = {}
+    coach_bars: dict[str, list] = {}
 
     for trade in opens:
         sym = trade["symbol"]
-        # 抓 5m bars（最近 4 根 = 20 分鐘窗口）
-        d = await _get_recent_5m_bars(source, sym, n=4)
-        if not d:
-            continue
-        bars = d["candles"]
-        if not bars:
-            continue
-        bars_cache[sym] = bars
+        # task#77：自檢查點（last_checked_ts；NULL→真實成交起點）抓「所有已確認 5m bar」，
+        #   取代舊版固定 4 根 20 分鐘窗 — 修「漏 poll／抓取暫時失敗時事件捲出窗永久全盲」。
+        since = _resolve_since(trade)
+        res = await _get_bars_since(source, sym, since)
+        if res is None:
+            continue  # 抓取失敗：不推進檢查點，下輪自然重抓同段窗（no silent loss）
+        bars = res["candles"]
+        if res.get("gap_exceeded"):
+            print(f"[trade_monitor] ⚠️ {sym} trade#{trade['id']} 缺口>{SINCE_FETCH_CAP}根"
+                  f"（≈25h，超單次抓取上限）：本輪只掃最近 {SINCE_FETCH_CAP} 根、檢查點跳至最新，"
+                  f"缺口較舊的那一段（since 起算至約 25h 前）不自動回補"
+                  f"（多已於常態運行即時涵蓋過），如疑漏請人工複查（no silent cap）")
+        if bars:
+            coach_bars[sym] = bars  # 教練層取最新已確認收盤（教練無自抓退路）
+
+        # task#77：本輪是否有任一腿入帳失敗？只要有，就不推進檢查點，下輪重抓同段重試。
+        # （record_leg 對 monitor 腿有 SELECT-before-INSERT 去重，重試不會重複入帳。）
+        book_failed = False
 
         # === TP/Stop 檢查 ===
         triggered = _check_trade(trade, bars)
@@ -239,12 +319,14 @@ async def monitor_once(source, tg=None, tg_fire=None, tg_us=None,
                 trade["legs_hit"].append(event_label)
                 trade["size_remaining"] = round(trade["size_remaining"] - size_pct, 3)
             except Exception as e:
+                book_failed = True
                 print(f"[trade_monitor] record_leg {sym} {event_label} error: {e}")
 
         # === Timeout 檢查（在 TP/SL 之後，因為若已部分 TP 不應 timeout 全部）===
         remain = _check_timeout(trade)
-        if remain is not None and remain > 0.001:
-            # 用最後一根 close 作 exit price（timeout = 平倉收掉）
+        if remain is not None and remain > 0.001 and bars:
+            # 用最後一根 close 作 exit price（timeout = 平倉收掉）；無新 bar 則本輪不平，
+            # timeout 是 wall-clock，下輪有 bar 時自然補平（不在無價時硬平）。
             last_close = bars[-1]["close"]
             try:
                 result = record_leg(
@@ -263,7 +345,14 @@ async def monitor_once(source, tg=None, tg_fire=None, tg_us=None,
                     tg_message_id=trade.get("tg_message_id"),
                 ))
             except Exception as e:
+                book_failed = True
                 print(f"[trade_monitor] record_leg {sym} timeout error: {e}")
+
+        # task#77：本輪成功抓到 bar「且所有腿都入帳成功」才推進檢查點到最後一根已確認 bar。
+        #   抓取失敗已 continue；入帳失敗（如 WAL 鎖逾時）則保留舊檢查點 → 下輪重抓同段重試，
+        #   靠 record_leg 去重避免重複入帳 → 杜絕「腿沒入帳但檢查點已跳過 → 永久漏記」。
+        if res.get("latest_confirmed_ts") and not book_failed:
+            set_trade_checkpoint(trade["id"], res["latest_confirmed_ts"])
 
     # === 推 Telegram 通知 ===
     if tg and events:
@@ -288,7 +377,7 @@ async def monitor_once(source, tg=None, tg_fire=None, tg_us=None,
     # === v41: 教練層（task #8 ⑤）— 凹單/追高/重壓/連續開倉的當下踩煞車 ===
     if coach_state is not None and tg is not None:
         try:
-            await _run_coach(tg, bars_cache, coach_state)
+            await _run_coach(tg, coach_bars, coach_state)
         except Exception as e:
             print(f"[trade_monitor] coach error: {type(e).__name__}: {e}")
 
@@ -471,7 +560,7 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
     v23-2 美股斷層修復：us_breakout 的事件發 tg_us（🇺🇸 美股主題）—
     進場通知在哪、出場事件就在哪；加密事件留 tg（📈 持倉與績效）。"""
     from .paper_journal import (apply_entry_fill, apply_paper_event, expire_pending,
-                                convert_pending_to_market,
+                                convert_pending_to_market, set_paper_checkpoint,
                                 get_open_paper, get_paper_stats, get_pending_entries)
 
     # v26: 先檢查分批限價單的進場成交 — 達到某格區間就推「進場進度」到持倉主題
@@ -559,38 +648,61 @@ async def _monitor_paper(source, tg, bars_cache: dict[str, list],
     us_lines: list[str] = []
     for pt in papers:
         sym = pt["symbol"]
-        bars = bars_cache.get(sym)
-        if bars is None:
-            d = await _get_recent_5m_bars(source, sym, n=4)
-            bars = d["candles"] if d and d.get("candles") else None
-            bars_cache[sym] = bars or []
-        if not bars:
-            continue
+        # task#77：每筆紙上倉用自己的檢查點抓「所有已確認 5m bar」（NULL→真實成交起點；
+        #   split 單取 min(filled_at)＝防幽靈 TP）。不走共用 bars_cache，避免同符號多筆
+        #   紙上倉的檢查點互相污染。
+        since = _resolve_since(pt)
+        res = await _get_bars_since(source, sym, since)
+        if res is None:
+            continue  # 抓取失敗：不推進檢查點，下輪自然重抓同段窗
+        bars = res["candles"]
+        if res.get("gap_exceeded"):
+            print(f"[trade_monitor] ⚠️ {sym} paper#{pt['id']} 缺口>{SINCE_FETCH_CAP}根"
+                  f"（≈25h，超單次抓取上限）：本輪只掃最近 {SINCE_FETCH_CAP} 根、檢查點跳至最新，"
+                  f"缺口較舊的那一段（since 起算至約 25h 前）不自動回補"
+                  f"（多已於常態運行即時涵蓋過），如疑漏請人工複查（no silent cap）")
 
         is_us = pt.get("setup", "") == "us_breakout"
         lines = us_lines if is_us else paper_lines
 
+        # task#77：每筆紙上倉獨立把關——入帳失敗則此筆本輪不推進檢查點（下輪重抓同段重試，
+        #   apply_paper_event 對 monitor 腿有 csv 去重保護），但其他紙上倉照常處理（不被一筆拖垮）。
+        book_failed = False
+
         # TP/SL（與實倉同一套純函式）；紙上額外帶桶級 TP 分配覆寫（task#53）
         for label, price, size in _check_trade(pt, bars, _resolve_pt_alloc(pt)):
-            r = apply_paper_event(pt["id"], label, size, price)
-            icon = "🎯" if label.startswith("tp") else "🛑"
-            closed_str = "（已平倉）" if r["closed"] else ""
-            lines.append(
-                f"{icon} {sym} {pt['direction']} {label.upper()} "
-                f"{r['leg_r']:+.2f}R{closed_str}"
-                f"{_signal_link(tg, pt.get('signal_msg_id'))}")
-            pt["legs_hit"].append(label)
-            pt["size_remaining"] = round(pt["size_remaining"] - size, 3)
+            try:
+                r = apply_paper_event(pt["id"], label, size, price)
+                icon = "🎯" if label.startswith("tp") else "🛑"
+                closed_str = "（已平倉）" if r["closed"] else ""
+                lines.append(
+                    f"{icon} {sym} {pt['direction']} {label.upper()} "
+                    f"{r['leg_r']:+.2f}R{closed_str}"
+                    f"{_signal_link(tg, pt.get('signal_msg_id'))}")
+                pt["legs_hit"].append(label)
+                pt["size_remaining"] = round(pt["size_remaining"] - size, 3)
+            except Exception as e:
+                book_failed = True
+                print(f"[trade_monitor] apply_paper_event {sym} {label} error: {e}")
 
         # timeout（v17: per-setup 時限，美股突破 24h）
         hold_max = HOLD_MAX_BY_SETUP.get(pt.get("setup", ""), DEFAULT_HOLD_MAX_HOURS)
         remain = _check_timeout(pt, hold_max)
-        if remain is not None and remain > 0.001:
+        if remain is not None and remain > 0.001 and bars:
             last_close = bars[-1]["close"]
-            r = apply_paper_event(pt["id"], "timeout", remain, last_close)
-            lines.append(
-                f"⏰ {sym} {pt['direction']} TIMEOUT {r['leg_r']:+.2f}R（已平倉）"
-                f"{_signal_link(tg, pt.get('signal_msg_id'))}")
+            try:
+                r = apply_paper_event(pt["id"], "timeout", remain, last_close)
+                lines.append(
+                    f"⏰ {sym} {pt['direction']} TIMEOUT {r['leg_r']:+.2f}R（已平倉）"
+                    f"{_signal_link(tg, pt.get('signal_msg_id'))}")
+            except Exception as e:
+                book_failed = True
+                print(f"[trade_monitor] apply_paper_event {sym} timeout error: {e}")
+
+        # task#77：本輪成功抓到 bar「且所有腿都入帳成功」才推進檢查點（抓取失敗已 continue；
+        #   入帳失敗則保留舊檢查點 → 下輪重抓同段重試，靠去重避免重複入帳）。
+        if res.get("latest_confirmed_ts") and not book_failed:
+            set_paper_checkpoint(pt["id"], res["latest_confirmed_ts"])
 
     # 加密事件 → 📈 持倉與績效（Stage 0 門檻只算加密引擎）
     if paper_lines and tg is not None:

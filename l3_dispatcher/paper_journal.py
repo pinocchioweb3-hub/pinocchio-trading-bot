@@ -25,6 +25,11 @@ from botconfig import CONFIG as _CFG
 
 RISK_USD = _CFG.risk_per_trade_usd  # 紙上 1R，與訊號設計一致
 
+# task#77：由 trade_monitor 寫入的出場 leg 標籤（每筆每型只該記一次）。用於
+# apply_paper_event 的冪等去重——at-least-once 輪詢若同一根 bar 被重抓，
+# 同一 leg 不得重複 append 進 legs_hit（雙倍扣 size/PnL）。
+_MONITOR_LEG_LABELS = ("tp1", "tp2", "tp3", "stop", "timeout")
+
 
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, isolation_level=None)
@@ -80,6 +85,8 @@ def init_db() -> None:
             #   None / 'limit_expire'=現行深限價可到期(預設)。只驅動 paper/demo 掛單行為，
             #   真錢執行層永不讀（紅線①）。供 trade_monitor 在掛單到期時決定「轉市價或作廢」。
             ("entry_policy_kind", "ALTER TABLE paper_trades ADD COLUMN entry_policy_kind TEXT"),
+            # task#77: 出場偵測檢查點 — 上次已掃到的「最後一根已確認 5m bar」的 ts（epoch ms）。
+            ("last_checked_ts", "ALTER TABLE paper_trades ADD COLUMN last_checked_ts INTEGER"),
         ):
             if col not in existing:
                 try:
@@ -452,7 +459,7 @@ def get_open_paper() -> list[dict]:
         rows = conn.execute(
             "SELECT id, symbol, setup, direction, entry_price, stop_price, "
             "tp1, tp2, tp3, entry_at, legs_hit, size_remaining, entry_filled_pct, "
-            "signal_msg_id, tp_alloc "
+            "signal_msg_id, tp_alloc, last_checked_ts, entry_splits "
             "FROM paper_trades WHERE status='open' AND entry_state != 'pending' ORDER BY entry_at",
         ).fetchall()
         out = []
@@ -469,8 +476,27 @@ def get_open_paper() -> list[dict]:
                 "tg_message_id": None,
                 "signal_msg_id": r[13],
                 "tp_alloc": r[14],
+                "last_checked_ts": r[15],   # task#77 出場偵測檢查點
+                "entry_splits": r[16],      # task#77 split 單 fill-start 退路用
             })
         return out
+    finally:
+        conn.close()
+
+
+def set_paper_checkpoint(paper_id: int, ts_ms: int) -> None:
+    """task#77：推進紙上倉的出場偵測檢查點到「最後一根已確認 5m bar」的 ts。
+
+    僅在本輪成功抓到 bar 後呼叫；抓取失敗不呼叫（下輪自然重抓同段窗，no silent loss）。
+    寫前比大小，永不倒退。
+    """
+    conn = _conn()
+    try:
+        conn.execute(
+            "UPDATE paper_trades SET last_checked_ts=? "
+            "WHERE id=? AND (last_checked_ts IS NULL OR last_checked_ts < ?)",
+            (int(ts_ms), paper_id, int(ts_ms)),
+        )
     finally:
         conn.close()
 
@@ -491,6 +517,15 @@ def apply_paper_event(paper_id: int, leg_label: str, size_pct: float,
         direction, entry, stop, legs_csv, size_rem, pnl, status, filled_pct = row
         if status != "open":
             return {"closed": True, "total_pnl": pnl, "leg_r": 0, "leg_pnl": 0}
+
+        # task#77 冪等保險：監控腿每筆每型只該記一次。正常流程已由 legs_hit（get_open_paper
+        #   從 legs_hit csv 重建）阻止重抓重記；此為「檢查點式 gap-fill」時代的縱深防禦——
+        #   萬一同一根已確認 bar 被下輪重抓，同一 leg 不會二次 append（雙倍扣 size/PnL）。
+        if leg_label in _MONITOR_LEG_LABELS:
+            existing_legs = [x for x in (legs_csv or "").split(",") if x]
+            if leg_label in existing_legs:
+                return {"closed": status != "open", "total_pnl": round(pnl, 2),
+                        "leg_r": 0.0, "leg_pnl": 0.0, "duplicate_skipped": True}
 
         sl_dist = abs(entry - stop)
         leg_r = ((exit_price - entry) if direction == "bull"
