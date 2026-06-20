@@ -2,10 +2,11 @@
 
 設計：
 - 每 15 分鐘掃所有 status='open' trades
-- 對每筆，抓 OKX 5m 最近 4 根 candles（涵蓋 20 分鐘 = poll 間隔 + buffer）
-- 用 max(high)/min(low) 判定觸發點：
-    * bull：high ≥ tp1/2/3 → record_leg(tp, size)；low ≤ stop → record_leg(stop, remaining)
-    * bear：low ≤ tp1/2/3 → record_leg(tp, size)；high ≥ stop → record_leg(stop, remaining)
+- 對每筆，抓 OKX 5m 最近 4 根 candles（涵蓋 20 分鐘 = poll 間隔 + buffer，升序：最舊在前）
+- 逐根時序判定觸發點（v76/task#74：口徑對齊 backtest/simulator）：
+    * 同一根 SL 與 TP 皆觸 → 保守先判 stop（OHLC 看不出盤中先後，避免紙上 R 過度樂觀）
+    * stop 未觸該根：bull high ≥ tp1/2/3 / bear low ≤ tp1/2/3 → record_leg(tp, size)
+    * TP 在較早 K 線、stop 在較晚 K 線 → 兩者合法依序成立
 - 進場後超過 hold_max_hours 且未平倉 → record_leg(timeout, remaining)
 
 TP/SL 分批比例：
@@ -105,7 +106,8 @@ def _entry_fill_probe(bars: list[dict], direction: str,
                       entry_at_ms: int) -> float | None:
     """task#60 治本：分批限價單成交偵測的「有利極值」探針。
 
-    對齊 _check_trade 的 TP/SL 高低聚合與 backtest._try_limit_fill 的盤中觸價語意：
+    對齊 backtest._try_limit_fill 的盤中觸價語意（成交偵測「是否曾觸價」與先後無關，
+    故用整窗極值；這與 _check_trade 的 TP/SL「時序＋同根保守先判 stop」是不同問題）：
       • bull → 取進場後各 bar 的 min(low)（價跌到掛單即成交）
       • bear → 取進場後各 bar 的 max(high)（價漲到掛單即成交）
     舊版只看 bars[-1]['close']（最後收盤），會漏掉「窗內觸價、收盤又彈回」的真成交，
@@ -125,8 +127,12 @@ def _check_trade(trade: dict, bars: list[dict],
                  tp_size_pct: dict | None = None) -> list[tuple[str, float, float]]:
     """純函式：給定 trade + 5m bars，回所有應觸發的 (event_label, trigger_price, size_pct) tuples。
 
-    順序：先檢查 TP（依 entry 後價格高低）→ 再檢查 stop → 再檢查 timeout。
-    若已 hit 的 leg label 就跳過。
+    v76/task#74：逐根時序走訪（bars 升序），同一根 SL/TP 皆觸 → 保守先判 stop
+    （口徑對齊 backtest/simulator.py，避免 live paper R 曲線/勝率被同根雙觸灌水）。
+    已 hit 的 leg label 跳過；stop 後立即收手不再判後續 K 線。
+
+    註：此修不含 simulator 的「TP1 後止損移到開倉價(breakeven)」遷移；trade_monitor
+    紙上帳本沿用固定 stop（breakeven 只在 Telegram 對人的建議，未進帳本）。該口徑差另議。
 
     tp_size_pct: 每段 TP 比例覆寫 dict（紙上桶級覆寫）；None→用模組預設 TP_SIZE_PCT
     （實倉路徑永遠 None＝零行為變更）。
@@ -138,39 +144,42 @@ def _check_trade(trade: dict, bars: list[dict],
     if size_remaining <= 0.001:
         return []  # 已完全平倉
 
-    entry = trade["entry_price"]
     stop = trade["stop_price"]
     tps = {"tp1": trade.get("tp1"), "tp2": trade.get("tp2"), "tp3": trade.get("tp3")}
 
-    # 4 根 5m 的高低聚合（涵蓋 poll 間隔）
-    bar_high = max(b["high"] for b in bars)
-    bar_low = min(b["low"] for b in bars)
-
     events: list[tuple[str, float, float]] = []
 
-    # === TP 檢查（依序：TP1 → TP2 → TP3）===
-    for tp_label, tp_price in tps.items():
-        if tp_price is None or tp_label in legs_hit:
-            continue
-        size_pct = sizes[tp_label]
-        if direction == "bull" and bar_high >= tp_price:
-            events.append((tp_label, tp_price, size_pct))
-            legs_hit.add(tp_label)
-            size_remaining -= size_pct
-        elif direction == "bear" and bar_low <= tp_price:
-            events.append((tp_label, tp_price, size_pct))
-            legs_hit.add(tp_label)
-            size_remaining -= size_pct
-
-    # === Stop 檢查（剩餘全平）===
-    stop_triggered = False
-    if direction == "bull" and bar_low <= stop:
-        stop_triggered = True
-    elif direction == "bear" and bar_high >= stop:
-        stop_triggered = True
-
-    if stop_triggered and "stop" not in legs_hit and size_remaining > 0.001:
-        events.append(("stop", stop, round(size_remaining, 3)))
+    # v76 治本（task#74）：逐根時序走訪，口徑對齊 backtest/simulator.py。
+    #   bars 已是升序（最舊在前；見 okx_candles 把 OKX 降序轉升序）。
+    #   舊版用 max(high)/min(low) 聚合整窗後「先記 TP、再記 stop」→ 同一根內 SL 與 TP
+    #   皆觸時，紙上記成「TP 部分獲利 + 剩餘止損」，但 OHLC 看不出盤中先後；backtest
+    #   (simulator.py:97「保守：同根先判 stop」) 對同一根記成「全止損」。兩者口徑不一致
+    #   → live paper R 曲線/勝率被系統性灌水（=紅線①實盤解鎖判據的統計基礎）。
+    #   修法＝同一根 SL/TP 皆觸 → 保守先判 stop（不記該根 TP）；TP 在較早 K 線（早於
+    #   stop 那根）則合法成立。純讓帳本更保守誠實，不碰策略/訊號數學、不碰真錢。
+    for b in bars:
+        hi, lo = b["high"], b["low"]
+        # --- 同根保守：先判 stop（盤中先後未知 → 假設先觸 stop，避免過度樂觀）---
+        stop_hit = ((direction == "bull" and lo <= stop)
+                    or (direction == "bear" and hi >= stop))
+        if stop_hit:
+            if "stop" not in legs_hit and size_remaining > 0.001:
+                events.append(("stop", stop, round(size_remaining, 3)))
+                size_remaining = 0.0
+            break  # stop 後該筆 trade 結束，後續 K 線不再判
+        # --- stop 未觸：本根依序判 TP1 → TP2 → TP3 ---
+        for tp_label, tp_price in tps.items():
+            if tp_price is None or tp_label in legs_hit:
+                continue
+            tp_hit = ((direction == "bull" and hi >= tp_price)
+                      or (direction == "bear" and lo <= tp_price))
+            if tp_hit:
+                size_pct = sizes[tp_label]
+                events.append((tp_label, tp_price, size_pct))
+                legs_hit.add(tp_label)
+                size_remaining -= size_pct
+        if size_remaining <= 0.001:
+            break  # 全部 TP 平完
 
     return events
 
