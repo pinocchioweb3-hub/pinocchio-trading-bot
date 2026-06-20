@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import sqlite3
 import time
 
-from botpaths import db_path as _db_path
+from botpaths import data_dir, db_path as _db_path
 
 from . import decision_registry as _dec
 from . import outbox as _outbox
@@ -367,28 +368,95 @@ def build_ceo_brief() -> str:
 # ===========================================================================
 # Worker 主迴圈
 # ===========================================================================
-async def run_ceo_loop(tg, target_hour_utc: int = 1):
-    """每日一次彙整簡報（預設 01:00 UTC = 09:00 台北，接在晨間宏觀之後）。"""
-    print("[ceo_session] loop online（每日 CEO 彙整簡報）")
+# ── task#79：每日 CEO 簡報啟動補跑（與 task#78 auto_tuner 同 bug-class 治本）──────────
+# 根因：舊 run_ceo_loop 只在每日固定 01:00 UTC 觸發、無補跑、無 run_on_startup；daemon 因
+# 開發迭代＋watchdog 頻繁重啟，幾乎從不存活滿一天剛好跨過該秒 → 每日 CEO 彙整簡報幾乎從不
+# 可靠送達。治本＝以 UTC 日期戳記持久化「今日是否已送」，啟動暖機後若今日尚未送且已過觸發點
+# 則『立即補送一次』，之後回正常每日節奏；至多每 UTC 日一次（不像 daily_macro 那樣每次重啟都
+# 推，避免洗版）。純內部簡報（送使用者自己的 TG），非對外、非真錢，無紅線。
+_CEO_STATE_NAME = "ceo_session_state.json"
+_WARMUP_S_DEFAULT = 300
+
+
+def _now_utc() -> dt.datetime:
+    """UTC 現在（抽成函式供測試注入；勿用本地時間）。"""
+    return dt.datetime.now(tz=dt.timezone.utc)
+
+
+def _ceo_state_path():
+    return data_dir() / _CEO_STATE_NAME
+
+
+def _load_last_brief_date() -> str | None:
+    """上次 CEO 簡報送出的 UTC 日期字串（YYYY-MM-DD），無則 None。讀失敗→None（保守＝會補送）。"""
+    try:
+        d = json.loads(_ceo_state_path().read_text(encoding="utf-8"))
+        v = d.get("last_brief_date")
+        return v if isinstance(v, str) else None
+    except Exception:
+        return None
+
+
+def _stamp_brief_date(date_str: str) -> None:
+    """戳記今日已送（UTC 日期）。寫失敗只印警告、不擋流程（最壞＝重啟後多補送一次，可接受）。"""
+    try:
+        p = _ceo_state_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"last_brief_date": date_str}, ensure_ascii=False),
+                     encoding="utf-8")
+    except Exception as e:
+        print(f"[ceo_session] 警告：寫入 brief 狀態失敗（不影響執行）：{type(e).__name__}: {e}")
+
+
+async def _send_ceo_brief(tg) -> None:
+    """產生並送出一次 CEO 簡報（純讀彙整 → 推使用者 TG）。例外只 log、不擋迴圈。"""
+    try:
+        brief = build_ceo_brief()
+        if tg is not None:
+            await tg.send_message(brief, parse_mode="HTML")
+            print("[ceo_session] brief sent")
+    except Exception as e:
+        print(f"[ceo_session] error: {type(e).__name__}: {e}")
+
+
+async def run_ceo_loop(tg, target_hour_utc: int = 1,
+                       warmup_seconds: float = _WARMUP_S_DEFAULT):
+    """每日一次彙整簡報（預設 01:00 UTC = 09:00 台北），含啟動補跑（task#79）。
+
+    控制流（至多每 UTC 日送一次）：
+      1. seed 已知待決策事項（idempotent）＋暖機 warmup_seconds（避開開機洗版）。
+      2. **啟動補跑**：若「今日(UTC)尚未送」且「已過今日觸發點 target_hour_utc」→ 立即補送一次
+         並戳記；解 daemon 在 01:00 UTC 之後才啟動／頻繁重啟而永遠跨不過觸發點的結構性失能。
+      3. 否則睡到下一個 target_hour_utc，醒來送、戳記當日，無限循環。
+    冪等：以 data_dir/ceo_session_state.json 的 last_brief_date(UTC) 去重；狀態檔遺失最壞只多
+    補送一次（可接受，純內部簡報）。
+    """
+    print("[ceo_session] loop online（每日 CEO 彙整簡報；含啟動補跑 task#79）")
     # 啟動時把已知待決策事項種進佇列（idempotent）
     try:
         _dec.seed_known_decisions()
     except Exception as e:
         print(f"[ceo_session] seed decisions error: {type(e).__name__}: {e}")
-    await asyncio.sleep(300)  # 啟動後延後，避開開機洗版
+    if warmup_seconds:
+        await asyncio.sleep(warmup_seconds)  # 啟動後延後，避開開機洗版
     while True:
-        now = dt.datetime.now(tz=dt.timezone.utc)
+        now = _now_utc()
+        today = now.date().isoformat()
+        sent_today = (_load_last_brief_date() == today)
+        past_fire = now.hour >= target_hour_utc
+        if past_fire and not sent_today:
+            # 啟動補送：今日已過觸發點但尚未送（多因 daemon 在 01:00 UTC 後才起／剛重啟）
+            print(f"[ceo_session] 啟動補送：{today} 今日尚未送出 CEO 簡報（已過 {target_hour_utc:02d}:00 UTC）")
+            await _send_ceo_brief(tg)
+            _stamp_brief_date(today)
+            continue  # 重算下一觸發點（此時 sent_today 已 True → 走排程睡眠分支）
+        # 排程睡眠到下一個 target_hour_utc
         nxt = now.replace(hour=target_hour_utc, minute=0, second=0, microsecond=0)
         if nxt <= now:
             nxt += dt.timedelta(days=1)
         await asyncio.sleep((nxt - now).total_seconds())
-        try:
-            brief = build_ceo_brief()
-            if tg is not None:
-                await tg.send_message(brief, parse_mode="HTML")
-                print("[ceo_session] brief sent")
-        except Exception as e:
-            print(f"[ceo_session] error: {type(e).__name__}: {e}")
+        await _send_ceo_brief(tg)
+        _stamp_brief_date(_now_utc().date().isoformat())
 
 
 if __name__ == "__main__":
