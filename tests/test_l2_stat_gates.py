@@ -318,6 +318,157 @@ def test_no_daemon_or_network_imports():
     assert not bad, f"L2 閘門應純離線，不該 import：{bad}"
 
 
+# --- 12. task#80 i.i.d. 獨立性 fail-safe（n_eff／叢聚校正）：只會更嚴或不變 ---
+from backtest.independence import _utc_day_key as _udk  # noqa: E402
+
+_DAY_MS = 86_400_000
+
+
+def _iid_returns_days(n: int, *, mean=0.2, sd=1.0, seed=0):
+    """每筆各自一天、彼此獨立（i.i.d. 版面）→ ICC≈0、n_eff≈n、不罰。"""
+    random.seed(seed)
+    rr = [random.gauss(mean, sd) for _ in range(n)]
+    days = [_udk(i * _DAY_MS) for i in range(n)]
+    return rr, days
+
+
+def _day_correlated(n_days: int, per_day: int, *, mean=0.4, day_sd=1.0,
+                    noise_sd=0.3, seed=0):
+    """真同日共振：每日一個 shock + 小幅個別雜訊 → 高 ICC → n_eff ≪ n。
+    （對照 _iid：僅『標籤』同日而值獨立時 ICC≈0、不罰——這正是本校正的核心。）"""
+    random.seed(seed)
+    rr: list[float] = []
+    days: list[str] = []
+    for d in range(n_days):
+        shock = random.gauss(mean, day_sd)
+        for _ in range(per_day):
+            rr.append(shock + random.gauss(0.0, noise_sd))
+            days.append(_udk(d * _DAY_MS))
+    return rr, days
+
+
+def test_neff_iid_layout_no_penalty():
+    """真 i.i.d.（每筆各一天、值獨立）：ICC≈0、deff≈1、n_eff≈n —— 共用標籤≠相關。"""
+    rr, days = _iid_returns_days(40, seed=11)
+    n_eff, icc, deff, cov = g.effective_n(rr, days)
+    assert cov == 1.0
+    assert abs(icc) < 0.08 and abs(deff - 1.0) < 0.2
+    assert n_eff >= 34           # 幾乎不打折
+
+
+def test_neff_same_label_but_independent_no_penalty():
+    """關鍵性質：值獨立、僅『標籤』每 10 筆同日 → ICC≈0、n_eff≈n（不因標籤受罰）。"""
+    random.seed(120)
+    rr = [random.gauss(0.2, 1.0) for _ in range(40)]
+    days = [_udk((i // 10) * _DAY_MS) for i in range(40)]
+    n_eff, icc, deff, cov = g.effective_n(rr, days)
+    assert icc < 0.15 and n_eff >= 30      # 共用標籤不等於相關
+
+
+def test_neff_clustered_shrinks():
+    """真同日共振：n_eff 嚴格 ≪ 名目 n、deff>1、ICC 高。"""
+    rr, days = _day_correlated(4, 10, seed=12)   # 40 筆、4 天
+    n_eff, icc, deff, cov = g.effective_n(rr, days)
+    assert n_eff < 40 and deff > 1.0 and icc > 0.5
+    assert n_eff < 30
+
+
+def test_psr_with_n_only_stricter():
+    """psr_with_n（n_eff≤n）≤ 名目 psr；i.i.d. 版面下兩者幾乎相等。"""
+    rr, days = _day_correlated(4, 10, seed=13)
+    p_nom = g.psr(rr, 0.0)
+    neff_c, *_ = g.effective_n(rr, days)
+    p_clu = g.psr_with_n(rr, neff_c, 0.0)
+    assert p_clu <= p_nom + 1e-9                  # 叢聚 → 更不顯著
+    rr_i, days_i = _iid_returns_days(40, mean=0.25, seed=130)
+    neff_i, *_ = g.effective_n(rr_i, days_i)
+    p_iid = g.psr_with_n(rr_i, neff_i, 0.0)
+    assert abs(p_iid - g.psr(rr_i, 0.0)) < 0.03   # i.i.d. → 幾乎不變
+
+
+def test_deflated_sharpe_n_only_stricter():
+    """叢聚校正 DSR ≤ 名目 DSR（n_eff≪n 時）。"""
+    rr, days = _day_correlated(4, 10, seed=14)
+    neff, *_ = g.effective_n(rr, days)
+    d_nom = g.deflated_sharpe(rr, 5, 0.05)
+    d_clu = g.deflated_sharpe_n(rr, 5, 0.05, n_eff=neff)
+    assert d_clu is not None and d_clu <= d_nom + 1e-9
+    # n_trials<=1 退化為 psr_with_n(0)
+    assert g.deflated_sharpe_n(rr, 1, None, n_eff=neff) == g.psr_with_n(rr, neff, 0.0)
+    # n_eff None → 回 None（呼叫端退名目）
+    assert g.deflated_sharpe_n(rr, 5, 0.05, n_eff=None) is None
+
+
+def test_gate_min_trl_neff_second_floor():
+    """治本要點：名目 n≥30 過第一道地板，但 n_eff<30 仍 fail-closed（時間炸彈拆除）。
+
+    第二道地板邏輯只吃 n_eff（float），不依賴「資料→n_eff」推導，故此處用高 SR
+    的 i.i.d. 樣本讓名目過第一道，再「顯式」餵 n_eff<30 觸發第二道——把地板邏輯與
+    推導解耦。資料→n_eff 的推導另由 test_neff_clustered_shrinks 證明；整條整合路徑
+    （真 day_keys→推導 n_eff→閘擋下）由 test_evaluate_candidate_clustered_only_tightens 證明。
+    """
+    random.seed(21)
+    rr = [random.gauss(0.5, 0.35) for _ in range(40)]      # 高 SR → 名目 mtrl≪40
+    g_nom = g.gate_min_trl(rr)                             # 無 n_eff＝今日行為
+    assert g_nom.passed is True                            # 名目 n=40 會過第一道
+    g_clu = g.gate_min_trl(rr, 23.0)                       # 顯式 n_eff<30
+    assert g_clu.passed is False                           # 第二道地板擋下
+    assert "n_eff" in g_clu.detail
+    # n_eff=None 時與舊行為逐欄一致（零行為改變保證）
+    assert (g_nom.passed, g_nom.stat) == (g.gate_min_trl(rr, None).passed,
+                                          g.gate_min_trl(rr, None).stat)
+
+
+def test_gate_dsr_neff_only_stricter():
+    """gate_dsr 帶 n_eff 的統計值 ≤ 不帶（min(名目,校正)）。"""
+    rr, days = _day_correlated(5, 10, mean=0.3, seed=16)   # 50 筆
+    neff, *_ = g.effective_n(rr, days)
+    s_nom = g.gate_dsr(rr, 4, 0.04).stat
+    s_clu = g.gate_dsr(rr, 4, 0.04, neff).stat
+    assert s_clu <= s_nom + 1e-9
+
+
+def test_evaluate_candidate_day_keys_none_is_status_quo(tmp_path):
+    """day_keys=None → 與不傳逐關一致（zero behavior change today）。"""
+    random.seed(17)
+    rr = [random.gauss(0.4, 1.0) for _ in range(40)]
+    v_no = g.evaluate_candidate(_ledger(tmp_path / "a"), bucket_key="x|y",
+                                candidate_returns=rr, append=False)
+    v_none = g.evaluate_candidate(_ledger(tmp_path / "b"), bucket_key="x|y",
+                                  candidate_returns=rr, day_keys=None, append=False)
+    assert [x.passed for x in v_no.gates] == [x.passed for x in v_none.gates]
+    assert v_no.passed == v_none.passed
+
+
+def test_evaluate_candidate_clustered_only_tightens(tmp_path):
+    """真叢聚 day_keys 永不讓「名目擋下的」變過；且把名目會過的壓下（更嚴）。"""
+    rr, days = _day_correlated(4, 10, mean=0.6, seed=18)
+    v_nom = g.evaluate_candidate(_ledger(tmp_path / "c"), bucket_key="x|y",
+                                 candidate_returns=rr, append=False)
+    v_clu = g.evaluate_candidate(_ledger(tmp_path / "d"), bucket_key="x|y",
+                                 candidate_returns=rr, day_keys=days, append=False)
+    # 逐關只會「同或更嚴」：名目 fail 的關，叢聚不可能反過來 pass
+    for gn, gc in zip(v_nom.gates, v_clu.gates):
+        if not gn.passed:
+            assert not gc.passed, f"{gc.name} 叢聚校正後竟反向放寬"
+    # minTRL 名目會過，但叢聚 n_eff<30 → 被第二道地板壓下（實際更嚴的證據）
+    assert v_nom.gates[0].passed is True and v_clu.gates[0].passed is False
+    assert "n_eff" in v_clu.summary               # 透明
+
+
+def test_evaluate_candidate_mismatched_day_keys_falls_back(tmp_path):
+    """day_keys 長度對不齊 → fail-closed 退名目（與 None 同行為），不報錯。"""
+    random.seed(19)
+    rr = [random.gauss(0.4, 1.0) for _ in range(40)]
+    v_none = g.evaluate_candidate(_ledger(tmp_path / "e"), bucket_key="x|y",
+                                  candidate_returns=rr, day_keys=None, append=False)
+    v_bad = g.evaluate_candidate(_ledger(tmp_path / "f"), bucket_key="x|y",
+                                 candidate_returns=rr, day_keys=["2026-01-01"],
+                                 append=False)   # 長度 1 ≠ 40
+    assert [x.passed for x in v_bad.gates] == [x.passed for x in v_none.gates]
+    assert "n_eff" not in v_bad.summary           # 未啟用校正
+
+
 # helper（n_trials 累計測試用）
 def led_eval(led, bucket, cand, mat, hyp, ts):
     return g.evaluate_candidate(led, bucket_key=bucket, candidate_returns=cand,

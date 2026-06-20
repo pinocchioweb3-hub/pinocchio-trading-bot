@@ -61,6 +61,14 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         pass
 
 from backtest.validation import _moments, min_trl, psr, sharpe
+# 獨立性校正原語抽至共用葉模組（單一真相源；live L2 閘 l2_stat_gates.py 亦 import
+# 同一套，見 task#80）。此處 re-export 保留既有呼叫名（_psr_with_n）與測試。
+from backtest.independence import (  # noqa: F401  (re-export)
+    _icc_oneway,
+    _utc_day_key,
+    effective_n,
+    psr_with_n as _psr_with_n,
+)
 
 _NORM = NormalDist()
 
@@ -174,73 +182,7 @@ def real_money_count(db_path: str) -> int:
         con.close()
 
 
-# ── 獨立性校正（n_eff） ─────────────────────────────────────────────────────
-def _utc_day_key(entry_ms: int | None) -> str | None:
-    """epoch 毫秒 → 'YYYY-MM-DD'（UTC）；None/異常回 None。"""
-    if entry_ms is None:
-        return None
-    try:
-        d = _dt.datetime.fromtimestamp(entry_ms / 1000.0, tz=_dt.timezone.utc)
-        return d.strftime("%Y-%m-%d")
-    except (TypeError, ValueError, OverflowError, OSError):
-        return None
-
-
-def _icc_oneway(groups: list[list[float]]):
-    """單因子隨機效果 ICC(1)。groups＝各群的 R 值清單。
-    回 (icc∈[0,1], 平均群大小 m̄, 群數 k)。k<2 或退化 → icc=0。"""
-    groups = [g for g in groups if g]
-    k = len(groups)
-    total = sum(len(g) for g in groups)
-    if k < 2 or total <= k:
-        return 0.0, (total / k if k else 0.0), k
-    grand = sum(sum(g) for g in groups) / total
-    means = [sum(g) / len(g) for g in groups]
-    ssb = sum(len(g) * (means[i] - grand) ** 2 for i, g in enumerate(groups))
-    ssw = sum(sum((x - means[i]) ** 2 for x in g) for i, g in enumerate(groups))
-    msb = ssb / (k - 1)
-    msw = ssw / (total - k)
-    # n0＝不等群大小的有效平均（標準 one-way ANOVA 修正）
-    n0 = (total - sum(len(g) ** 2 for g in groups) / total) / (k - 1)
-    denom = msb + (n0 - 1) * msw
-    if denom <= 0:
-        return 0.0, total / k, k
-    icc = (msb - msw) / denom
-    return max(0.0, min(1.0, icc)), total / k, k
-
-
-def effective_n(returns: list[float], day_keys: list[str | None]):
-    """叢聚（按 UTC 日）校正後的有效獨立樣本數 n_eff。
-    回 (n_eff, icc, design_effect, coverage)；無法可靠估計時 n_eff=None。"""
-    n = len(returns)
-    paired = [(r, d) for r, d in zip(returns, day_keys) if d is not None]
-    coverage = (len(paired) / n) if n else 0.0
-    if n < 3 or coverage < 0.5:
-        return None, None, None, round(coverage, 3)
-    by_day: dict[str, list[float]] = {}
-    for r, d in paired:
-        by_day.setdefault(d, []).append(r)
-    icc, mbar, k = _icc_oneway(list(by_day.values()))
-    if k < 2:
-        return None, None, None, round(coverage, 3)
-    deff = 1.0 + (mbar - 1.0) * icc            # Kish design effect
-    deff = max(1.0, deff)
-    n_eff = len(paired) / deff
-    return round(n_eff, 1), round(icc, 3), round(deff, 2), round(coverage, 3)
-
-
-def _psr_with_n(returns: list[float], n_eff: float, sr_benchmark: float = 0.0):
-    """Bailey-LdP PSR 但以 n_eff 取代 len（叢聚校正版）。閉式同 validation.psr，
-    僅 sqrt(n-1)→sqrt(n_eff-1)。n_eff<2 回 None。"""
-    if len(returns) < 3 or n_eff is None or n_eff < 2:
-        return None
-    _, sd, skew, kurt = _moments(returns)
-    if sd == 0:
-        return None
-    sr = mean(returns) / sd
-    denom = sqrt(max(1e-12, 1 - skew * sr + ((kurt - 1) / 4) * sr * sr))
-    z = (sr - sr_benchmark) * sqrt(n_eff - 1) / denom
-    return round(_NORM.cdf(z), 4)
+# ── 獨立性校正（n_eff）── 見上方 re-export（backtest.independence）。 ──────────
 
 
 # ── 統計 ──────────────────────────────────────────────────────────────────

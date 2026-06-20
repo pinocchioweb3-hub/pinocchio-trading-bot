@@ -36,6 +36,8 @@ import sys
 from dataclasses import dataclass, field
 
 from botconfig import CONFIG
+# task#80：i.i.d. fail-safe — 把逐筆 UTC 日鍵餵給 L2 閘做叢聚校正（n_eff）。葉模組，無循環。
+from backtest.independence import _utc_day_key
 
 # v49：Windows 主控台預設 cp950，印 emoji/繁中會 UnicodeEncodeError → 強制 UTF-8
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -150,6 +152,24 @@ def replay_series(trades: list[dict], policy: AllocPolicy) -> tuple[list[float],
     return out, bad
 
 
+def _entry_ms(trade: dict) -> int | None:
+    """穩健取進場 epoch 毫秒（paper_trades.entry_at）；缺/壞值回 None。"""
+    v = trade.get("entry_at")
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _aligned_day_keys(trades: list[dict], policy: AllocPolicy) -> list[str | None]:
+    """與 replay_series 同步：只對「可回放(r 非 None)」的筆記其 UTC 日鍵，順序對齊
+    （task#80 i.i.d. fail-safe；replay_trade_r 為純函式 → 同份輸入決定論一致對齊）。"""
+    return [_utc_day_key(_entry_ms(t)) for t in trades
+            if replay_trade_r(t, policy) is not None]
+
+
 def _trade_alloc(trade: dict) -> AllocPolicy:
     """task#53(step8)：取「該筆當初記帳所用的分配」。
 
@@ -237,6 +257,7 @@ def compare_allocation(trades: list[dict], challenger: AllocPolicy, *,
     # 2) 逐筆對齊回放（兩配置皆可回放者才進矩陣，確保 PBO 同列同筆）
     aligned_champ: list[float] = []
     aligned_chal: list[float] = []
+    aligned_days: list[str | None] = []     # task#80：與 aligned_chal 逐筆對齊的 UTC 日鍵
     matrix: list[list[float]] = []
     n_unver = 0
     for t in trades:
@@ -247,6 +268,7 @@ def compare_allocation(trades: list[dict], challenger: AllocPolicy, *,
             continue
         aligned_champ.append(rc)
         aligned_chal.append(rh)
+        aligned_days.append(_utc_day_key(_entry_ms(t)))
         matrix.append([rc, rh])
 
     champ_mean = (sum(aligned_champ) / len(aligned_champ)) if aligned_champ else None
@@ -258,7 +280,8 @@ def compare_allocation(trades: list[dict], challenger: AllocPolicy, *,
         led, bucket_key=bucket_key, candidate_returns=aligned_chal,
         matrix=matrix if len(matrix) >= 2 and len(matrix[0]) >= 2 else None,
         hypothesis=hypothesis or f"alloc:{challenger.tp_alloc} vs {champ.tp_alloc}",
-        registered_at_ms=registered_at_ms, append=append_ledger)
+        registered_at_ms=registered_at_ms, day_keys=aligned_days,
+        append=append_ledger)
 
     better = (champ_mean is not None and chal_mean is not None and chal_mean > champ_mean)
     if not better:
@@ -313,6 +336,7 @@ def evaluate_selection(trades: list[dict], predicate, *, bucket_key: str,
     full_r, _ = replay_series(trades, pol)
     subset = [t for t in trades if _safe_pred(predicate, t)]
     subset_r, _ = replay_series(subset, pol)
+    subset_days = _aligned_day_keys(subset, pol)    # task#80：與 subset_r 同步對齊
 
     full_mean = (sum(full_r) / len(full_r)) if full_r else None
     subset_mean = (sum(subset_r) / len(subset_r)) if subset_r else None
@@ -321,7 +345,8 @@ def evaluate_selection(trades: list[dict], predicate, *, bucket_key: str,
     v = evaluate_candidate(
         led, bucket_key=bucket_key, candidate_returns=subset_r, matrix=None,
         hypothesis=hypothesis or "selection-filter",
-        registered_at_ms=registered_at_ms, append=append_ledger)
+        registered_at_ms=registered_at_ms, day_keys=subset_days,
+        append=append_ledger)
 
     return SelectionVerdict(
         bucket_key=bucket_key, n_full=len(full_r), n_subset=len(subset_r),

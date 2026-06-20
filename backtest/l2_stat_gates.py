@@ -63,6 +63,10 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         pass
 
 from backtest.validation import deflated_sharpe, min_trl, psr, sharpe
+# task#80：i.i.d. 獨立性 fail-safe。逐筆 R 若按同一 UTC 日叢聚（day-shock 共振）就非
+# i.i.d.，名目 n 會高估有效樣本 → PSR/DSR 過度自信、minTRL 低估 → 偏向「假晉升」。
+# 共用葉模組提供 n_eff/叢聚校正；day_keys 缺/對不齊時退回名目（只會更嚴或不變）。
+from backtest.independence import deflated_sharpe_n, effective_n, psr_with_n
 
 # ─── 門檻（只能調嚴；改動須同步通過 assert_thresholds_only_stricter）─────────
 MIN_BUCKET_N = 30        # bucket（如 幣×regime）內最少筆數，不足 fail-closed（只能調高）
@@ -396,27 +400,46 @@ class L2Verdict:
     summary: str = ""
 
 
-def gate_min_trl(returns: list[float]) -> GateResult:
+def gate_min_trl(returns: list[float], n_eff: float | None = None) -> GateResult:
     n = len(returns)
     if n < MIN_BUCKET_N:
         return GateResult("minTRL", False, float(n), float(MIN_BUCKET_N),
                           f"樣本 {n}<{MIN_BUCKET_N} → fail-closed（小樣本不准自欺）")
+    # task#80：第二道 fail-closed 地板——叢聚校正後的有效獨立樣本也須 ≥ 門檻。
+    # n_eff≤n 恆成立，故此閘只會更嚴（同日共振灌水的名目筆數不算數）。
+    if n_eff is not None and n_eff < MIN_BUCKET_N:
+        return GateResult("minTRL", False, round(n_eff, 1), float(MIN_BUCKET_N),
+                          f"n_eff {n_eff:.1f}<{MIN_BUCKET_N}（名目 {n} 筆按 UTC 日叢聚校正後）"
+                          " → fail-closed（同日共振不算獨立證據）")
     mtrl = min_trl(returns, 0.0, 0.95)
     if mtrl == float("inf"):
         return GateResult("minTRL", False, None, float(MIN_BUCKET_N),
                           "SR≤0 或無離散 → minTRL=∞（證不出 edge）")
-    passed = n >= mtrl
-    return GateResult("minTRL", passed, round(mtrl, 1), float(n),
-                      f"需 {mtrl:.0f} 筆才足以證明 SR>0；現有 {n} 筆"
+    # 達標筆數用「名目 n 與 n_eff 取較嚴者」比對 minTRL（叢聚時 n_eff 更小 → 更難達標）。
+    n_use = min(n, int(n_eff)) if n_eff is not None else n
+    passed = n_use >= mtrl
+    axis = f"n_eff取整={n_use}" if (n_eff is not None and int(n_eff) < n) else f"{n} 筆"
+    return GateResult("minTRL", passed, round(mtrl, 1), float(n_use),
+                      f"需 {mtrl:.0f} 筆才足以證明 SR>0；現有 {axis}"
                       f"{'（足）' if passed else '（不足）'}")
 
 
-def gate_dsr(returns: list[float], n_trials: int, sr_variance: float | None) -> GateResult:
-    dsr = deflated_sharpe(returns, n_trials, sr_variance)
+def gate_dsr(returns: list[float], n_trials: int, sr_variance: float | None,
+             n_eff: float | None = None) -> GateResult:
+    nominal = deflated_sharpe(returns, n_trials, sr_variance)
+    dsr = nominal
+    axis = "名目n"
+    # task#80：叢聚校正版（去膨脹基準 sr_star 不變，僅 sqrt(n-1)→sqrt(n_eff-1)）。
+    # 取 min(名目, 校正) 確保只會更嚴——即使兩閉式在邊角分歧也絕不放寬。
+    if n_eff is not None:
+        clustered = deflated_sharpe_n(returns, n_trials, sr_variance, n_eff=n_eff)
+        if clustered is not None:
+            dsr = min(nominal, clustered)
+            axis = f"n_eff={n_eff:.1f}"
     passed = dsr >= DSR_MIN
     sv = "—" if sr_variance is None else f"{sr_variance:.4f}"
     return GateResult("DSR", passed, round(dsr, 4), DSR_MIN,
-                      f"DSR={dsr:.3f}（n_trials={n_trials}、實測跨試驗SR變異={sv}）"
+                      f"DSR={dsr:.3f}（n_trials={n_trials}、SR變異={sv}、axis={axis}）"
                       f" {'≥' if passed else '<'}{DSR_MIN}")
 
 
@@ -447,12 +470,16 @@ def evaluate_candidate(ledger: TrialLedger, *, bucket_key: str,
                        matrix: list[list[float]] | None = None,
                        hypothesis: str = "", registered_at_ms: int | None = None,
                        trial_id: str | None = None, ts_ms: int | None = None,
+                       day_keys: list[str | None] | None = None,
                        append: bool = True) -> L2Verdict:
     """跑四關 → 總判定。**n_trials / 跨試驗 SR 變異 / FDR 族群全部從 ledger 取，禁手傳。**
 
     candidate_returns：必須是「凍結後」的 out-of-time holdout R 序列（防 HARKing；
         呼叫端用 out_of_time_holdout() 產生）。
     matrix：T×N 同期多配置逐期報酬（給 PBO/CSCV）。None → PBO fail-closed。
+    day_keys：與 candidate_returns 等長、逐筆對齊的 UTC 日鍵（task#80 i.i.d. fail-safe）。
+        None 或長度對不齊 → 退回名目 n（status quo，永不放寬）；提供且可估時，minTRL
+        與 DSR 改用叢聚校正後的 n_eff（≤名目 n）把關，候選 p 取名目/校正較嚴者。
     append=True：無論成敗都 append（file-drawer），讓下次評估看得到、分母累計。
     """
     # 1) 從 ledger 取族群（評估候選之前的既有試驗）
@@ -464,14 +491,24 @@ def evaluate_candidate(ledger: TrialLedger, *, bucket_key: str,
     cand_sr = sharpe(candidate_returns)
     cand_p = trial_p_value(candidate_returns)
 
+    # 2b) 獨立性校正（task#80）：day_keys 對齊才估 n_eff，否則 None＝退名目（fail-closed）。
+    n_eff = None
+    if day_keys is not None and len(day_keys) == len(candidate_returns):
+        n_eff, _icc, _deff, _cov = effective_n(candidate_returns, day_keys)
+    if n_eff is not None:
+        # 候選 p 取「名目 / 叢聚校正」較嚴者（p 越大越難存活 FDR）— 防禦式單調，只會更嚴。
+        clustered_psr = psr_with_n(candidate_returns, n_eff, 0.0)
+        if clustered_psr is not None:
+            cand_p = max(cand_p, max(0.0, min(1.0, 1.0 - clustered_psr)))
+
     # 3) 實測跨試驗 SR 變異數（含候選）
     sr_list = [v["sharpe"] for v in prior.values()] + [cand_sr]
     sr_var = pvariance(sr_list) if len(sr_list) >= 2 else None
 
-    # 4) 四關
+    # 4) 四關（minTRL/DSR 吃 n_eff；PBO=CSCV 連續分塊本就對序列相關穩健、不需校正）
     gates = (
-        gate_min_trl(candidate_returns),
-        gate_dsr(candidate_returns, n_trials, sr_var),
+        gate_min_trl(candidate_returns, n_eff),
+        gate_dsr(candidate_returns, n_trials, sr_var, n_eff),
         gate_pbo(matrix),
         gate_bhy_fdr(cand_p, other_p),
     )
@@ -489,7 +526,9 @@ def evaluate_candidate(ledger: TrialLedger, *, bucket_key: str,
 
     head = "✅ 通過四關" if passed else "❌ 未過閘"
     detail = "；".join(f"{g.name}{'✓' if g.passed else '✗'}" for g in gates)
-    summary = f"{head}（bucket={bucket_key}, n_trials={n_trials}）：{detail}"
+    neff_note = (f", n={len(candidate_returns)}/n_eff={n_eff:.1f}"
+                 if n_eff is not None else f", n={len(candidate_returns)}")
+    summary = f"{head}（bucket={bucket_key}, n_trials={n_trials}{neff_note}）：{detail}"
     return L2Verdict(passed, gates, n_trials, bucket_key, summary)
 
 
