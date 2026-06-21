@@ -40,10 +40,16 @@ class _FakeCheck:
 
 def compute_entry_zone(signal_price: float, direction: str,
                        setup: str = "intraday") -> tuple[float, float]:
-    """進場區（與 message_format 口徑一致）。bull: -0.3%~+0.2%；bear 對稱。"""
-    if direction == "bull":
-        return signal_price * 0.997, signal_price * 1.002
-    return signal_price * 0.998, signal_price * 1.003
+    """進場區（委派 telegram_bot.plan._entry_band 的單一權威）。
+
+    v55-x task#10：原本此處自有一份 ± 帶常數（忽略 setup 永遠用 intraday 帶、無 round、
+    無 ambush 分支＝潛伏 bug），與 message_format/intent_format 各自重算＝漂移隱患。
+    現統一委派 plan._entry_band：
+        • intraday：-0.3%~+0.2% / bear 對稱（與舊值逐位元相同，僅多 round(.,6)）。
+        • ambush（休眠中）：改用正確 ambush 帶（修潛伏 bug，今日零活影響）。
+    純讀計算，零下單/訊號數學變更（紅線①不受影響）。"""
+    from telegram_bot.plan import _entry_band
+    return _entry_band(setup, direction, signal_price)
 
 
 async def _fetch_live_price(symbol: str) -> float | None:
@@ -206,6 +212,11 @@ async def dispatch_once(tg: TelegramClient, tg_aux: TelegramClient | None = None
         return True
 
     # === 渲染訊息（價在進場區內 → 直接 FIRE）===
+    # task#10(2e) 範圍註記：DISPLAY_MODE 新手/專家小抄只接在 deepdive 卡（macro.py
+    #   _with_display_mode）——那是 LLM 親筆論述，新手端最需要術語白話化。FIRE 卡走
+    #   render_fire_message/render_fire_with_checks 的『結構化欄位』（進場/止損/TP 已逐項
+    #   標題化、含內嵌說明），不是 prose，故不套用同一段小抄；若日後要對 FIRE 卡也加新手
+    #   小抄，於此處 text 完成後包一層 _with_display_mode 即可（限 bull/bear 可做單向）。
     if cc:
         fake = _FakeCheck(
             confidence=cc.get("confidence", 0),

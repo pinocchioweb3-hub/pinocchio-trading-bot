@@ -1,31 +1,39 @@
-"""task#20 cvd_slope 治本 · 第二步「影子接線」（純觀測、零訊號數學變更）。
+"""task#20 因子回補治本 · 第二步「影子接線」（純觀測、零訊號數學變更）。
 
 第一步（v61，已 SHIP）＝忠實度回測閘：證明免 key Binance 自算 CVD 是 CoinGlass
 聚合 CVD 的忠實代理（每根 delta 時序 r 中位 0.928、cvd_slope_7d 同號率 100%）。
+v64（已 SHIP）＝其餘三個壞因子的離線回補純函式層（backtest.factor_backfill）。
 
-本檔＝第二步：開始「回補缺的數據」。資料缺口在 universe 排名路徑——
-coinglass.py:666 對每個 universe 幣硬塞 `cvd_slope_7d = 0.0`（z-score 恆 0 →
-strength.py 的 20% CVD 權重在排名路徑等於死掉）。本影子 worker 每小時：
+本檔＝第二步：開始「回補缺的數據」。資料缺口在 universe 排名路徑——coinglass.py
+get_strength_universe 對多個因子塞死值/反符號：cvd_slope_7d=0.0、top_trader_dev=0.05、
+btc_corr_30d=0.70（三者 z-score 退化＝死權重，合計 35%）、vol_24h_vs_30d 反符號（15%）。
+本影子 worker 每小時：
     1. 取 universe 因子快照（**逐幣節流**呼叫 source.get_strength_universe，避開
        「burst N 筆被 CoinGlass 上游 429 截斷成 ~2–5 筆」的缺陷；重用 daemon 共用
-       限流器 + TTL 快取）——這是 strength 排名器「實際吃到」的因子（含 0.0 stub）。
-    2. 對同一批幣用免 key Binance klines 自算 cvd_slope_7d / cvd_slope（零額度）。
-    3. 把「實際因子（含 0.0 缺口）＋ 該補的 Binance CVD 值」併成一筆 JSONL 寫進
-       獨立 sink：data_dir()/cvd_shadow.jsonl。
+       限流器 + TTL 快取）——這是 strength 排名器「實際吃到」的因子（含死值/反符號缺口）。
+    2. 對同一批幣用免 key Binance 自算「該補的正確值」（零額度、同 T 橫斷面）：
+       cvd_slope_7d/cvd_slope（1h klines）、top_trader_dev（大戶比−1）、
+       btc_corr_30d（日報酬 Pearson vs BTC）、vol_24h_vs_30d（24h/30d 日均，修正反符號）。
+    3. 把「實際因子（含死值/反符號缺口）＋ 該補的 Binance 正確值」併成一筆 JSONL 寫進
+       獨立 sink：data_dir()/cvd_shadow.jsonl（binance_* 獨立鍵，從不回寫）。
 
-日後的「EV 閘」（離線、另案）可讀這份 JSONL 做**反事實重排序**：
-「若 cvd_slope_7d 用 Binance 值取代 0.0，universe 排名/EV 是否改善？」過閘才晉升
-去真填 coinglass.py:666（走 RUNBOOK #26）。離線 EV 閘可以 import strength.py；
-但本 worker 不行（見影子鐵則）。
+日後的「EV 閘」（離線、另案）可讀這份 JSONL 做**聯合反事實重排序**：
+「若把這幾個壞因子（cvd_slope_7d / top_trader_dev / btc_corr_30d / vol_24h_vs_30d）
+同時用 Binance 正確值取代死值/反符號，universe 排名/EV 是否改善？」過閘才晉升去真填
+coinglass.py get_strength_universe（走 RUNBOOK #26、task#64）。離線 EV 閘可以
+import strength.py；但本 worker 不行（見影子鐵則）。同 T 橫斷面一次補齊全部因子，是為了
+讓數週的累積同時覆蓋所有因子、且能做「同一快照」的聯合反事實檢定（資料累積才是長瓶頸）。
 
 ════════════════════════════════════════════════════════════════════════════
 影子鐵則（與 convergence_shadow 同一套，絕不可違反）：
-    * 本 worker **永不** 把 binance_cvd_slope_7d 寫回 universe items / strength_score；
+    * 本 worker **永不** 把任何 binance_* 回補值（cvd / top_trader_dev / btc_corr / vol）
+      寫回 universe items / strength_score；
       **永不** 寫 fire_queue / snapshot / symbol_gate / 任何下單路徑；
       **永不** import market_intel_mcp.strength 或 l2_trigger.signals。
     * 唯一輸出 = 自己的 cvd_shadow.jsonl（觀測用，給日後 EV 閘離線反事實重排序）。
-    * CVD 數學唯一來源 = backtest.binance_cvd_validate.cvd_slopes_from_klines
-      （v61 回測閘已認證的純函式；本檔只重用、不另寫一份數學）。
+    * 因子數學唯一來源 = backtest.binance_cvd_validate（CVD，v61 回測閘認證）
+      + backtest.factor_backfill（top_trader_dev / btc_corr / vol，v64 已認證純函式）；
+      本檔只重用、不另寫一份數學。
     * 整個迴圈體包 try/except；任何源失敗都吞掉續跑，絕不拖垮 daemon
       （外層另有 supervise() 崩潰隔離 + 退避重啟）。
     * 不發 Telegram（純背景觀測，不打擾使用者）。
@@ -90,27 +98,37 @@ _FACTOR_KEYS = (
 
 
 def _build_item(symbol: str, factors: dict, cvd: dict | None,
-                captured_ts: str | None = None) -> dict:
-    """把一個 universe 因子 dict + 一份 cvd_slopes_from_klines 輸出併成觀測 item。
+                captured_ts: str | None = None,
+                backfill: dict | None = None) -> dict:
+    """把一個 universe 因子 dict + Binance 回補值（CVD + 三因子）併成觀測 item。
 
     純函式（無 I/O）：factors=get_strength_universe 的單筆 item；cvd=Binance 自算
-    （None＝Binance 取數失敗，誠實記 None 不捏造，紅線③）。
-    刻意把「實際因子（含 0.0 stub 缺口）」與「該補的 Binance 值」並排，供離線反事實重排。
+    （None＝Binance 取數失敗，誠實記 None 不捏造，紅線③）；backfill=_backfill_factors
+    輸出（None＝未取，四個回補鍵誠實 None）。
+    刻意把「實際因子（含死值/反符號缺口）」與「該補的 Binance 正確值」並排，供離線反事實重排。
     captured_ts＝該幣因子實際取到的 UTC 時刻（None＝未知，誠實不捏造）；離線閘可據此
     驗證整輪是否落在同一橫斷面窗口（見 span_sec）。
+    影子鐵則：所有 binance_* 值活在獨立鍵，**從不**寫回 factors_live（strength 排名器吃的）。
     """
     factors_live = {k: factors.get(k) for k in _FACTOR_KEYS}
     stub_cvd = factors_live.get("cvd_slope_7d")
     item = {
         "symbol": symbol,
         "captured_ts": captured_ts,          # 該幣因子實際取到的 UTC 時刻（同 T 橫斷面驗證用）
-        "factors_live": factors_live,        # strength 排名器實際吃到的（cvd_slope_7d=0.0 缺口）
+        "factors_live": factors_live,        # strength 排名器實際吃到的（含死值/反符號缺口）
         "stub_cvd_slope_7d": stub_cvd,       # 明確標出 universe 路徑現用的 stub（通常 0.0）
         "binance_cvd_slope_7d": None,
         "binance_cvd_slope": None,
         "binance_cvd": None,
         "binance_bars": 0,
         "binance_ok": False,
+        # —— v65 因子回補：top_trader_dev / btc_corr_30d / vol_24h_vs_30d 並排記錄 ——
+        # 獨立 binance_* 鍵，從不汙染 factors_live；缺料誠實 None（紅線③）。
+        "binance_top_trader_ratio": None,
+        "binance_top_trader_dev": None,
+        "binance_btc_corr_30d": None,
+        "binance_vol_24h_vs_30d": None,
+        "binance_daily_bars": 0,
     }
     if isinstance(cvd, dict):
         item["binance_cvd_slope_7d"] = cvd.get("cvd_slope_7d")
@@ -118,6 +136,12 @@ def _build_item(symbol: str, factors: dict, cvd: dict | None,
         item["binance_cvd"] = cvd.get("cvd")
         item["binance_bars"] = len(cvd.get("series") or [])
         item["binance_ok"] = True
+    if isinstance(backfill, dict):
+        item["binance_top_trader_ratio"] = backfill.get("top_trader_ratio")
+        item["binance_top_trader_dev"] = backfill.get("top_trader_dev")
+        item["binance_btc_corr_30d"] = backfill.get("btc_corr_30d")
+        item["binance_vol_24h_vs_30d"] = backfill.get("vol_24h_vs_30d")
+        item["binance_daily_bars"] = backfill.get("daily_bars") or 0
     return item
 
 
@@ -166,6 +190,73 @@ async def _binance_cvd(bn, symbol: str) -> dict | None:
         return cvd_slopes_from_klines(body)
     except Exception:
         return None
+
+
+async def _binance_daily(bn, symbol: str, limit: int = 35):
+    """免 key 取 Binance 1d klines → (closes, volumes_usd) 兩個升序 list。
+
+    給 btc_corr_30d（日報酬 Pearson）與 vol_24h_vs_30d（24h/30d 日均量）用。
+    失敗回 (None, None)（不 raise；誠實，紅線③）。
+    """
+    try:
+        kl = await bn.get_candles(symbol, "1d", limit)
+        if not isinstance(kl, dict) or kl.get("error"):
+            return None, None
+        candles = kl.get("candles") or []
+        closes = [c.get("close") for c in candles]
+        vols = [c.get("volume_usd") for c in candles]
+        return closes, vols
+    except Exception:
+        return None, None
+
+
+async def _binance_positioning(bn, symbol: str):
+    """免 key 取大戶帳戶多空比最新值（topLongShortAccountRatio['latest']）。
+
+    給 top_trader_dev（ratio − 1）用。失敗回 None（不 raise；誠實，紅線③）。
+    """
+    try:
+        pos = await bn.get_positioning(symbol, "1d", 30)
+        if isinstance(pos, dict) and not pos.get("error"):
+            return pos.get("latest")
+        return None
+    except Exception:
+        return None
+
+
+def _backfill_factors(symbol: str, top_ratio, sym_closes, sym_vols,
+                      btc_closes) -> dict:
+    """純函式：用 v64 回補純函式把三個壞因子算成「該補的正確值」（誠實 None，不捏造）。
+
+    重用 backtest.factor_backfill（v64 已 SHIP + 16 測鎖契約）的純函式，本檔不另寫數學：
+        top_trader_dev ← ratio − 1（死權重 stub=0.05 的治本）
+        btc_corr_30d   ← 日報酬 Pearson vs BTC（死權重 stub=0.70 的治本；BTC 對自己=1.0）
+        vol_24h_vs_30d ← 24h 量 / 30d 日均量（修正 stub 反符號 bug）
+    分子用最近日線量（vols[-1]，可能是當日進行中未完整 bar）；因整輪同 T 橫斷面同時刻取樣，
+    「當日進行中比例」對全幣近似同一乘數 → z-score 截面正規化會吸收，相對排名不受偏。
+    純函式（無 I/O）：所有 live 取數由呼叫端先做好再餵進來，方便離線單測。
+    """
+    from backtest.factor_backfill import (
+        top_trader_dev_from_ratio, btc_corr_from_closes, vol_ratio_24h_vs_30d,
+    )
+    dev = top_trader_dev_from_ratio(top_ratio)
+    if symbol == "BTC":
+        corr = 1.0                       # BTC 對自己定義為 1.0（與 factor_backfill 一致）
+    elif sym_closes and btc_closes:
+        corr = btc_corr_from_closes(sym_closes, btc_closes)
+    else:
+        corr = None
+    vol_ratio = None
+    if sym_vols:
+        vol_ratio = vol_ratio_24h_vs_30d(sym_vols[-1], sym_vols[:-1])
+    n_bars = len([c for c in (sym_closes or []) if c is not None])
+    return {
+        "top_trader_ratio": top_ratio,
+        "top_trader_dev": dev,
+        "btc_corr_30d": corr,
+        "vol_24h_vs_30d": vol_ratio,
+        "daily_bars": n_bars,
+    }
 
 
 # 取數補抓回合數（pass 1 之後再補抓 miss 的幣；吸收瞬時 429 競爭，盡量湊滿 universe）。
@@ -259,20 +350,33 @@ async def _run_cycle(source=None, n: int = _UNIVERSE_N) -> dict:
     bn = get_binance_perp()
     t0 = time.monotonic()
 
-    # 1) universe 因子快照（strength 排名器實際吃到的；cvd_slope_7d 是 0.0 缺口）
+    # 1) universe 因子快照（strength 排名器實際吃到的；含死值/反符號缺口）
     factor_items = await _universe_factors(source, n)
     syms = [it.get("symbol") for it in factor_items if it.get("symbol")]
 
-    # 2) 對同一批幣免費自算 Binance CVD（序列化，尊重 source 限流；Binance 免 key）
-    cvd_results = await asyncio.gather(
-        *[_binance_cvd(bn, s) for s in syms],
-        return_exceptions=True,
+    # 2) BTC 日線收盤當 btc_corr 參考序列（取一次；BTC 對自己 corr=1.0）。
+    #    即便 BTC 不在本輪 universe 也要有參考，故獨立取（免 key、零額度）。
+    btc_closes, _btc_vols = await _binance_daily(bn, "BTC")
+
+    # 3) 對同一批幣免費自算 Binance：CVD（1h×168）+ 日線（corr/vol）+ 大戶比（dev）。
+    #    三組全並行（Binance 免 key、零 CoinGlass 額度）；同 T 橫斷面一次補齊全部因子。
+    cvd_results, daily_results, pos_results = await asyncio.gather(
+        asyncio.gather(*[_binance_cvd(bn, s) for s in syms], return_exceptions=True),
+        asyncio.gather(*[_binance_daily(bn, s) for s in syms], return_exceptions=True),
+        asyncio.gather(*[_binance_positioning(bn, s) for s in syms], return_exceptions=True),
     )
     cvd_map: dict[str, dict | None] = {}
-    for s, r in zip(syms, cvd_results):
-        cvd_map[s] = r if isinstance(r, dict) else None
+    daily_map: dict[str, tuple] = {}
+    pos_map: dict = {}
+    for idx, s in enumerate(syms):
+        cr = cvd_results[idx]
+        cvd_map[s] = cr if isinstance(cr, dict) else None
+        dr = daily_results[idx]
+        daily_map[s] = dr if isinstance(dr, tuple) else (None, None)
+        pr = pos_results[idx]
+        pos_map[s] = pr if not isinstance(pr, BaseException) else None
 
-    # 3) 併記錄（純函式 _build_item），並抽出每幣 captured_ts 算橫斷面跨度
+    # 4) 併記錄（純函式 _build_item + _backfill_factors），抽出每幣 captured_ts 算橫斷面跨度
     items = []
     cap_ts_list = []
     for it in factor_items:
@@ -281,20 +385,28 @@ async def _run_cycle(source=None, n: int = _UNIVERSE_N) -> dict:
             continue
         cts = it.get("_captured_ts")   # _universe_factors 暫存的取到時刻（可能 None）
         cap_ts_list.append(cts)
-        items.append(_build_item(sym, it, cvd_map.get(sym), captured_ts=cts))
+        sclose, svol = daily_map.get(sym, (None, None))
+        backfill = _backfill_factors(sym, pos_map.get(sym), sclose, svol, btc_closes)
+        items.append(_build_item(sym, it, cvd_map.get(sym),
+                                 captured_ts=cts, backfill=backfill))
 
     n_binance_ok = sum(1 for it in items if it.get("binance_ok"))
+    n_backfill_ok = sum(1 for it in items
+                        if it.get("binance_btc_corr_30d") is not None
+                        or it.get("binance_top_trader_dev") is not None
+                        or it.get("binance_vol_24h_vs_30d") is not None)
     return {
         "ts": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
         "universe_n": n,
         "captured": len(items),
         "binance_ok": n_binance_ok,
+        "backfill_ok": n_backfill_ok,             # 至少補到一個因子（top_trader_dev/btc_corr/vol）的幣數
         "span_sec": _span_seconds(cap_ts_list),   # 首→末因子取到的時間跨度（同 T 橫斷面驗證；None=不足2筆）
         "elapsed_sec": round(time.monotonic() - t0, 1),  # 整輪耗時（含補抓退避；接近 interval 即告警）
         "items": items,
-        "note": "shadow-only: binance_cvd_slope_7d 從不寫回 universe/strength/fire；"
-                "補捉 universe 路徑缺的 cvd_slope_7d（現為 coinglass.py:666 的 0.0 stub）"
-                "供日後 EV 閘離線反事實重排序；CVD 數學＝v61 回測閘認證純函式",
+        "note": "shadow-only: 任何 binance_* 回補值（cvd/top_trader_dev/btc_corr/vol）"
+                "從不寫回 universe/strength/fire；補捉 universe 路徑死值/反符號缺口"
+                "供日後 EV 閘離線『聯合反事實重排序』；因子數學＝v61+v64 回測閘認證純函式",
     }
 
 
@@ -317,6 +429,7 @@ async def run_cvd_shadow_loop(source=None, interval_seconds: int = 3600):
             print(f"[cvd_shadow] universe_n={summary['universe_n']} "
                   f"captured={summary['captured']} "
                   f"binance_ok={summary['binance_ok']} "
+                  f"backfill_ok={summary.get('backfill_ok')} "
                   f"span_sec={span} elapsed_sec={elapsed}")
             # 整輪耗時逼近 interval＝補抓退避吃太久（橫斷面被拉長/下一輪要遲到），留痕示警
             if isinstance(elapsed, (int, float)) and elapsed > int(interval_seconds) * 0.9:
@@ -391,23 +504,59 @@ def _selftest() -> int:
     assert _span_seconds(["bad-ts", "also-bad"]) is None    # 解析不出 → None，不丟例外
     print("  ✅ _span_seconds：首末跨度正確、不足2筆/壞值誠實 None")
 
-    print("自測通過：影子 item 併記（0.0 缺口並排/誠實 None/因子白名單/captured_ts）"
-          "+ span 跨度 + 可序列化 ✅")
+    # 7) 因子回補並排（v65）：backfill 值活在獨立 binance_* 鍵，不汙染 factors_live
+    bf = {"top_trader_ratio": 1.93, "top_trader_dev": 0.93,
+          "btc_corr_30d": 0.42, "vol_24h_vs_30d": 1.8, "daily_bars": 34}
+    item_bf = _build_item("BTC", factors, cvd, backfill=bf)
+    assert item_bf["binance_top_trader_ratio"] == 1.93
+    assert item_bf["binance_top_trader_dev"] == 0.93
+    assert item_bf["binance_btc_corr_30d"] == 0.42
+    assert item_bf["binance_vol_24h_vs_30d"] == 1.8
+    assert item_bf["binance_daily_bars"] == 34
+    # 影子鐵則：backfill 絕不寫回 factors_live（仍是含死值缺口的原值）
+    assert item_bf["factors_live"]["top_trader_dev"] == 0.05
+    assert item_bf["factors_live"]["btc_corr_30d"] == 0.7
+    assert item_bf["factors_live"]["vol_24h_vs_30d"] == 1.2
+    print("  ✅ 因子回補並排：binance_* 獨立鍵、不汙染 factors_live")
+
+    # 8) 沒傳 backfill → 四個回補鍵誠實 None、daily_bars=0（不捏造，紅線③）
+    item_nobf = _build_item("ETH", factors, cvd)
+    assert item_nobf["binance_top_trader_dev"] is None
+    assert item_nobf["binance_btc_corr_30d"] is None
+    assert item_nobf["binance_vol_24h_vs_30d"] is None
+    assert item_nobf["binance_daily_bars"] == 0
+    print("  ✅ 無 backfill → 回補鍵誠實 None")
+
+    # 9) _backfill_factors 純函式：BTC 對自己 corr=1.0、dev=ratio−1、資料不足誠實 None
+    bf_btc = _backfill_factors("BTC", 1.5, [100, 101, 102], [10, 20, 30],
+                               [100, 101, 102])
+    assert bf_btc["btc_corr_30d"] == 1.0           # BTC 對自己定義為 1.0
+    assert bf_btc["top_trader_dev"] == 0.5         # 1.5 − 1
+    assert bf_btc["vol_24h_vs_30d"] is None        # 之前日數 < min_days=7 → 誠實 None
+    bf_alt = _backfill_factors("ETH", None, None, None, [100, 101])
+    assert bf_alt["top_trader_dev"] is None and bf_alt["btc_corr_30d"] is None
+    assert bf_alt["daily_bars"] == 0
+    print("  ✅ _backfill_factors：BTC自corr=1 / dev=ratio−1 / 資料不足誠實 None")
+
+    print("自測通過：影子 item 併記（死值缺口並排/誠實 None/因子白名單/captured_ts）"
+          "+ 因子回補（top_trader_dev/btc_corr/vol）+ span 跨度 + 可序列化 ✅")
     return 0
 
 
 if __name__ == "__main__":
     import sys
+    from pathlib import Path
+    # 直接以路徑執行本檔時 sys.path[0] 是 l3_dispatcher/，專案根不在路徑上 →
+    # import backtest / market_intel_mcp 會失敗；先補上專案根，讓 --selftest（會 import
+    # backtest.factor_backfill）與 live 試跑（import market_intel_mcp）皆可「python
+    # l3_dispatcher\cvd_shadow.py」直跑。pytest 另由 test 檔自插 root，故那條路徑不受影響。
+    _root = str(Path(__file__).resolve().parent.parent)
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         raise SystemExit(_selftest())
     # 一次性 live 試跑（唯讀；需 .env 的 CoinGlass 金鑰才取得到 universe 因子）
     import os
-    from pathlib import Path
-    # 直接以路徑執行本檔時 sys.path[0] 是 l3_dispatcher/，專案根不在路徑上 →
-    # import market_intel_mcp 會失敗；補上專案根讓「python l3_dispatcher\cvd_shadow.py」可直跑。
-    _root = str(Path(__file__).resolve().parent.parent)
-    if _root not in sys.path:
-        sys.path.insert(0, _root)
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     # ⚠️ 環境陷阱：MARKET_INTEL_BACKEND 預設 "mock"（settings.py:19），且 daemon 是用

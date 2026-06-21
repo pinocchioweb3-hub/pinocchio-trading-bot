@@ -17,6 +17,7 @@ if str(_ROOT) not in sys.path:
 
 from l3_dispatcher.cvd_shadow import (
     _build_item, _selftest, _FACTOR_KEYS, _universe_factors, _span_seconds,
+    _backfill_factors,
 )
 from market_intel_mcp.symbol_mapping import TRADING_CANDIDATES
 
@@ -196,3 +197,78 @@ def test_span_seconds_computes_first_to_last_skew():
     assert _span_seconds(["2026-01-01T00:00:00+00:00"]) is None
     assert _span_seconds([None, None]) is None
     assert _span_seconds(["bad-ts", "worse"]) is None
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  v65 因子回補（top_trader_dev / btc_corr_30d / vol_24h_vs_30d）並排記錄
+# ════════════════════════════════════════════════════════════════════════
+_BACKFILL = {"top_trader_ratio": 1.93, "top_trader_dev": 0.93,
+             "btc_corr_30d": 0.42, "vol_24h_vs_30d": 1.8, "daily_bars": 34}
+
+
+def test_build_item_carries_backfill_side_by_side():
+    item = _build_item("BTC", _FACTORS, _CVD, backfill=_BACKFILL)
+    assert item["binance_top_trader_ratio"] == 1.93
+    assert item["binance_top_trader_dev"] == 0.93
+    assert item["binance_btc_corr_30d"] == 0.42
+    assert item["binance_vol_24h_vs_30d"] == 1.8
+    assert item["binance_daily_bars"] == 34
+
+
+def test_build_item_backfill_never_overwrites_factors_live():
+    # 影子鐵則：回補的正確值絕不汙染 strength 排名器吃的 factors_live（仍是死值缺口）
+    item = _build_item("ETH", _FACTORS, _CVD, backfill=_BACKFILL)
+    assert item["factors_live"]["top_trader_dev"] == 0.05      # 死值 stub 原封不動
+    assert item["factors_live"]["btc_corr_30d"] == 0.7         # 死值 stub 原封不動
+    assert item["factors_live"]["vol_24h_vs_30d"] == 1.2       # 反符號 stub 原封不動
+    # 並排的回補值與 live 值不同源、不互通
+    assert item["binance_top_trader_dev"] != item["factors_live"]["top_trader_dev"]
+
+
+def test_build_item_honest_none_when_backfill_missing():
+    item = _build_item("SOL", _FACTORS, _CVD)            # 不傳 backfill
+    assert item["binance_top_trader_ratio"] is None
+    assert item["binance_top_trader_dev"] is None
+    assert item["binance_btc_corr_30d"] is None
+    assert item["binance_vol_24h_vs_30d"] is None
+    assert item["binance_daily_bars"] == 0
+    # factors_live 仍完整（缺的只有回補那半）
+    assert item["factors_live"]["return_7d_pct"] == 5.0
+
+
+def test_build_item_factor_key_whitelist_unaffected_by_backfill():
+    # 加了 backfill 後 factors_live 白名單仍嚴格（回補值活在 binance_* 不混入）
+    noisy = dict(_FACTORS, secret="x", password="leak")
+    item = _build_item("DOGE", noisy, _CVD, backfill=_BACKFILL)
+    assert set(item["factors_live"].keys()) == set(_FACTOR_KEYS)
+    assert "secret" not in item["factors_live"]
+
+
+def test_backfill_factors_btc_self_corr_and_dev():
+    bf = _backfill_factors("BTC", 1.5, [100, 101, 102], [10, 20, 30],
+                           [100, 101, 102])
+    assert bf["btc_corr_30d"] == 1.0          # BTC 對自己定義為 1.0
+    assert bf["top_trader_dev"] == 0.5        # 1.5 − 1
+    assert bf["daily_bars"] == 3
+    # 之前日數 < min_days=7 → vol 誠實 None（不捏造，紅線③）
+    assert bf["vol_24h_vs_30d"] is None
+
+
+def test_backfill_factors_honest_none_on_missing():
+    bf = _backfill_factors("ETH", None, None, None, [100, 101])
+    assert bf["top_trader_ratio"] is None
+    assert bf["top_trader_dev"] is None       # ratio None → dev None
+    assert bf["btc_corr_30d"] is None         # 無 sym_closes → None
+    assert bf["vol_24h_vs_30d"] is None
+    assert bf["daily_bars"] == 0
+
+
+def test_backfill_factors_vol_sign_and_corr_use_returns():
+    # 量增 → 比值 > 1（修正反符號）；需 ≥ min_days+1 日量
+    bf = _backfill_factors("XRP", 1.0,
+                           [100.0] * 40,                 # 平盤收盤 → corr 零變異 → None
+                           [100.0] * 39 + [300.0],       # 24h=300、之前 39 日均=100 → 3.0
+                           [100.0] * 40)
+    assert bf["vol_24h_vs_30d"] is not None and bf["vol_24h_vs_30d"] > 1.0
+    # 平盤序列日報酬零變異 → Pearson 未定義 → 誠實 None（不假裝 1.0）
+    assert bf["btc_corr_30d"] is None
