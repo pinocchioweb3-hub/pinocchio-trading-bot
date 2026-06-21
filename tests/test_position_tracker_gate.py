@@ -65,3 +65,29 @@ def test_gate_skips_unchanged_within_heartbeat():
 
 def test_gate_heartbeat_forces_push():
     assert _should_push_positions("fpA", "fpA", _POS_HEARTBEAT_MS + 1, 0) is True
+
+
+# ── task#4：持倉總覽（排序＋摘要）──
+def _P(sym, e, s, d="bull"):
+    return {"symbol": sym, "direction": d, "entry_price": e, "stop_price": s, "legs_hit": []}
+
+
+def test_overview_sorts_most_at_risk_first():
+    from l3_dispatcher.macro import _position_overview
+    sorted_pos, summary = _position_overview(
+        [_P("BTC", 100, 95), _P("ETH", 100, 95)], {"BTC": 105.0, "ETH": 97.0})  # BTC R=1.0, ETH R=0.4
+    assert [p["symbol"] for p in sorted_pos] == ["ETH", "BTC"]
+    assert "共 2 倉" in summary and "最接近止損" in summary and "ETH" in summary
+
+
+def test_overview_noprice_sorts_last():
+    from l3_dispatcher.macro import _position_overview
+    sorted_pos, _ = _position_overview([_P("FOO", 100, 95), _P("BTC", 100, 95)], {"BTC": 105.0})
+    assert sorted_pos[-1]["symbol"] == "FOO"
+
+
+def test_overview_total_unrealized_r():
+    from l3_dispatcher.macro import _position_overview
+    _, summary = _position_overview(
+        [_P("BTC", 100, 95), _P("ETH", 100, 90)], {"BTC": 105.0, "ETH": 110.0})  # 1.0 + 1.0
+    assert "+2.00R" in summary

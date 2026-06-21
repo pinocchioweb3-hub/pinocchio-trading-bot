@@ -1334,6 +1334,31 @@ def _should_push_positions(fp, last_fp, now_ms, last_push_ms,
     return (now_ms - last_push_ms) >= heartbeat_ms
 
 
+def _position_overview(positions: list[dict], prices: dict):
+    """task#4 持倉總覽（純函式可測）：依當前 R 升冪排序（最接近止損者排最前＝最該先看），
+    並產一行組合摘要（倉數／未實現合計 R／最接近止損者）。無價者排最後。
+    回 (sorted_positions, summary_line)。指紋閘 order-independent，故排序不影響去重。"""
+    def _cr(o):
+        cur = prices.get(o["symbol"])
+        if cur is None:
+            return None
+        sld = abs(o["entry_price"] - o["stop_price"]) or 1e-9
+        return ((cur - o["entry_price"]) / sld if o["direction"] == "bull"
+                else (o["entry_price"] - cur) / sld)
+    enriched = [(o, _cr(o)) for o in positions]
+    enriched.sort(key=lambda x: (x[1] is None, x[1] if x[1] is not None else 0.0))
+    sorted_pos = [o for o, _ in enriched]
+    rs = [(o, r) for o, r in enriched if r is not None]
+    if rs:
+        total_r = sum(r for _, r in rs)
+        worst_o, worst_r = min(rs, key=lambda x: x[1])
+        summary = (f"📦 共 {len(positions)} 倉｜未實現合計 <code>{total_r:+.2f}R</code>｜"
+                   f"最接近止損 <b>{worst_o['symbol']}</b>(<code>{worst_r:+.2f}R</code>)")
+    else:
+        summary = f"📦 共 {len(positions)} 倉（價格抓取中）"
+    return sorted_pos, summary
+
+
 async def run_position_tracker_loop(tg, source, interval_seconds: int = 3600):
     """每小時檢查持倉，但只在有實質變化或過 6h 心跳才推（v83 降噪）。
 
@@ -1400,7 +1425,10 @@ async def run_position_tracker_loop(tg, source, interval_seconds: int = 3600):
         else:
             head = f"📊 <b>持倉追蹤快照（紙上驗證 {n_paper} 筆）</b>"
         lines = [head, "━━━━━━━━━━━━━━━━"]
-        for o in positions:
+        sorted_positions, _overview = _position_overview(positions, prices)
+        lines.append(_overview)          # v84 task#4：頂部組合摘要（最該先看的在最前）
+        lines.append("")
+        for o in sorted_positions:
             sym = o["symbol"]
             a_emoji, _ = _asset_kind(sym, o.get("setup", ""))
             dir_zh = "做多" if o["direction"] == "bull" else "做空"  # v83：與 FIRE 卡一致中文化
