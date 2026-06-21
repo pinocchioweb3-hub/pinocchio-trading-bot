@@ -166,6 +166,18 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
         result = run_optimization(active_path=active_path)
     if not result["buckets"]:
         return None
+    # v82：0 晉升日（常態）每桶皆「⏸️維持」零資訊 → 收斂為結論一行＋收斂進度，
+    #   把每日 ~4800 字洗版牆壓成可掃讀的一則；全文明細仍可由 active 覆寫表/帳本回溯。
+    #   誠實標籤（紅線①、樣本未達門檻）保留。有晉升才展開全文。
+    if result["n_promoted"] == 0:
+        max_n = max((b.get("n_trades", 0) for b in result["buckets"]), default=0)
+        prog = (f"，最大桶 n={max_n}（差 {30 - max_n} 筆達門檻 30）"
+                if max_n < 30 else f"，最大桶 n={max_n}")
+        return ("🤖 <b>自動優化器</b>（TP 分配，過 L2 才寫模擬盤）\n"
+                f"掃 {result['n_trades']} 筆／{result['n_buckets']} 桶｜"
+                f"本輪晉升 <b>0</b> 桶（皆未過 L2{prog}）\n"
+                + aps.render_active(active_path) + "\n"
+                "<i>只驅動模擬盤（紅線①）；覆寫表恆空＝零行為變更，可事後 rollback。</i>")
     lines = ["🤖 <b>自動優化器</b>（step8：過 L2 後直接寫模擬盤 TP 分配，即時生效）",
              "━━━━━━━━━━━━━━━━",
              f"掃 {result['n_trades']} 筆已平倉紙上單，分 {result['n_buckets']} 桶"
