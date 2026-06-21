@@ -80,7 +80,7 @@ def next_step(*, paper_n, paper_min, live_n, live_min,
 
 def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
            demo_n, demo_live, demo_active, open_decisions, pending_outbox,
-           demo_rejected=0, demo_reject_hint=None,
+           demo_rejected=0, demo_reject_hint=None, real_output_age_sec=None,
            last_nudge_ms=0, stall_sec=STALL_SEC, nudge_cooldown_sec=NUDGE_COOLDOWN_SEC) -> dict:
     """核心判定（純函式）。回 state / next_step / blockers / should_nudge。
 
@@ -100,11 +100,16 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
                    live_min=live_min, demo_n=demo_n, demo_active=demo_active,
                    demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint)
 
-    if commit_age_sec is None:
+    # v84 task#7（CEO 深度綜合）：ADVANCING 不再只看 git commit 時效——補「實質產出代理」
+    #   （近期紙上活動：新進場/平倉）。無關 commit 不再謊報推進；有真產出即使無 commit 也算推進；
+    #   兩者皆停滯才 STALLED（這才該 push CEO）。
+    recent_commit = commit_age_sec is not None and commit_age_sec < stall_sec
+    recent_output = real_output_age_sec is not None and real_output_age_sec < stall_sec
+    if commit_age_sec is None and real_output_age_sec is None:
         state = "IDLE"
     elif blockers:
         state = "BLOCKED_ON_USER"
-    elif commit_age_sec < stall_sec:
+    elif recent_commit or recent_output:
         state = "ADVANCING"
     else:
         state = "STALLED"
@@ -119,6 +124,7 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
         "blockers": blockers,
         "should_nudge": should_nudge,
         "commit_age_sec": commit_age_sec,
+        "real_output_age_sec": real_output_age_sec,
     }
 
 
@@ -249,12 +255,23 @@ def build_snapshot(now_ms: int | None = None) -> dict:
 
     commit_age_sec = _git_last_commit_age_sec()
 
+    # task#7：實質產出代理＝最近紙上活動(進場/平倉)距今秒數。無關 commit 不再謊報推進。
+    real_output_age_sec = None
+    try:
+        from . import paper_journal as _pj
+        last_ms = _pj.most_recent_activity_ms()
+        if last_ms:
+            real_output_age_sec = max(0, int((now_ms - last_ms) / 1000))
+    except Exception:
+        pass
+
     verdict = assess(
         now_ms=now_ms, commit_age_sec=commit_age_sec,
         paper_n=paper_n, paper_min=paper_min, live_n=live_n, live_min=live_min,
         demo_n=demo_n, demo_live=demo_live, demo_active=demo_active,
         open_decisions=open_decisions, pending_outbox=pending_outbox,
         demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint,
+        real_output_age_sec=real_output_age_sec,
         last_nudge_ms=last_nudge_ms,
     )
 

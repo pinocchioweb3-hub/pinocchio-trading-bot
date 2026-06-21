@@ -737,6 +737,19 @@ def get_paper_funnel(days: int = 30, setup_not: str | None = None) -> dict:
         conn.close()
 
 
+def most_recent_activity_ms() -> int | None:
+    """最近一筆紙上活動（進場或出場）的 epoch ms；無資料回 None。
+    供 CEO 監督判『實質產出』（task#7）：有新進場/平倉＝引擎真在動，非只看 git commit。"""
+    init_db()
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT MAX(entry_at), MAX(exit_at) FROM paper_trades").fetchone()
+        cands = [int(x) for x in (row or []) if x]
+        return max(cands) if cands else None
+    finally:
+        conn.close()
+
+
 def render_paper_funnel(days: int = 30, setup_not: str | None = None) -> str:
     f = get_paper_funnel(days, setup_not)
     if f["proposed"] == 0:
