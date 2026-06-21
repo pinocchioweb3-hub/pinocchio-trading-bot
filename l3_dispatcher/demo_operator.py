@@ -47,6 +47,7 @@ EXCLUDED_SETUPS = ("us_breakout",)
 INTAKE_MAX_AGE_MIN = int(os.getenv("DEMO_INTAKE_MAX_AGE_MIN", "90"))
 INTAKE_BATCH_LIMIT = int(os.getenv("DEMO_INTAKE_BATCH_LIMIT", "3"))   # 每輪最多開幾筆新倉（保守）
 SCAN_LIMIT = int(os.getenv("DEMO_INTAKE_SCAN_LIMIT", "200"))         # 每輪從 paper 讀新訊號上限
+DEMO_MIN_RR = float(os.getenv("DEMO_MIN_RR", "1.5"))                 # 模擬盤交易訊號品質閘：只開 R:R≥此值（研究 w7r04t691）
 ENTRY_EXPIRY_HOURS = float(os.getenv("DEMO_ENTRY_EXPIRY_HOURS", "8"))  # 限價掛單逾時作廢
 TIME_LIMIT_HOURS = float(os.getenv("DEMO_TIME_LIMIT_HOURS", "24"))     # 持倉逾時平倉（鏡 demo_trader.TIME_LIMIT_HOURS=24）
 
@@ -63,6 +64,28 @@ def is_active(env=None) -> bool:
 def is_crypto_signal(setup, excluded=EXCLUDED_SETUPS) -> bool:
     """是否為應鏡像到 OKX 模擬盤的加密訊號（排除美股等非永續宇宙）。"""
     return (setup or "") not in tuple(excluded)
+
+
+def signal_rr(entry, stop, tp1):
+    """tp1 報酬:風險比 = |tp1-entry| / |entry-stop|；無法算回 None。"""
+    try:
+        risk = abs(float(entry) - float(stop))
+        reward = abs(float(tp1) - float(entry))
+        return (reward / risk) if risk > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_quality_signal(row, min_rr=None) -> bool:
+    """【模擬盤交易 Session】訊號品質閘——只開高 R:R(高期望值)單，避免過度交易耗盡保證金
+    （研究 w7r04t691：最低 R:R 篩選；解 51008 的篩選半，與槓桿效率半互補）。
+
+    ⚠️ 兩 Session 獨立：這只 gate【模擬盤交易】；【紙上驗證 Session】(paper_journal) 仍記錄
+       全部訊號做回測迭代，不受此限。無 tp1/無法算 R:R → 不擋（交由其他閘），只擋明確 R:R 過低。"""
+    if min_rr is None:
+        min_rr = DEMO_MIN_RR
+    rr = signal_rr(row.get("entry_price"), row.get("stop_price"), row.get("tp1"))
+    return True if rr is None else rr >= min_rr
 
 
 def select_new_signals(rows, hwm, now_ms, *, max_age_min=INTAKE_MAX_AGE_MIN,
@@ -89,6 +112,7 @@ def select_new_signals(rows, hwm, now_ms, *, max_age_min=INTAKE_MAX_AGE_MIN,
             and r.get("direction") in ("bull", "bear")
             and bool(r.get("entry_price")) and bool(r.get("stop_price"))
             and (now_ms - ea) <= age_ms
+            and is_quality_signal(r)        # v84 task#5/#6：模擬盤只開高 R:R 訊號（紙上驗證 Session 不受限）
         )
         if eligible and len(picked) >= limit:
             break                       # 合格但額度滿 → 留到下輪，高水位不跨過它
@@ -195,7 +219,11 @@ async def _place_one(ex, signal, *, avail_usd, tg=None) -> dict:
                 ct_val=0.0, risk_usd=0.0, entry_order_id=None,
                 regime=signal.get("regime"), status="rejected",
                 exit_reason="reject:not_on_okx",
-                note=f"標的不在 OKX 永續宇宙：{type(e).__name__}")
+                # task#73(A) 誠實措辭：被擋的是 OKX「模擬盤(demo/testnet)」較精簡的永續
+                #   宇宙——該標的在 OKX 正式盤(live)很可能存在，只是 demo 未上架。措辭講清楚
+                #   「demo 沒有」而非「OKX 沒有」，避免日後誤判訊號標的本身無效（紅線③不誤導）。
+                note=(f"標的不在 OKX 模擬盤(demo/testnet)永續宇宙"
+                      f"（live 可能有、demo 較精簡）：{type(e).__name__}"))
         return {"placed": False, "reason": "not_on_okx"}
     plan = dt.build_order_plan(
         symbol, direction, entry, stop,
