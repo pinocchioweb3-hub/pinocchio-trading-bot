@@ -783,7 +783,7 @@ def render_weekly_tg(ev: dict, d1: dict, pa: dict | None = None) -> str:
     lp = ev.get("losing_patterns", [])
     blocks = [_honesty_banner_html(),
               "━━━━━━━━━━━━━━━━",
-              f"🔬 <b>每週覆盤 Session</b>（紙上帳驗屍，僅建議不自動套用）",
+              f"🔬 <b>每週覆盤 Session</b>（紙上帳驗屍，純描述觀測；任何調整一律走 L2 四關，不自動套用）",
               f"累積已平倉樣本 <code>{ev.get('n_total', 0)}</code> 筆"]
 
     # setup 期望值速覽
@@ -797,10 +797,11 @@ def render_weekly_tg(ev: dict, d1: dict, pa: dict | None = None) -> str:
     if lp:
         tip_lines = []
         for p in lp[:4]:
-            tip_lines.append(f"  💡 <b>{p['pattern']}</b>：{p['n']} 筆、"
+            tip_lines.append(f"  • <b>{p['pattern']}</b>：{p['n']} 筆、"
                              f"avg <code>{p['avg_r']:+.2f}R</code>、合計 "
-                             f"<code>{p['sum_r']:+.2f}R</code> → 建議收緊此情境進場條件")
-        blocks.append("⚠️ <b>偵測到賠錢模式</b>（建議檢視）：\n" + "\n".join(tip_lines))
+                             f"<code>{p['sum_r']:+.2f}R</code>（純描述）")
+        blocks.append("⚠️ <b>偵測到賠錢模式</b>（純描述；是否調整由 champion/challenger→L2 "
+                      "四關以統計嚴謹度判定，非此報告口語建議）：\n" + "\n".join(tip_lines))
     else:
         blocks.append("✅ 本週無達門檻的賠錢模式（樣本仍 &lt;100，續觀察）")
 
@@ -814,8 +815,9 @@ def render_weekly_tg(ev: dict, d1: dict, pa: dict | None = None) -> str:
 
     blocks.append(f"🧪 <b>D1 反事實</b>（deepdive 加 breadth&ge;{d1.get('breadth_gate', '')} "
                   f"且 BTC 4h&gt;200MA）：\n  {d1.get('verdict', '')}")
-    blocks.append("<i>採納方式：到 /settings 或 .env 調整對應參數。"
-                  "AI 持續評估，參數變更權保留給你。</i>")
+    blocks.append("<i>此為唯讀紙上帳描述。任何參數調整一律走 champion/challenger→L2 四關"
+                  "（minTRL/DSR/PBO/FDR）以統計嚴謹度自動把關，不依此報告口語建議手動改"
+                  "（避免繞過 L2）；真錢永遠人工（紅線①）。</i>")
     return "\n\n".join(blocks)
 
 
