@@ -72,6 +72,32 @@ def test_open_position_exclusion_preserved(tmp_path, monkeypatch):
     assert "PEPE" in picked          # 未開倉且未近期推 → 可選
 
 
+def test_non_crypto_excluded_from_deepdive(tmp_path, monkeypatch):
+    """task#73-B：美股/貴金屬商品即使漏進交易層宇宙，也不得進 deepdive（加密結構分析）。
+    deepdive 卡＝加密 SMC/Wyckoff；美股走獨立 1h 突破引擎、無此卡，商品非射程。
+    這道閘是 defense-in-depth：上游今日純加密，但來源一旦變更不得破壞架構。"""
+    _isolate(tmp_path, monkeypatch)
+    t0 = 1_000_000
+    win = 86400
+    picked, _recently = _deepdive_candidates(
+        ["BTC", "ETH", "MU", "NVDA", "XAU"], set(), 10, win, now=t0)
+    assert picked == ["BTC", "ETH"]        # 只有加密進 deepdive，保序
+    assert "MU" not in picked and "NVDA" not in picked   # 美股白名單擋
+    assert "XAU" not in picked             # 貴金屬商品擋
+
+
+def test_crypto_only_preserves_open_and_recent_filters(tmp_path, monkeypatch):
+    """task#73-B 與既有兩道閘正交：非加密被擋的同時，已開倉/近期已推的加密閘仍生效。"""
+    _isolate(tmp_path, monkeypatch)
+    t0 = 1_000_000
+    win = 86400
+    sg.mark_sent("ETH", "deepdive", now=t0)            # ETH 近期已推
+    picked, recently = _deepdive_candidates(
+        ["BTC", "ETH", "SOL", "MU"], {"SOL"}, 10, win, now=t0 + 60)
+    assert "ETH" in recently
+    assert picked == ["BTC"]               # ETH 冷卻、SOL 已開倉、MU 非加密 → 只剩 BTC
+
+
 def test_top_n_slicing_and_order_preserved(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     t0 = 1_000_000

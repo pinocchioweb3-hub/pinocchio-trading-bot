@@ -301,6 +301,40 @@ def lookup(query: str) -> str:
 
 
 # ===========================================================================
+# 渲染：新手白話小抄（task#10 P0-C 2e：DISPLAY_MODE 新手/專家模式）
+# ===========================================================================
+# 「看懂一張交易計畫卡」必需的核心術語（顯示順序即此順序）。刻意只收計畫上會出現的
+# 風控/部位詞，不灌全表（全表走 /指標）。
+NOVICE_LEGEND_KEYS: tuple[str, ...] = (
+    "stop_loss", "take_profit", "r_multiple", "leverage", "confidence",
+)
+
+
+def render_novice_legend(keys: tuple[str, ...] | None = None) -> str:
+    """新手白話小抄：把『看懂上面這張交易計畫必需的術語』用一句白話列出，給七種受眾裡的
+    新手端（賣菜阿婆／散戶新手）。回 HTML 字串可直接接到 deepdive 卡尾；無命中→回 ''。
+
+    ⛔ 紅線/不變量：本小抄**只含術語定義**（術語中文名＋abbr＋一句白話 what），**絕不含
+       任何計畫數字**（進場價／止損價／TP／R 值／槓桿倍數／部位）。這是 DISPLAY_MODE
+       新手模式 vs 專家模式的『唯一差異』——故同一張卡的計畫數字在兩模式下逐位元相同
+       （見 tests/test_display_mode.py 的 parity 斷言）。"""
+    sel = keys if keys is not None else NOVICE_LEGEND_KEYS
+    by_key = {t.key: t for t in TERMS}
+    lines: list[str] = []
+    for k in sel:
+        t = by_key.get(k)
+        if not t:
+            continue
+        abbr = f"（{_esc(t.abbr)}）" if t.abbr else ""
+        lines.append(f"• <b>{_esc(t.zh)}</b>{abbr}：{_esc(t.what)}")
+    if not lines:
+        return ""
+    return ("🔰 <b>新手白話小抄</b>\n"
+            + "\n".join(lines)
+            + "\n<i>想看完整說明與誠實提醒：</i><code>/指標 止損</code>")
+
+
+# ===========================================================================
 # 渲染：機器 JSON（給 AI Agent／未來信任網頁 #11 讀）—— 同一份 canonical 來源
 # ===========================================================================
 def glossary_json() -> dict:

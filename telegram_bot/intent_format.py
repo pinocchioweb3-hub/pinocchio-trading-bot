@@ -31,38 +31,17 @@
 """
 from __future__ import annotations
 
-import datetime as dt
-import hashlib
 import json
 from typing import Any, Optional
-
-from l2_trigger.leverage import choose_leverage, compute_position, compute_tp_prices
 
 SCHEMA_NAME = "trade-intent"
 SCHEMA_VERSION = "1.0"
 
 # 紅線：永不自動下實盤。只允許這兩種執行政策。
 ALLOWED_EXECUTION_MODES = ("human_gated", "demo_only")
-
-# 各資產類 / setup 的執行參數預設（max_slippage、意圖有效時長）
-_POLICY = {
-    ("crypto_perp", "intraday"): {"slippage": 0.15, "ttl_h": 4},
-    ("crypto_perp", "ambush"): {"slippage": 0.30, "ttl_h": 48},
-    ("crypto_spot", "intraday"): {"slippage": 0.15, "ttl_h": 4},
-    ("crypto_spot", "ambush"): {"slippage": 0.30, "ttl_h": 48},
-    ("equity_signal", "intraday"): {"slippage": 0.30, "ttl_h": 96},
-    ("equity_signal", "ambush"): {"slippage": 0.30, "ttl_h": 96},
-}
-_POLICY_DEFAULT = {"slippage": 0.30, "ttl_h": 24}
-
-
-def _iso(ts_ms: int | None) -> str:
-    """ms epoch → ISO8601 UTC（Z 結尾）。None → 現在。"""
-    if ts_ms:
-        t = dt.datetime.fromtimestamp(ts_ms / 1000, tz=dt.timezone.utc)
-    else:
-        t = dt.datetime.now(tz=dt.timezone.utc)
-    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+# 註：進場區 ± 帶 / _POLICY / _iso / 計畫計算已全數搬到 telegram_bot/plan.py（單一權威，
+#     v76 task#10）。此檔只留 _signal_note（供 plan.canonical_to_intent 取用）、validate_intent
+#     與便捷包裝；to_trade_intent/_compute_plan 委派 plan.py。
 
 
 def _signal_note(sig: dict) -> str:
@@ -91,50 +70,15 @@ def _signal_note(sig: dict) -> str:
 
 
 def _compute_plan(decision_dict: dict[str, Any]) -> dict[str, Any]:
-    """重算進場區/止損/槓桿/倉位/止盈 — 與 telegram_bot/message_format.render_fire_message
-    同邏輯、同來源（botconfig.CONFIG），確保「人看的卡片」與「機器 intent」永不打架。
+    """重算進場區/止損/槓桿/倉位/止盈。
 
-    ⚠️ 若 message_format 的進場區/止損公式變動，這裡必須同步（selftest 會抓內部一致性，
-    但跨檔同步靠人工：兩者都從 CONFIG 取數，差異只在進場區的 ± 百分比常數）。
+    v76 task#10：本函式已收斂為 telegram_bot/plan.build_canonical_plan 的薄包裝
+    （單一權威層）。intent 口徑用 risk_usd=1.0（R 去美元化「形狀」計算，金額不外洩）。
+    進場區 ± 帶/止損/槓桿/止盈的「唯一真值」現在都在 plan.py，三處拷貝漂移隱患終結。
+    保留本函式名與簽章只為相容既有呼叫端與測試（golden parity test 證明逐位元等價）。
     """
-    from botconfig import CONFIG
-
-    snap = decision_dict["snapshot"]
-    direction = decision_dict["direction"]          # "bull"/"bear"
-    setup = decision_dict["setup_name"]             # "intraday"/"ambush"
-    sym = snap["symbol"]
-    entry = snap["price"]
-
-    sl_pct = CONFIG.sl_pct(setup)
-    if direction == "bull":
-        stop = round(entry * (1 - sl_pct / 100), 6)
-    else:
-        stop = round(entry * (1 + sl_pct / 100), 6)
-
-    lev = choose_leverage(sym, snap.get("atr_pct_7d"))
-    # 倉位用 1U 風險做「形狀」計算（只為拿 sl_distance_pct，金額不外洩 — R 去美元化）
-    pos = compute_position(entry, stop, 1.0, lev)
-    tp_r = CONFIG.tp_r(setup)
-    tps = compute_tp_prices(entry, stop, direction, tp_r)
-
-    # 進場區間（與 message_format 完全一致）
-    if setup == "intraday":
-        if direction == "bull":
-            entry_low, entry_high = round(entry * 0.997, 6), round(entry * 1.002, 6)
-        else:
-            entry_low, entry_high = round(entry * 0.998, 6), round(entry * 1.003, 6)
-    else:  # ambush
-        if direction == "bull":
-            entry_low, entry_high = round(entry * 0.985, 6), round(entry, 6)
-        else:
-            entry_low, entry_high = round(entry, 6), round(entry * 1.015, 6)
-
-    return {
-        "sym": sym, "direction": direction, "setup": setup, "entry": entry,
-        "stop": stop, "lev": lev, "pos": pos, "tp_r": tp_r, "tps": tps,
-        "entry_low": entry_low, "entry_high": entry_high,
-        "sl_distance_pct": pos["sl_distance_pct"],
-    }
+    from telegram_bot.plan import build_canonical_plan
+    return build_canonical_plan(decision_dict, risk_usd=1.0)
 
 
 def to_trade_intent(decision_dict: dict[str, Any], *,
@@ -145,130 +89,14 @@ def to_trade_intent(decision_dict: dict[str, Any], *,
     asset_class: None → 自動判定（snapshot/decision 帶 asset_class 則用之，否則 crypto_perp）。
     execution_policy: 只允許 human_gated / demo_only（紅線）。
     """
-    if execution_policy not in ALLOWED_EXECUTION_MODES:
-        raise ValueError(
-            f"execution_policy 只允許 {ALLOWED_EXECUTION_MODES}，"
-            f"收到 {execution_policy!r}（本系統永不自動下實盤）")
-
-    from botconfig import CONFIG
-
-    snap = decision_dict["snapshot"]
-    plan = _compute_plan(decision_dict)
-    sym = plan["sym"]
-    direction = plan["direction"]
-    setup = plan["setup"]
-    side = "long" if direction == "bull" else "short"
-
-    # 資產類別判定
-    if asset_class is None:
-        asset_class = (decision_dict.get("asset_class")
-                       or snap.get("asset_class") or "crypto_perp")
-
-    # symbol 規範形：加密 BASE-USDT；美股維持代碼
-    if asset_class == "equity_signal":
-        symbol_canonical = sym
-        margin_mode = None
-    elif asset_class == "crypto_spot":
-        symbol_canonical = f"{sym}-USDT"
-        margin_mode = None
-    else:  # crypto_perp
-        symbol_canonical = f"{sym}-USDT"
-        margin_mode = "isolated"
-
-    ts_ms = snap.get("ts", 0)
-    created_at = _iso(ts_ms)
-    # intent_id：FIX ClOrdID 角色（去重/對帳）。同一訊號→同一 id（deterministic，便於 idempotent）。
-    seed = f"{symbol_canonical}|{setup}|{ts_ms}|{plan['entry']}|{plan['stop']}"
-    short = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
-    intent_id = f"ti_{created_at}_{sym}_{setup}_{short}"
-
-    pol = _POLICY.get((asset_class, setup), _POLICY_DEFAULT)
-    ref = plan["entry"]
-    price_band_pct = round(abs(plan["entry_high"] - plan["entry_low"]) / ref * 100, 3) if ref else 0.0
-    deadline = _iso((ts_ms or int(dt.datetime.now(tz=dt.timezone.utc).timestamp() * 1000))
-                    + pol["ttl_h"] * 3600 * 1000)
-
-    # 失效規則（多/空方向正確；不像舊卡片一律寫「跌破」）
-    if direction == "bull":
-        inval_rule = f"4h 收盤跌破 {plan['stop']}（1R 止損）"
-    else:
-        inval_rule = f"4h 收盤站上 {plan['stop']}（1R 止損）"
-
-    # 風險：R 去美元化 — 用帳戶% 表達。% 模式給設定值；固定 $ 模式留 null（不外洩金額，交易員自設）。
-    pct_of_account = CONFIG.risk_per_trade_pct if CONFIG.risk_per_trade_pct > 0 else None
-
-    # 止盈（多段分批）
-    tp_r = plan["tp_r"]
-    tps = plan["tps"]
-    split = CONFIG.tp_size_split
-    actions = [
-        f"平 {split[0] * 100:.0f}% + 止損移到開倉價",
-        f"平 {split[1] * 100:.0f}%",
-        f"平剩餘 {split[2] * 100:.0f}% 或移動止損",
-    ]
-    take_profits = []
-    for i in range(len(tp_r)):
-        take_profits.append({
-            "r_multiple": tp_r[i],
-            "price": tps[f"tp{i + 1}"],
-            "size_pct": round(split[i] * 100) if i < len(split) else None,
-            "action": actions[i] if i < len(actions) else "平剩餘",
-        })
-
-    # 決策理由（給人/LLM 上下文，不影響執行）
-    signals = []
-    for sig in decision_dict.get("confirmed", []):
-        st = sig.get("state")
-        if st in ("bull", "bear"):
-            signals.append({
-                "name": sig.get("name"),
-                "state": st,
-                "note": _signal_note(sig),
-            })
-    setup_zh = "日內爆發" if setup == "intraday" else "左側埋伏"
-    dir_zh = "做多" if direction == "bull" else "做空"
-    narrative = f"{sym} {setup_zh}；{dir_zh} setup（綜合分 {decision_dict.get('composite_score')}）"
-
-    intent = {
-        "schema": SCHEMA_NAME,
-        "version": SCHEMA_VERSION,
-        "intent_id": intent_id,
-        "created_at": created_at,
-        "asset_class": asset_class,
-        "symbol_canonical": symbol_canonical,
-        "venue_hint": None,
-        "side": side,
-        "order_type": "limit",
-        "time_in_force": "gtc",
-        "post_only": False,
-        "reduce_only": False,
-        "margin_mode": margin_mode,
-        "entry_zone": {
-            "low": plan["entry_low"],
-            "high": plan["entry_high"],
-            "reference": ref,
-        },
-        "invalidation": {"price": plan["stop"], "rule": inval_rule},
-        "risk": {
-            "pct_of_account": pct_of_account,
-            "suggested_leverage": plan["lev"],
-            "max_slippage_pct": pol["slippage"],
-        },
-        "take_profits": take_profits,
-        "acceptance": {
-            "price_band_pct": price_band_pct,
-            "deadline": deadline,
-            "max_slippage_pct": pol["slippage"],
-        },
-        "rationale": {
-            "composite_score": decision_dict.get("composite_score"),
-            "strength_score": snap.get("strength_score"),
-            "signals": signals,
-            "narrative": narrative,
-        },
-        "execution_policy": {"mode": execution_policy},
-    }
-    return intent
+    # v76 task#10：組裝收斂到單一權威 plan.canonical_to_intent（含 auto_live 紅線硬擋）。
+    # 規則型計畫用 risk_usd=1.0 的 canonical（R 去美元化）；deepdive 走 plan.canonical_from_deepdive
+    # 另路產 canonical 後同樣餵 canonical_to_intent。golden parity test 證明本委派逐位元等價。
+    from telegram_bot.plan import build_canonical_plan, canonical_to_intent
+    canonical = build_canonical_plan(decision_dict, risk_usd=1.0)
+    return canonical_to_intent(canonical, decision_dict,
+                               asset_class=asset_class,
+                               execution_policy=execution_policy)
 
 
 # ── 輕量驗證器（零外部相依；不依賴 jsonschema 套件）────────────────────────────

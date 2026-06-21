@@ -484,6 +484,64 @@ def get_open_paper() -> list[dict]:
         conn.close()
 
 
+def get_latest_deepdive_plan(symbol: str | None = None,
+                             direction: str | None = None) -> dict | None:
+    """task#10(2d)：把「最近一筆 deepdive 紙上計畫」重建成 LLM-plan 形狀，供 deepdive 卡的
+    「📋 複製 JSON」按鈕 / /intent 後備產出機器可讀 trade-intent。
+
+    回 dict（與 synthesizer._extract_plan_block 同形狀，餵得進 plan.canonical_from_deepdive）：
+        {actionable, symbol, direction, entry_type(market/limit),
+         entry, entry_lo, entry_hi, stop, tp1, tp2, tp3, entry_at}
+    限價區間從 entry_splits 的 price min/max 還原；entry_type 由 entry_splits 有無判定。
+    找不到（無 deepdive 列 / symbol/direction 不符）→ None，呼叫端安全降級。
+
+    ⛔ 紅線①：只讀 paper_trades（模擬盤帳），永不碰真錢帳本 `trades`。
+    """
+    init_db()
+    conn = _conn()
+    try:
+        sql = ("SELECT symbol, direction, entry_price, stop_price, tp1, tp2, tp3, "
+               "entry_at, entry_splits FROM paper_trades WHERE setup='deepdive'")
+        args: list = []
+        if symbol:
+            sql += " AND symbol=?"
+            args.append(symbol)
+        if direction:
+            sql += " AND direction=?"
+            args.append(direction)
+        sql += " ORDER BY id DESC LIMIT 1"
+        row = conn.execute(sql, args).fetchone()
+        if not row:
+            return None
+        sym, dirn, entry_price, stop_price, tp1, tp2, tp3, entry_at, splits_json = row
+        zone_lo = zone_hi = None
+        entry_type = "market"
+        if splits_json:
+            try:
+                prices = [s["price"] for s in json.loads(splits_json)
+                          if s.get("price") is not None]
+                if prices:
+                    zone_lo, zone_hi = min(prices), max(prices)
+                    entry_type = "limit"
+            except Exception:
+                zone_lo = zone_hi = None
+                entry_type = "market"
+        return {
+            "actionable": True,
+            "symbol": sym,
+            "direction": dirn,
+            "entry_type": entry_type,
+            "entry": entry_price,
+            "entry_lo": zone_lo,
+            "entry_hi": zone_hi,
+            "stop": stop_price,
+            "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "entry_at": entry_at,
+        }
+    finally:
+        conn.close()
+
+
 def set_paper_checkpoint(paper_id: int, ts_ms: int) -> None:
     """task#77：推進紙上倉的出場偵測檢查點到「最後一根已確認 5m bar」的 ts。
 

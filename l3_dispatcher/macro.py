@@ -842,11 +842,19 @@ def _deepdive_repush_window(interval_seconds: int) -> int:
 def _deepdive_candidates(trading_syms: list, open_syms_set: set,
                          max_n: int, repush_win: int,
                          now: int | None = None):
-    """選 deepdive 候選：排除①已開倉同幣 ②近期已推過 deepdive 卡的同幣（不分方向）。
+    """選 deepdive 候選：排除①已開倉同幣 ②近期已推過 deepdive 卡的同幣（不分方向）
+    ③非加密標的（task#73-B 治本）。
 
     回 (picked_top_n, recently_pushed_set)。純函式（symbol_gate 唯讀），便於離線測試。
     第②道是 v67 補的缺口：中性/非可做單卡不建紙上倉也不進 symbol_gate(bull/bear)，
     過去只靠 open_syms_set 擋＝對中性卡無效 → 同幣每 cadence 重推。
+    第③道（task#73-B）：deepdive 引擎做的是「加密 SMC/Wyckoff 結構分析」。美股走獨立
+    1h 突破投票引擎、本就無此卡（見 [[us-vs-crypto-engine]]）；貴金屬商品亦非本卡射程。
+    過去若美股/商品漏進交易層宇宙（watchlist.trading），run_per_symbol_loop 沒有任何
+    程式閘擋它——會對美股送出一張「加密結構」🎯 卡＝架構違規。此處以 _asset_kind 收口，
+    只有 🪙 加密才進 deepdive；被擋的非加密在 run_per_symbol_loop 印出（不靜默漏記）。
+    今日 watchlist.trading 來源（OKX USDT 永續 + 加密候選清單）本就純加密，故此閘現為
+    defense-in-depth；一旦上游來源變更導致美股/商品流入，這道閘確保不破壞架構。
     """
     from . import symbol_gate
     recently = {s for s in trading_syms
@@ -854,7 +862,8 @@ def _deepdive_candidates(trading_syms: list, open_syms_set: set,
                 and not symbol_gate.should_send(s, "deepdive",
                                                 window_s=repush_win, now=now)}
     picked = [s for s in trading_syms
-              if s not in open_syms_set and s not in recently]
+              if s not in open_syms_set and s not in recently
+              and _asset_kind(s)[0] == "🪙"]
     return picked[:max_n], recently
 
 
@@ -889,10 +898,16 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
             symbols, _recently = _deepdive_candidates(
                 list(watchlist.trading or []), open_syms_set,
                 max_symbols_per_run, _repush_win)
+            # task#73-B：把被「非加密」閘擋下的標的印出來，避免靜默漏記（紅線③：no silent caps）。
+            _non_crypto = sorted(s for s in (watchlist.trading or [])
+                                 if _asset_kind(s)[0] != "🪙")
             if open_syms_set or _recently:
                 print(f"[deepdive] excluding open: {sorted(open_syms_set)} "
                       f"| recently-pushed(<={_repush_win // 3600}h): {sorted(_recently)} "
                       f"(picked: {symbols})")
+            if _non_crypto:
+                print(f"[deepdive] non-crypto excluded (deepdive=加密結構分析專用): "
+                      f"{_non_crypto}")
             if not symbols:
                 print(f"[deepdive] no trading tier symbols (all open or empty), skipping")
             else:
@@ -912,10 +927,21 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
                                       f"（已被搶槽/近期已推同幣同向，避免重複單）")
                                 await asyncio.sleep(2)
                                 continue
+                            # task#10(2d)：可執行方向才掛「📋 複製 JSON」鈕。
+                            #   callback 走 symbol+direction 查最近一筆 deepdive 紙上計畫
+                            #   重建 trade-intent（⛔只讀 paper_trades，永不碰真錢帳本 trades）。
+                            # task#10(2e)：同樣只在可執行卡附『新手白話小抄』（純定義、零計畫
+                            #   數字），中性卡保持乾淨。專家模式不附；卡片本體/計畫數字兩模式相同。
+                            _actionable = _dir in ("bull", "bear")
+                            _buttons = ([[{"text": "📋 複製 JSON",
+                                           "callback_data": f"dintent:{sym}:{_dir}"}]]
+                                        if _actionable else None)
+                            card_text = _with_display_mode(text) if _actionable else text
                             sig_mid = await _send_to_telegram(
-                                tg, text,
+                                tg, card_text,
                                 prefix=(f"🎯 <b>{sym} 交易計畫深度分析</b>\n"
-                                        + await _shadow_observe_prefix(sym_state))
+                                        + await _shadow_observe_prefix(sym_state)),
+                                buttons=_buttons
                             )
                             if _dir in ("bull", "bear") and not sig_mid:
                                 # v48: 送出失敗 → 歸還搶到的槽，下輪可重試（不靜默漏單）
@@ -1056,19 +1082,50 @@ async def _shadow_observe_prefix(sym_state: dict) -> str:
         return ""
 
 
-async def _send_to_telegram(tg, text: str, prefix: str = "") -> int:
+def _display_mode() -> str:
+    """task#10(2e)：讀 DISPLAY_MODE（novice/expert，預設 novice）。
+    純顯示鍵——不入 strength/l2_trigger 任何訊號或下單數學，不做數值夾擠，
+    set_override 任意字串鍵照收（與 SHADOW_* 物理隔離無關）。壞值一律退回 novice。"""
+    try:
+        from botconfig import get_str
+        m = (get_str("DISPLAY_MODE", "novice") or "novice").strip().lower()
+        return m if m in ("novice", "expert") else "novice"
+    except Exception:
+        return "novice"
+
+
+def _with_display_mode(text: str) -> str:
+    """task#10(2e)：新手模式在卡尾附『新手白話小抄』（純術語定義、零計畫數字）；
+    專家模式原樣回傳。
+
+    ⛔ 不變量：兩模式的『差異』只有這段定義小抄——卡片本體（LLM 論述）與機器計畫
+       數字逐位元相同（見 tests/test_display_mode.py parity 斷言）。小抄取錯/空→原樣。"""
+    if _display_mode() == "expert":
+        return text
+    try:
+        from .glossary import render_novice_legend
+        legend = render_novice_legend()
+    except Exception:
+        legend = ""
+    return f"{text}\n\n{legend}" if legend else text
+
+
+async def _send_to_telegram(tg, text: str, prefix: str = "",
+                            buttons: list | None = None) -> int:
     """共用 send + auto-split + plain text fallback。
-    v33：回傳第一則訊息的 message_id（>0 代表成功、可當連結錨點；0=失敗）。"""
+    v33：回傳第一則訊息的 message_id（>0 代表成功、可當連結錨點；0=失敗）。
+    task#10(2d)：buttons（inline_keyboard 列陣列）只掛在『最後一段』——分段時讓
+    「📋 複製 JSON」按鈕貼在卡片結尾，不會散落在中段。"""
     import re as _re
     full = f"{prefix}{text}"
 
-    async def _try_send(part: str) -> int:
-        resp = await tg.send_message(part, parse_mode="HTML")
+    async def _try_send(part: str, btns: list | None = None) -> int:
+        resp = await tg.send_message(part, parse_mode="HTML", inline_buttons=btns)
         if resp.get("ok"):
             return resp.get("result", {}).get("message_id", 0) or 0
-        # HTML 失敗 → 剝標籤改純文字（不傳 parse_mode）
+        # HTML 失敗 → 剝標籤改純文字（不傳 parse_mode），按鈕照掛
         plain = _re.sub(r"<[^>]+>", "", part)
-        resp2 = await tg.send_message(plain, parse_mode=None)
+        resp2 = await tg.send_message(plain, parse_mode=None, inline_buttons=btns)
         return resp2.get("result", {}).get("message_id", 0) or 0 if resp2.get("ok") else 0
 
     first_id = 0
@@ -1081,12 +1138,13 @@ async def _send_to_telegram(tg, text: str, prefix: str = "") -> int:
                 cur += ("\n" if cur else "") + line
         if cur: parts.append(cur)
         for i, p in enumerate(parts, 1):
-            mid = await _try_send(f"<b>[{i}/{len(parts)}]</b>\n{p}")
+            _btns = buttons if i == len(parts) else None   # 按鈕只掛最後一段
+            mid = await _try_send(f"<b>[{i}/{len(parts)}]</b>\n{p}", _btns)
             if i == 1:
                 first_id = mid
             await asyncio.sleep(0.5)
     else:
-        first_id = await _try_send(full)
+        first_id = await _try_send(full, buttons)
     return first_id
 
 

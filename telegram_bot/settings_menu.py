@@ -23,6 +23,12 @@ def render_settings() -> tuple[str, list[list[dict]]]:
     _mode = get_str("SIGNAL_MODE", "balanced")
     _mode_zh = {"steady": "🛡️ 穩健（低頻高質）", "balanced": "⚖️ 平衡",
                 "aggressive": "🔥 積極（高頻高波動）"}.get(_mode, "⚖️ 平衡")
+    # task#10(2e)：顯示模式（純呈現層，不碰任何訊號/下單數學）。新手＝卡尾附白話小抄。
+    _disp = (get_str("DISPLAY_MODE", "novice") or "novice").strip().lower()
+    if _disp not in ("novice", "expert"):
+        _disp = "novice"
+    _disp_zh = {"novice": "🔰 新手（附白話小抄）",
+                "expert": "🎓 專家（精簡）"}.get(_disp, "🔰 新手（附白話小抄）")
     if CONFIG.risk_per_trade_pct > 0:
         risk_line = (f"帳戶 <b>{CONFIG.risk_per_trade_pct:g}%</b>"
                      f"（≈ ${CONFIG.risk_per_trade_usd:,.0f}／筆，本金 ${CONFIG.account_balance_usd:,.0f}）")
@@ -36,6 +42,7 @@ def render_settings() -> tuple[str, list[list[dict]]]:
         f"📊 最多同時持倉：<b>{CONFIG.max_concurrent_trades}</b> 倉\n"
         f"⚡ 槓桿：<b>{CONFIG.default_leverage}x</b>（1–50x 自己定；高槓桿放大盈虧、也更接近爆倉）\n"
         f"🎚️ 訊號模式：<b>{_mode_zh}</b>\n"
+        f"👁️ 顯示模式：<b>{_disp_zh}</b>\n"
         f"🎯 啟用策略：<b>{len(enabled_ids)}</b> 個\n"
         "\n<i>點按鈕即時調整，立刻套用到下一筆訊號。</i>"
     )
@@ -58,6 +65,10 @@ def render_settings() -> tuple[str, list[list[dict]]]:
     buttons.append([_btn("⚡5x", "set:lev:5"), _btn("10x", "set:lev:10"),
                     _btn("15x", "set:lev:15"), _btn("20x", "set:lev:20")])
     buttons.append([_btn("30x", "set:lev:30"), _btn("50x", "set:lev:50")])
+    # 顯示模式（單選；新手＝卡尾白話小抄，專家＝精簡。純呈現層，零訊號數學）
+    def _db(label, val):
+        return _btn(("● " if _disp == val else "") + label, f"set:display:{val}")
+    buttons.append([_db("🔰新手", "novice"), _db("🎓專家", "expert")])
     # 策略開關（每列一個，含勾選狀態）
     mat = {"live": "🟢", "paper": "🧪", "experimental": "🔬"}
     for m in REGISTRY.values():
@@ -103,6 +114,14 @@ async def handle_settings_callback(tg, cq: dict) -> bool:
             set_override("SIGNAL_MODE", mv, source="human")
             note = "訊號模式改為 " + {"steady": "🛡️穩健", "balanced": "⚖️平衡",
                                       "aggressive": "🔥積極"}.get(mv, mv)
+        elif action == "display":
+            # task#10(2e)：純呈現層切換（新手卡尾附白話小抄 / 專家精簡）。
+            #   非法值落回 novice；不碰任何訊號或下單數學。
+            dv = parts[2] if len(parts) > 2 else "novice"
+            if dv not in ("novice", "expert"):
+                dv = "novice"
+            set_override("DISPLAY_MODE", dv, source="human")
+            note = "顯示模式改為 " + {"novice": "🔰新手", "expert": "🎓專家"}.get(dv, dv)
         elif action == "strat":
             sid = parts[2]
             from l2_trigger.registry import REGISTRY, enabled_strategies

@@ -8,8 +8,6 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-from l2_trigger.leverage import choose_leverage, compute_position, compute_tp_prices
-
 
 def _esc(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -81,40 +79,20 @@ def render_fire_message(decision_dict: dict[str, Any]) -> tuple[str, list[list[d
     dir_emoji = "📈" if direction == "bull" else "📉"
     dir_zh = "做多" if direction == "bull" else "做空"
 
-    # === 風控數字 ===
-    # v15: SL 與 dispatcher 帳本/trade_monitor 監控統一為 4.0%（intraday loose profile）
-    # 原本這裡寫 3.5% 但帳本記 4.0%，使用者照訊息掛單、系統卻用另一個價判停損
-    # v23-2: 與 dispatcher 同源（botconfig）— 終結兩處複製的不同步隱患
+    # === 風控數字（單一權威：telegram_bot/plan.build_canonical_plan）===
+    # v76 task#10：進場區/止損/槓桿/倉位/止盈不再在此重算 —— 與機器 intent、帳本同源於
+    # plan.py，終結三處 ± 常數拷貝的漂移隱患。卡片口徑用預設 risk_usd（CONFIG.risk_per_trade_usd）；
+    # sl_distance_pct 與金額無關，故與機器 intent 的 1.0 口徑顯示完全一致。
     from botconfig import CONFIG
-    entry = snap["price"]
-    sl_pct = CONFIG.sl_pct(setup)
-    if direction == "bull":
-        stop = round(entry * (1 - sl_pct / 100), 6)
-    else:
-        stop = round(entry * (1 + sl_pct / 100), 6)
-    risk_usd = CONFIG.risk_per_trade_usd
-    lev = choose_leverage(sym, snap.get("atr_pct_7d"))
-    pos = compute_position(entry, stop, risk_usd, lev)
-    tp_r = CONFIG.tp_r(setup)
-    tps = compute_tp_prices(entry, stop, direction, tp_r)
-
-    # === 進場區間（不是單一價）===
-    # Intraday: 從訊號價 -0.3% 到 +0.2%（追進場時容忍突破回測）
-    # Ambush:   左側埋伏，從支撐區下方 1.5% 到當前價（分批掛低，等回踩）
-    if setup == "intraday":
-        if direction == "bull":
-            entry_low = round(entry * 0.997, 6)
-            entry_high = round(entry * 1.002, 6)
-        else:
-            entry_low = round(entry * 0.998, 6)
-            entry_high = round(entry * 1.003, 6)
-    else:  # ambush
-        if direction == "bull":
-            entry_low = round(entry * 0.985, 6)  # 支撐區下方 1.5%
-            entry_high = round(entry, 6)
-        else:
-            entry_low = round(entry, 6)
-            entry_high = round(entry * 1.015, 6)
+    from telegram_bot.plan import build_canonical_plan
+    plan = build_canonical_plan(decision_dict)
+    entry = plan["entry"]
+    stop = plan["stop"]
+    pos = plan["pos"]
+    tp_r = plan["tp_r"]
+    tps = plan["tps"]
+    entry_low = plan["entry_low"]
+    entry_high = plan["entry_high"]
 
     # === 訊號描述 ===
     sig_lines = []

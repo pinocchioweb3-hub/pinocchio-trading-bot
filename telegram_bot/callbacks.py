@@ -116,21 +116,15 @@ async def _handle_callback(tg: TelegramClient, cq: dict) -> None:
 # ===========================================================================
 # v45: 通用交易意圖（trade-intent JSON）— /intent 指令與「📋 複製可執行 JSON」按鈕共用
 # ===========================================================================
-async def _send_intent_json(tg: TelegramClient, decision: dict, thread_id,
-                            *, intro: str = "") -> None:
-    """把 decision_dict 編成 trade-intent JSON 後送出（跨所通用、宣告式、永不自動下實盤）。
-    優先用 <pre> 區塊（手機可一鍵複製）；過長則純文字分段直送（避開 4096 截斷）。"""
+async def _emit_intent(tg: TelegramClient, intent: dict, thread_id,
+                       *, intro: str = "") -> None:
+    """把『已組好』的 trade-intent dict 送出（驗證 + <pre> 手機一鍵複製 / 過長純文字分段）。
+    規則型(trades 來源) 與 deepdive(paper 來源) intent 共用此送出器 → 呈現一致。"""
     import html as _html
     import json as _json
 
-    from .intent_format import to_trade_intent, validate_intent
+    from .intent_format import validate_intent
 
-    try:
-        intent = to_trade_intent(decision)
-    except Exception as e:
-        await tg.send_message(f"⚠️ 無法產生 intent：{type(e).__name__}: {e}",
-                              parse_mode="HTML", message_thread_id=thread_id)
-        return
     problems = validate_intent(intent)
     blob = _json.dumps(intent, ensure_ascii=False, indent=2)
 
@@ -148,6 +142,20 @@ async def _send_intent_json(tg: TelegramClient, decision: dict, thread_id,
         await tg.send_message(
             "⚠️ intent 結構檢查警告：" + "；".join(problems[:5]),
             parse_mode="HTML", message_thread_id=thread_id)
+
+
+async def _send_intent_json(tg: TelegramClient, decision: dict, thread_id,
+                            *, intro: str = "") -> None:
+    """把 decision_dict 編成 trade-intent JSON 後送出（跨所通用、宣告式、永不自動下實盤）。"""
+    from .intent_format import to_trade_intent
+
+    try:
+        intent = to_trade_intent(decision)
+    except Exception as e:
+        await tg.send_message(f"⚠️ 無法產生 intent：{type(e).__name__}: {e}",
+                              parse_mode="HTML", message_thread_id=thread_id)
+        return
+    await _emit_intent(tg, intent, thread_id, intro=intro)
 
 
 _INTENT_INTRO = (
@@ -187,6 +195,60 @@ async def _handle_intent_callback(tg: TelegramClient, cq: dict) -> None:
     await tg.answer_callback_query(cq_id, "已產生可執行 JSON ↓")
     await _send_intent_json(tg, decision, msg.get("message_thread_id"),
                             intro=_INTENT_INTRO)
+
+
+def _intent_asset_class(symbol: str) -> str:
+    """deepdive 卡涵蓋加密/美股/商品；用 macro._asset_kind 判資產類別給 intent 組裝。
+
+    🇺🇸 美股 → equity_signal（symbol 不加 -USDT、無保證金/槓桿假設，誠實標成股票訊號；
+        deepdive 偶混入美股是 task#73(B) 待修，混入時這樣標最不誤導）。
+    🥇 商品 / 🪙 加密 → crypto_perp（來自加密強勢掃描器，交易所多為 -USDT 永續）。
+    任何錯誤 → crypto_perp（deepdive 主體即加密，安全預設）。
+    """
+    try:
+        from l3_dispatcher.macro import _asset_kind
+        emoji, _ = _asset_kind(symbol)
+        return "equity_signal" if emoji == "🇺🇸" else "crypto_perp"
+    except Exception:
+        return "crypto_perp"
+
+
+async def _handle_deepdive_intent_callback(tg: TelegramClient, cq: dict) -> None:
+    """deepdive 卡「📋 複製 JSON」按鈕：callback_data='dintent:{SYM}:{dir}'。
+
+    deepdive 是目前唯一活躍的使用者卡，但其機器 JSON 在此之前是死的（get_signal_for_intent
+    只讀真錢帳本 trades，恆空）。本處從模擬盤 paper_trades 重建最近一筆 deepdive 計畫，
+    走 plan.intent_from_deepdive_paper 組出通用 trade-intent JSON。
+
+    ⛔ 紅線①：只讀模擬盤 paper_trades，永不碰真錢帳本 trades。"""
+    from l3_dispatcher.paper_journal import get_latest_deepdive_plan
+    from telegram_bot.plan import intent_from_deepdive_paper
+
+    cq_id = cq.get("id", "")
+    data = cq.get("data", "") or ""
+    msg = cq.get("message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    if chat_id not in _authorized_chats():
+        await tg.answer_callback_query(cq_id, "未授權")
+        return
+
+    parts = data.split(":")
+    if len(parts) != 3:
+        await tg.answer_callback_query(cq_id, "按鈕資料損壞")
+        return
+    sym, direction = parts[1], parts[2]
+    paper = get_latest_deepdive_plan(symbol=sym, direction=direction)
+    if not paper:
+        await tg.answer_callback_query(cq_id, "找不到此標的的深度分析計畫", show_alert=True)
+        return
+    try:
+        intent = intent_from_deepdive_paper(paper, asset_class=_intent_asset_class(sym))
+    except Exception as e:
+        await tg.answer_callback_query(
+            cq_id, f"無法產生 intent：{type(e).__name__}", show_alert=True)
+        return
+    await tg.answer_callback_query(cq_id, "已產生可執行 JSON ↓")
+    await _emit_intent(tg, intent, msg.get("message_thread_id"), intro=_INTENT_INTRO)
 
 
 # ===========================================================================
@@ -632,10 +694,24 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
         decision = (get_signal_for_intent(symbol=sym_arg) if sym_arg
                     else get_signal_for_intent())
         if not decision:
+            # task#10(2d) 後備：trades 帳恆空（deepdive 只寫 paper_trades）。改從最近一筆
+            #   deepdive 紙上計畫產 intent，讓唯一活躍卡的 /intent 不再永遠落空。
+            #   ⛔ 只讀模擬盤 paper_trades（紅線①）。
+            from l3_dispatcher.paper_journal import get_latest_deepdive_plan
+            paper = get_latest_deepdive_plan(symbol=sym_arg)
+            if paper:
+                try:
+                    from telegram_bot.plan import intent_from_deepdive_paper
+                    intent = intent_from_deepdive_paper(
+                        paper, asset_class=_intent_asset_class(paper["symbol"]))
+                    await _emit_intent(tg, intent, thread_id, intro=_INTENT_INTRO)
+                except Exception as e:
+                    print(f"[callbacks] deepdive intent error: {type(e).__name__}: {e}")
+                return
             who = f"「{sym_arg}」的" if sym_arg else ""
             reply = (f"找不到{who}近期訊號快照。\n"
                      "FIRE 訊號發出後即可用 <code>/intent</code> 取得它的可執行 JSON，"
-                     "或直接點訊號卡片上的「📋 複製可執行 JSON」按鈕。")
+                     "或直接點訊號卡片上的「📋 複製 JSON」按鈕。")
         else:
             try:
                 await _send_intent_json(tg, decision, thread_id, intro=_INTENT_INTRO)
@@ -693,6 +769,9 @@ async def run_interactive_listener(tg: TelegramClient, poll_seconds: float = 2.0
                             elif (cq.get("data") or "").startswith("set:"):
                                 from .settings_menu import handle_settings_callback
                                 await handle_settings_callback(tg, cq)
+                            elif (cq.get("data") or "").startswith("dintent:"):
+                                # task#10(2d): deepdive 卡「📋 複製 JSON」（paper 來源）
+                                await _handle_deepdive_intent_callback(tg, cq)
                             elif (cq.get("data") or "").startswith("intent:"):
                                 # v45: 「📋 複製可執行 JSON」按鈕
                                 await _handle_intent_callback(tg, cq)
