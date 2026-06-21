@@ -333,9 +333,12 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
     # v82：0 晉升日（常態）每桶皆「⏸️維持」零資訊 → 收斂為結論一行＋收斂進度，
     #   把每日 ~4800 字洗版牆壓成可掃讀的一則；全文明細仍可由 active 覆寫表/帳本回溯。
     if result["n_promoted"] == 0:
-        max_n = max((b.get("n_plans", 0) for b in result["buckets"]), default=0)
-        prog = (f"，最大桶 n={max_n}（差 {30 - max_n} 筆達門檻 30）"
-                if max_n < 30 else f"，最大桶 n={max_n}")
+        # v83(6)：進度用 L2 實際把關的「對齊樣本 n_aligned」估距門檻（raw 桶筆數會樂觀高估）
+        _aligned = [getattr(b["chosen"][1], "n_aligned", 0) or 0
+                    for b in result["buckets"] if b.get("chosen")]
+        max_n = max(_aligned) if _aligned else 0
+        prog = (f"，最大對齊樣本 n_aligned={max_n}（差 {30 - max_n} 筆達門檻 30）"
+                if max_n < 30 else f"，最大對齊樣本 n_aligned={max_n}")
         return ("🎚️ <b>入場積極度自動優化器</b>\n"
                 f"掃 {result.get('n_rows', '?')} 筆／{result['n_buckets']} 桶｜"
                 f"本輪晉升 <b>0</b> 桶（最佳挑戰者皆未過 L2{prog}）\n"

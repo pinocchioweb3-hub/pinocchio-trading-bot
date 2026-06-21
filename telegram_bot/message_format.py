@@ -267,6 +267,7 @@ def render_health_alert(check) -> str:
         "dispatch_failures": "訊號送達失敗",
         "scheduler_stalled": "排程卡住",
         "data_quality_low": "資料品質下降",
+        "plan_snapshot_degraded": "進場計畫捕捉退化",
     }.get(check.kind, check.kind)
     return (
         f"{icon} <b>系統監督警報 [{sev_zh}]</b>\n"

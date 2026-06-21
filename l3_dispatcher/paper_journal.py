@@ -775,6 +775,7 @@ def _wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     """勝率 Wilson 95% 信賴區間（純數學、零相依/零網路）。小樣本會很寬＝誠實顯示不確定。"""
     if n <= 0:
         return (0.0, 0.0)
+    k = max(0, min(k, n))   # v83(6) 縱深防禦：夾定義域，p>1 會丟 complex 而崩
     p = k / n
     denom = 1.0 + z * z / n
     centre = p + z * z / (2 * n)
@@ -792,8 +793,8 @@ def _paper_summary_stat_note(stats: dict) -> str:
     if _display_mode_pj() == "expert":
         wr = (stats.get("win_rate_pct", 0) or 0) / 100.0
         lo, hi = _wilson_ci(round(wr * n), n)
-        tail = ("（n<30 未達顯著門檻，僅描述非結論）" if n < 30
-                else "（原始 n；同日叢聚下有效樣本更低，顯著性另見 crypto-EV 工具）")
+        tail = ("（n<30：勝率與 EV 皆未達顯著門檻，僅描述非結論）" if n < 30
+                else "（原始 n；同日叢聚下有效樣本更低，勝率與 EV 顯著性另見 crypto-EV 工具）")
         return (f"\n🎓 <i>勝率 95%CI [{lo*100:.0f}%–{hi*100:.0f}%]｜n={n}{tail}"
                 "；紙上非真錢、過去命中率≠未來</i>")
     return ("\n🔰 <i>勝率＝過去這些紙上單的命中比例，<b>不代表未來、樣本量也還沒到可下結論</b>；"

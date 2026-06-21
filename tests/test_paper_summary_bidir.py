@@ -68,3 +68,11 @@ def test_empty_no_note(monkeypatch):
 def test_wilson_ci_wide_for_small_n():
     lo, hi = _wilson_ci(18, 42)  # ~42.9%
     assert 0.0 <= lo < 0.43 < hi <= 1.0 and (hi - lo) > 0.25  # 小樣本區間很寬=誠實
+
+
+def test_wilson_ci_clamps_domain():
+    # v83(6) 縱深防禦：k>n（p>1）不得丟 complex 而崩；夾回 [0,1]
+    lo, hi = _wilson_ci(50, 42)
+    assert 0.0 <= lo <= 1.0 and 0.0 <= hi <= 1.0
+    lo2, hi2 = _wilson_ci(-3, 42)
+    assert 0.0 <= lo2 <= 1.0 and 0.0 <= hi2 <= 1.0

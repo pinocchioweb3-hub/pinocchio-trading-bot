@@ -30,3 +30,17 @@ def test_specific_formatter_still_works():
     out = _fmt_signal_evidence({"name": "funding",
                                 "evidence": {"funding": 0.0001, "regime": "neutral"}})
     assert "8h" in out and "中性" in out
+
+
+# ── v83(6)：孿生函式 intent_format._signal_note 同樣不得倒 raw dict（可執行 JSON 出口）──
+def test_intent_note_unknown_no_raw_dict():
+    from telegram_bot.intent_format import _signal_note
+    out = _signal_note({"name": "brand_new_sig",
+                        "evidence": {"foo": 1, "secret_internal": 9}})
+    assert "{" not in out and "foo" not in out and "secret_internal" not in out
+
+
+def test_intent_note_uses_shared_label():
+    from telegram_bot.intent_format import _signal_note
+    out = _signal_note({"name": "atr_coiling", "evidence": {}})
+    assert "ATR 收斂" in out and "{" not in out

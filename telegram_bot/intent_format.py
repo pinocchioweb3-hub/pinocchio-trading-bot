@@ -65,8 +65,14 @@ def _signal_note(sig: dict) -> str:
         return f"7d CVD 斜率 {(ev.get('cvd_slope_7d', 0) or 0):+.3f}"
     if name == "large_holder_creeping":
         return f"7d 大戶持倉斜率 {(ev.get('top_trader_slope_7d', 0) or 0):+.4f}"
-    # 退化：給出原始證據的短摘要
-    return str(ev)[:80] if ev else ""
+    # 退化（v83(6) 治本，對齊 message_format._fmt_signal_evidence）：未知訊號型態
+    #   絕不倒 raw evidence dict——這會把內部鍵名/開發殘渣帶進使用者「複製可執行 JSON」卡
+    #   （最該守的可執行出口）。改用共用 _SIGNAL_LABEL 給人類可讀名（lazy import 避免循環）。
+    try:
+        from telegram_bot.message_format import _SIGNAL_LABEL
+        return _SIGNAL_LABEL.get(name, name)
+    except Exception:
+        return name or ""
 
 
 def _compute_plan(decision_dict: dict[str, Any]) -> dict[str, Any]:
