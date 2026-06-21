@@ -1403,10 +1403,11 @@ async def run_position_tracker_loop(tg, source, interval_seconds: int = 3600):
         for o in positions:
             sym = o["symbol"]
             a_emoji, _ = _asset_kind(sym, o.get("setup", ""))
+            dir_zh = "做多" if o["direction"] == "bull" else "做空"  # v83：與 FIRE 卡一致中文化
             link = _signal_link(tg, o.get("_link_id"))
             cur = prices.get(sym)
             if cur is None:
-                lines.append(f"⚪ {a_emoji}<b>{sym} {o['direction']}</b> (價格抓取失敗){link}")
+                lines.append(f"⚪ {a_emoji}<b>{sym} {dir_zh}</b> (價格抓取失敗){link}")
                 continue
 
             entry = o["entry_price"]; stop = o["stop_price"]; tp1 = o.get("tp1")
@@ -1439,12 +1440,12 @@ async def run_position_tracker_loop(tg, source, interval_seconds: int = 3600):
             if o["legs_hit"]:
                 legs_str = f"  已過：<code>{','.join(sorted(o['legs_hit']))}</code>"
             lines.append(
-                f"{icon} {a_emoji}<b>{sym} {o['direction']}</b> (進場 {age_h:.1f}h 前){legs_str}{link}\n"
+                f"{icon} {a_emoji}<b>{sym} {dir_zh}</b> (進場 {age_h:.1f}h 前){legs_str}{link}\n"
                 f"   進場 <code>${entry:.4f}</code> → 現價 <code>${cur:.4f}</code> "
                 f"(<code>{cur_r:+.2f}R</code>)\n"
                 f"   距 TP1 <code>{to_tp1_pct:+.2f}%</code>  距 SL <code>{to_sl_pct:+.2f}%</code>"
                 if tp1 else
-                f"{icon} {a_emoji}<b>{sym} {o['direction']}</b> (進場 {age_h:.1f}h 前){link}\n"
+                f"{icon} {a_emoji}<b>{sym} {dir_zh}</b> (進場 {age_h:.1f}h 前){link}\n"
                 f"   進場 <code>${entry:.4f}</code> → 現價 <code>${cur:.4f}</code> (<code>{cur_r:+.2f}R</code>)"
             )
 
