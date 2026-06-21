@@ -1190,6 +1190,23 @@ def _macro_confluence_dashboard_line() -> str:
         return ""
 
 
+def _daily_macro_tldr(state) -> str:
+    """task#4 巨牆漸進揭露最小安全落地：每日宏觀牆最前置『一句話結論』(市場 Regime ＋影子綜合
+    宏觀分數)，讓結論不被下方數千字細節淹沒。缺料→誠實省略，永不杜撰(紅線③)。純呈現附加。"""
+    try:
+        advice = (state or {}).get("regime_advice", {}) or {}
+        label = advice.get("label", "")
+        if not label:
+            return ""
+        color = advice.get("color", "")
+        score = _read_macro_confluence_score()
+        score_txt = (f"｜綜合宏觀 <code>{score:+.1f}</code>/100（影子·非進場訊號）"
+                     if score is not None else "")
+        return f"🧭 <b>一句話</b>：Regime {color} {label}{score_txt}"
+    except Exception:
+        return ""
+
+
 def _read_macro_confluence_record():
     """純讀 macro_confluence.jsonl 末行整筆 dict（市場層宏觀背景，進場時凍結用）。
     檔缺/空/壞 JSON/末行非 dict → None。零 API、零重算，與
@@ -1594,9 +1611,11 @@ async def run_daily_macro_loop(tg, source, watchlist, target_hour_utc: int = 0,
             # (B) 影子顯示：每日宏觀卡附「綜合宏觀儀表板（影子觀測，非進場訊號）」。
             #     純讀本地 jsonl 末行；dash 為空時 prefix 原樣、daily macro 照常送。
             dash = _macro_confluence_dashboard_line()
-            await _send_to_telegram(
-                tg, text,
-                prefix=(prefix + dash + "\n") if dash else prefix)
+            tldr = _daily_macro_tldr(state)   # v84 task#4：結論前置（一句話），不被巨牆淹沒
+            extra = (tldr + "\n") if tldr else ""
+            if dash:
+                extra += dash + "\n"
+            await _send_to_telegram(tg, text, prefix=prefix + extra)
             print(f"[daily-macro] sent ({meta.get('output_chars')} chars)")
             return True
         # 敘事引擎離線/失敗 → 降級模板版（不再靜默消失）
