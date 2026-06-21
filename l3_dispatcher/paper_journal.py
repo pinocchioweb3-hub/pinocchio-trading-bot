@@ -670,6 +670,9 @@ def get_paper_stats(days: int = 30, setup: str | None = None,
         wins = [r for r in closed if (r[2] or 0) > 0]
         total_pnl = sum(r[1] or 0 for r in closed)
         rs = [r[2] or 0 for r in closed]
+        _rmean = (sum(rs) / len(rs)) if rs else 0.0
+        r_std = (((sum((x - _rmean) ** 2 for x in rs) / (len(rs) - 1)) ** 0.5)
+                 if len(rs) > 1 else 0.0)   # 樣本標準差（task#4：供 EV 信賴區間）
         gain = sum(r for r in rs if r > 0)
         loss = abs(sum(r for r in rs if r < 0))
         pf = (gain / loss) if loss > 0 else (float("inf") if gain > 0 else 0.0)
@@ -681,6 +684,7 @@ def get_paper_stats(days: int = 30, setup: str | None = None,
             "win_rate_pct": round(len(wins) / len(closed) * 100, 1) if closed else 0.0,
             "total_pnl_usd": round(total_pnl, 2),
             "avg_r": round(sum(rs) / len(rs), 3) if rs else 0.0,
+            "r_std": round(r_std, 3),
             "profit_factor": round(pf, 2) if pf != float("inf") else None,
             "stage0_progress": f"{len(closed)}/100",  # 自動交易 Stage 1 門檻
         }
@@ -806,10 +810,16 @@ def _paper_summary_stat_note(stats: dict) -> str:
     if _display_mode_pj() == "expert":
         wr = (stats.get("win_rate_pct", 0) or 0) / 100.0
         lo, hi = _wilson_ci(round(wr * n), n)
+        # EV 95%CI（常態近似 avg_r ± 1.96·SE；小樣本很寬＝誠實顯示不確定；含0＝未證實正期望值）
+        avg_r = stats.get("avg_r", 0.0) or 0.0
+        se = (stats.get("r_std", 0.0) or 0.0) / (n ** 0.5) if n > 0 else 0.0
+        ev_lo, ev_hi = avg_r - 1.96 * se, avg_r + 1.96 * se
+        ev_note = (f"｜EV 95%CI [{ev_lo:+.2f}, {ev_hi:+.2f}]R"
+                   + ("（含0＝未證實有正期望值）" if ev_lo <= 0 <= ev_hi else ""))
         tail = ("（n<30：勝率與 EV 皆未達顯著門檻，僅描述非結論）" if n < 30
-                else "（原始 n；同日叢聚下有效樣本更低，勝率與 EV 顯著性另見 crypto-EV 工具）")
-        return (f"\n🎓 <i>勝率 95%CI [{lo*100:.0f}%–{hi*100:.0f}%]｜n={n}{tail}"
-                "；紙上非真錢、過去命中率≠未來</i>")
+                else "（原始 n；同日叢聚下有效樣本更低，顯著性另見 crypto-EV 工具）")
+        return (f"\n🎓 <i>勝率 95%CI [{lo*100:.0f}%–{hi*100:.0f}%]{ev_note}｜n={n}{tail}"
+                "；紙上非真錢、過去≠未來</i>")
     return ("\n🔰 <i>勝率＝過去這些紙上單的命中比例，<b>不代表未來、樣本量也還沒到可下結論</b>；"
             "這是模擬盤紀錄、非真錢績效</i>")
 

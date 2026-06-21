@@ -9,7 +9,7 @@ import l3_dispatcher.paper_journal as pj
 from l3_dispatcher.paper_journal import render_paper_summary, _wilson_ci
 
 STATS = {"n_closed": 42, "n_open": 3, "win_rate_pct": 42.9, "avg_r": -0.02,
-         "window_days": 30, "stage0_progress": "42/100", "total_pnl_usd": -264}
+         "r_std": 1.2, "window_days": 30, "stage0_progress": "42/100", "total_pnl_usd": -264}
 BASE_BITS = ["已平 <code>42</code>", "勝率 <code>42.9%</code>",
              "期望值 <code>-0.02R</code>", "PnL $-264"]
 
@@ -34,6 +34,13 @@ def test_expert_adds_ci_and_threshold(monkeypatch):
     assert "95%CI" in out and "n=42" in out
     for b in BASE_BITS:
         assert b in out
+
+
+def test_expert_adds_ev_ci(monkeypatch):
+    # task#4：EV 也帶信賴區間（avg_r=-0.02、r_std=1.2、n=42 → 區間含0＝未證實正期望值）
+    _set_mode(monkeypatch, "expert")
+    out = render_paper_summary(STATS)
+    assert "EV 95%CI" in out and "含0" in out
 
 
 def test_parity_numbers_identical(monkeypatch):
