@@ -46,7 +46,10 @@ from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from botconfig import CONFIG as _BC
-from l2_trigger.leverage import choose_leverage, compute_position, compute_tp_prices
+from l2_trigger.leverage import (
+    choose_leverage, compute_position, compute_tp_prices,
+    leverage_for_stop, LEVERAGE_OVERRIDES,
+)
 
 # ---------------------------------------------------------------------------
 # 規格常數（research spec 定案；可由 .env / RiskConfig 覆寫處標註）
@@ -162,8 +165,22 @@ def max_safe_leverage(entry: float, stop: float, buffer: float = LIQ_BUFFER,
 def choose_safe_leverage(symbol: str, entry: float, stop: float,
                          atr_pct_7d: Optional[float],
                          tier_leverage: Optional[int] = None) -> int:
-    """ATR 分層槓桿，再以 max_safe_leverage 封頂（清算永不先於止損）。"""
-    tier = tier_leverage if tier_leverage is not None else choose_leverage(symbol, atr_pct_7d, default=15)
+    """槓桿 tier，再以 max_safe_leverage（含 mmr）封頂（清算永不先於止損）。
+
+    v83 task#5（研究 w7r04t691 落地）：ATR 未知時（demo 路徑 atr=None）原本 choose_leverage
+    硬退守 5x → 資金效率極差、每單鎖過多保證金 → 5000U 很快耗盡 → OKX 51008 餘額不足。
+    改為：ATR 未知時用「止損距離推導效率 tier」(leverage_for_stop)，再交由 max_safe_leverage
+    封頂保安全。symbol 硬 override（如 WLFI=5）與顯式 tier_leverage 仍優先。風險不變（由止損定
+    倉位），只是少鎖保證金 → 同樣 5000U 能持更多單。"""
+    if tier_leverage is not None:
+        tier = tier_leverage
+    elif symbol in LEVERAGE_OVERRIDES:
+        tier = LEVERAGE_OVERRIDES[symbol]
+    elif atr_pct_7d is not None:
+        tier = choose_leverage(symbol, atr_pct_7d, default=15)
+    else:
+        sl_pct = abs(entry - stop) / entry * 100 if entry else 0.0
+        tier = leverage_for_stop(sl_pct)
     return max(1, min(tier, max_safe_leverage(entry, stop)))
 
 
