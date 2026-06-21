@@ -340,6 +340,12 @@ def audit_stats(hours: int = 24) -> dict:
 
 
 if __name__ == "__main__":
+    # v82 治本：煙霧測試一律走臨時 DB，絕不碰正式 message_audit.db。
+    #   （過去 __main__ 末尾的 DELETE FROM send_log 會清空正式稽核遙測——危險 footgun）。
+    import tempfile
+    import pathlib
+    DB_PATH = str(pathlib.Path(tempfile.gettempdir()) / "_msgaudit_smoke.db")
+    pathlib.Path(DB_PATH).unlink(missing_ok=True)
     init_db()
     # 煙霧測試
     # v82: 修正過期煙霧樣本——fire 強特徵是「可立即執行/倉位配置（R」，原樣本缺之故誤判 unknown
@@ -353,6 +359,6 @@ if __name__ == "__main__":
     assert v3.should_block, v3   # 逐字重複應 block
     v4 = audit_message("True", topic_key="news")
     assert "too_short" in v4.clarity, v4
-    conn = _conn(); conn.execute("DELETE FROM send_log"); conn.close()
-    print("message_auditor 煙霧測試 ALL PASS")
+    pathlib.Path(DB_PATH).unlink(missing_ok=True)  # 清臨時檔（取代會清空正式表的危險 DELETE）
+    print("message_auditor 煙霧測試 ALL PASS（臨時 DB，未碰正式稽核表）")
     print("stats:", audit_stats())
