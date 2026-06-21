@@ -1287,8 +1287,55 @@ def _asset_kind(symbol: str, setup: str = "") -> tuple[str, str]:
     return "🪙", "加密"
 
 
+# ── 持倉快照變化指紋閘（v83 task#4：治本「每輪整面 2000 字重推、即使零變化」噪音）──
+#   算力端評估：position 66 則/24h、每則 ~2000 字，多半內容沒變＝最大噪音源。
+#   只在「持倉集合/已觸發腿/R 粗檔」有實質變化才整面推；純價格漂移不推；無變化也至少
+#   每 6h 補一份心跳。純呈現/推播決策層，零訊號/帳本/下單數學變更。
+_POS_HEARTBEAT_MS = 6 * 3600 * 1000
+_pos_last_fp: str | None = None
+_pos_last_push_ms: int = 0
+
+
+def _r_bucket(r: float) -> str:
+    """當前 R 量化成粗檔（與顯示 icon 同界），純價格漂移不跨檔＝不算變化。"""
+    if r >= 1.0:
+        return "tp1+"
+    if r >= 0.5:
+        return "half"
+    if r >= 0.0:
+        return "up"
+    if r >= -0.5:
+        return "dn"
+    return "near_sl"
+
+
+def _position_fingerprint(positions: list[dict], prices: dict) -> str:
+    """持倉集合狀態指紋：每倉 (kind|symbol|direction|legs|R檔)，排序串接。
+    同持倉、同已觸發腿、同 R 粗檔 → 指紋不變（純價格漂移不觸發重推）。"""
+    parts = []
+    for o in positions:
+        cur = prices.get(o["symbol"])
+        if cur is None:
+            parts.append(f"{o.get('_kind')}|{o['symbol']}|{o['direction']}|noprice")
+            continue
+        sld = abs(o["entry_price"] - o["stop_price"]) or 1e-9
+        cur_r = ((cur - o["entry_price"]) / sld if o["direction"] == "bull"
+                 else (o["entry_price"] - cur) / sld)
+        legs = ",".join(sorted(o.get("legs_hit") or []))
+        parts.append(f"{o.get('_kind')}|{o['symbol']}|{o['direction']}|{legs}|{_r_bucket(cur_r)}")
+    return "‖".join(sorted(parts))
+
+
+def _should_push_positions(fp, last_fp, now_ms, last_push_ms,
+                           heartbeat_ms=_POS_HEARTBEAT_MS) -> bool:
+    """有實質變化（指紋改變）→ 推；無變化但過心跳窗 → 補推；否則跳過（降噪）。"""
+    if fp != last_fp:
+        return True
+    return (now_ms - last_push_ms) >= heartbeat_ms
+
+
 async def run_position_tracker_loop(tg, source, interval_seconds: int = 3600):
-    """每小時推一份「持倉追蹤快照」。
+    """每小時檢查持倉，但只在有實質變化或過 6h 心跳才推（v83 降噪）。
 
     內容：
     - 每筆持倉：資產別(🪙/🇺🇸/🥇) / 標的 / 方向 / 進場時間 / 進場價 / 當前價 /
@@ -1335,6 +1382,14 @@ async def run_position_tracker_loop(tg, source, interval_seconds: int = 3600):
 
         if not prices:
             return  # 全失敗 → 不推假快照
+
+        # 變化指紋閘（v83 降噪）：同持倉/同腿/同 R 粗檔且未過 6h 心跳 → 跳過整面重推
+        global _pos_last_fp, _pos_last_push_ms
+        _fp = _position_fingerprint(positions, prices)
+        _now0 = int(time.time() * 1000)
+        if not _should_push_positions(_fp, _pos_last_fp, _now0, _pos_last_push_ms):
+            print("[position_tracker] 無實質變化（同持倉/同leg/同R檔），跳過推播（降噪）")
+            return
 
         # 渲染
         now_ms = int(time.time() * 1000)
@@ -1395,6 +1450,8 @@ async def run_position_tracker_loop(tg, source, interval_seconds: int = 3600):
 
         text = "\n".join(lines)
         await _send_to_telegram(tg, text)
+        _pos_last_fp = _fp           # 推成功才更新指紋/時戳（失敗下輪會重試）
+        _pos_last_push_ms = _now0
         print(f"[position_tracker] sent snapshot "
               f"({len(positions)} positions: {n_paper} paper / {n_live} live)")
 
