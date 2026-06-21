@@ -89,7 +89,16 @@ def _h(s: str) -> str:
 
 # ── 類型推斷 ──────────────────────────────────────────────────────────────
 # v27: 每類給一個「唯一強特徵」（命中即定案，不靠計分避免誤判）
+# v82: 治本 msg_kind 分類漏洞（呈現評估 wf 發現）——CEO 簡報原撞 econc 關鍵詞被誤標
+#   econ、優化器報告原撞弱特徵「已平倉」被誤標 tp_sl→再 cascade 出 trade_msg_no_direction
+#   偽陽性；OTS 錨定/美股永續快照/掛單逾時 無規則→灌 unknown(占 ~498)。以下五條強特徵
+#   置於最前（命中即定案，先於 econ 與弱 tp_sl）治本之。純標籤層，零渲染/訊號數學變更。
 STRONG_SIGNATURES = [
+    ("ceo_brief",   ("每日簡報", "監督人角色")),          # CEO 簡報，須先於 econ
+    ("tuner_report", ("自動優化器",)),                    # 復盤優化器報告，須先於弱 tp_sl
+    ("anchor",      ("帳本防竄改錨定", "opentimestamps")),  # OTS 比特幣錨定
+    ("usquote",     ("美股永續行情",)),                   # 美股永續即時快照（≠美股快訊 usnews）
+    ("expiry",      ("掛單逾時作廢", "逾時作廢")),          # 限價掛單逾時取消
     ("system",   ("稽核 session 報告", "worker 崩潰", "機器人上線", "🧵 threads", "token 續期")),
     ("pulse",    ("每小時即時動態",)),
     ("macro",    ("daily macro", "每日宏觀分析")),
@@ -320,7 +329,8 @@ def audit_stats(hours: int = 24) -> dict:
 if __name__ == "__main__":
     init_db()
     # 煙霧測試
-    v1 = audit_message("🔥 <b>BTC/USDT</b> 做多 進場區間 $65000", topic_key="trade")
+    # v82: 修正過期煙霧樣本——fire 強特徵是「可立即執行/倉位配置（R」，原樣本缺之故誤判 unknown
+    v1 = audit_message("🔥 <b>BTC/USDT</b> 做多 可立即執行 倉位配置（R 計）進場區間 $65000", topic_key="trade")
     assert v1.msg_kind == "fire" and v1.route == "ok", v1
     v2 = audit_message("📊 每日宏觀分析 regime=bull", topic_key="trade")  # 錯主題
     assert v2.route.startswith("MISROUTE"), v2
