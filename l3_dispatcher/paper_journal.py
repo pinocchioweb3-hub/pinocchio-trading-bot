@@ -760,16 +760,57 @@ def render_paper_funnel(days: int = 30, setup_not: str | None = None) -> str:
             f"{honest}")
 
 
+def _display_mode_pj() -> str:
+    """讀 DISPLAY_MODE（novice/expert，預設 novice）。純呈現層，不碰訊號/帳本數學。
+    內嵌 import 避免與 botconfig 的載入順序耦合；任何錯誤落回 novice。"""
+    try:
+        from botconfig import get_str
+        m = (get_str("DISPLAY_MODE", "novice") or "novice").strip().lower()
+        return m if m in ("novice", "expert") else "novice"
+    except Exception:
+        return "novice"
+
+
+def _wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """勝率 Wilson 95% 信賴區間（純數學、零相依/零網路）。小樣本會很寬＝誠實顯示不確定。"""
+    if n <= 0:
+        return (0.0, 0.0)
+    p = k / n
+    denom = 1.0 + z * z / n
+    centre = p + z * z / (2 * n)
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+    return (max(0.0, (centre - half) / denom), min(1.0, (centre + half) / denom))
+
+
+def _paper_summary_stat_note(stats: dict) -> str:
+    """task#83(B) 雙向顯示：治本「統計裸奔」——勝率/EV 不再以裸點估計假裝精確。
+    novice＝白話 caveat（過去≠未來、紙上非真錢）；expert＝勝率 95%CI＋n<門檻不予判讀。
+    純附加層：絕不改任何既有數字（與 parity 不變量一致）；誠實標籤永不省略（紅線③）。"""
+    n = int(stats.get("n_closed", 0) or 0)
+    if n <= 0:
+        return ""
+    if _display_mode_pj() == "expert":
+        wr = (stats.get("win_rate_pct", 0) or 0) / 100.0
+        lo, hi = _wilson_ci(round(wr * n), n)
+        tail = ("（n<30 未達顯著門檻，僅描述非結論）" if n < 30
+                else "（原始 n；同日叢聚下有效樣本更低，顯著性另見 crypto-EV 工具）")
+        return (f"\n🎓 <i>勝率 95%CI [{lo*100:.0f}%–{hi*100:.0f}%]｜n={n}{tail}"
+                "；紙上非真錢、過去命中率≠未來</i>")
+    return ("\n🔰 <i>勝率＝過去這些紙上單的命中比例，<b>不代表未來、樣本量也還沒到可下結論</b>；"
+            "這是模擬盤紀錄、非真錢績效</i>")
+
+
 def render_paper_summary(stats: dict) -> str:
     """紙上帳一行摘要（嵌進 /status 與每日績效）"""
     if stats["n_closed"] == 0 and stats["n_open"] == 0:
         return "📜 紙上驗證：尚無紀錄（每筆訊號自動追蹤中）"
-    return (f"📜 紙上驗證（{stats['window_days']}d）："
+    base = (f"📜 紙上驗證（{stats['window_days']}d）："
             f"已平 <code>{stats['n_closed']}</code> 筆 "
             f"勝率 <code>{stats['win_rate_pct']}%</code> "
             f"期望值 <code>{stats['avg_r']:+.2f}R</code>/筆　"
             f"Stage1 門檻 <code>{stats['stage0_progress']}</code>"
             f"　<i>(100U 風險基準 PnL ${stats['total_pnl_usd']:+.0f})</i>")
+    return base + _paper_summary_stat_note(stats)
 
 
 if __name__ == "__main__":
