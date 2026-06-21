@@ -39,3 +39,25 @@ def test_select_filters_low_rr_demo_only():
 
 def test_threshold_is_configurable():
     assert DEMO_MIN_RR >= 1.0
+
+
+def test_select_filters_by_tradable_universe():
+    # task#8：只挑 OKX 模擬盤可交易幣；不可交易者被過濾且 hwm 推進（不重試）
+    now = int(time.time() * 1000)
+    rows = [
+        {"id": 1, "symbol": "BTC", "setup": "deepdive", "status": "open", "direction": "bull",
+         "entry_price": 100, "stop_price": 95, "tp1": 120, "entry_at": now},
+        {"id": 2, "symbol": "FOONOTONOKX", "setup": "deepdive", "status": "open", "direction": "bull",
+         "entry_price": 100, "stop_price": 95, "tp1": 120, "entry_at": now},
+    ]
+    picked, hwm = select_new_signals(rows, 0, now, tradable_symbols={"BTC", "ETH"})
+    assert [r["id"] for r in picked] == [1] and hwm == 2
+
+
+def test_none_universe_means_no_filter():
+    # 宇宙抓取失敗(None) → 不過濾（安全降級，退回原行為）
+    now = int(time.time() * 1000)
+    rows = [{"id": 1, "symbol": "FOO", "setup": "deepdive", "status": "open", "direction": "bull",
+             "entry_price": 100, "stop_price": 95, "tp1": 120, "entry_at": now}]
+    picked, _ = select_new_signals(rows, 0, now, tradable_symbols=None)
+    assert len(picked) == 1

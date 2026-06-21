@@ -89,7 +89,8 @@ def is_quality_signal(row, min_rr=None) -> bool:
 
 
 def select_new_signals(rows, hwm, now_ms, *, max_age_min=INTAKE_MAX_AGE_MIN,
-                       limit=INTAKE_BATCH_LIMIT, excluded=EXCLUDED_SETUPS):
+                       limit=INTAKE_BATCH_LIMIT, excluded=EXCLUDED_SETUPS,
+                       tradable_symbols=None):
     """從 paper 新列挑出該鏡像的訊號，回 (selected, new_hwm)。
 
     合格條件（全 AND）：id>hwm、加密 setup、status=='open'、方向合法、有 entry/stop、
@@ -113,6 +114,8 @@ def select_new_signals(rows, hwm, now_ms, *, max_age_min=INTAKE_MAX_AGE_MIN,
             and bool(r.get("entry_price")) and bool(r.get("stop_price"))
             and (now_ms - ea) <= age_ms
             and is_quality_signal(r)        # v84 task#5/#6：模擬盤只開高 R:R 訊號（紙上驗證 Session 不受限）
+            and (tradable_symbols is None   # v84 task#8：只挑 OKX 模擬盤可交易幣（治本 not_on_okx 主因）
+                 or (r.get("symbol") or "").upper() in tradable_symbols)
         )
         if eligible and len(picked) >= limit:
             break                       # 合格但額度滿 → 留到下輪，高水位不跨過它
@@ -181,6 +184,40 @@ async def _make_ex():
     ex = demo_guard.make_demo_exchange()
     await demo_guard.confirm_okx_demo(ex)
     return ex
+
+
+_DEMO_UNIVERSE = {"set": None, "ts": 0.0}
+_DEMO_UNIVERSE_TTL = 3600.0  # 1h 快取
+
+
+async def _okx_demo_universe(ex):
+    """OKX 模擬盤可交易的 USDT 永續『基礎幣』集合（快取 1h）。
+    用於 intake 預過濾：把有限額度(3/輪)用在『真能在 OKX 模擬盤成交』的訊號上，治本
+    not_on_okx 拒單主因(驗活 17/35)＝避免額度被不可交易幣浪費、提升 demo 樣本 throughput。
+    任何失敗 → None（呼叫端不過濾、退回原行為，安全降級、零回歸）。"""
+    import time as _t
+    now = _t.time()
+    cached = _DEMO_UNIVERSE["set"]
+    if cached is not None and (now - _DEMO_UNIVERSE["ts"]) < _DEMO_UNIVERSE_TTL:
+        return cached
+    try:
+        markets = await ex.load_markets()
+        uni = set()
+        for m in (markets or {}).values():
+            try:
+                if (m.get("swap") and m.get("active", True)
+                        and m.get("quote") == "USDT" and m.get("base")):
+                    uni.add(str(m["base"]).upper())
+            except Exception:
+                continue
+        if not uni:
+            return None
+        _DEMO_UNIVERSE["set"] = uni
+        _DEMO_UNIVERSE["ts"] = now
+        return uni
+    except Exception as e:  # noqa: BLE001
+        print(f"[demo_op] OKX demo 宇宙抓取失敗（本輪不過濾）：{type(e).__name__}: {e}")
+        return None
 
 
 async def _place_one(ex, signal, *, avail_usd, tg=None) -> dict:
@@ -353,7 +390,10 @@ async def _intake(ex, *, now_ms, tg=None) -> dict:
 
     rows = pj.get_signals_after(hwm, limit=SCAN_LIMIT)
     summary["scanned"] = len(rows)
-    selected, new_hwm = select_new_signals(rows, hwm, now_ms)
+    uni = await _okx_demo_universe(ex)        # v84 task#8：預過濾不可交易幣，不浪費額度
+    if uni is not None:
+        summary["universe_size"] = len(uni)
+    selected, new_hwm = select_new_signals(rows, hwm, now_ms, tradable_symbols=uni)
     summary["selected"] = len(selected)
 
     if selected:
