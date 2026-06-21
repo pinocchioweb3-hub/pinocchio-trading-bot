@@ -294,7 +294,8 @@ def render_narrative_digest() -> str:
     if not nars:
         return ""
     icon = {"bullish": "🟢", "bearish": "🔴", "mixed": "🟡", "neutral": "⚪"}
-    lines = ["🧩 <b>市場敘事脈絡</b>（事件因果追蹤）", "━━━━━━━━━━━━━━━━"]
+    lines = ["🧩 <b>市場敘事脈絡</b>（社群／新聞貼文自動彙整，未經本系統查證）",
+             "━━━━━━━━━━━━━━━━"]
     for n in nars[:6]:
         lines.append(f"{icon.get(n['impact'], '⚪')} <b>{n['title_zh']}</b>"
                      f"（{n['event_count']} 事件）")
@@ -312,7 +313,12 @@ def render_narrative_digest() -> str:
         lines.append("\n🔗 <b>因果鏈</b>")
         for c, e, conf in links:
             lines.append(f"   {c} → {e}（信心 {conf}/10）")
-    lines.append("\n<i>每日自動聚類，事件不再孤立 — 跨來源追蹤主軸敘事與因果。</i>")
+    # v82 治本（紅線③）：narrative 是 LLM 對抓取貼文的自動聚類摘要，非本系統查證的事實。
+    #   極端宣稱（併購／IPO／市值兆億數字）若以斷言語氣呈現＝用系統誠實信用替未驗證消息背書，
+    #   故明確標示為「未經查證的彙整」並勸阻據此下單（不刪敘事、只誠實標 provenance）。
+    lines.append("\n<i>⚠️ 以上為 LLM 對社群／新聞貼文的自動聚類摘要，<b>非本系統查證的事實</b>；"
+                 "極端宣稱（如併購／IPO／市值數字）請自行向原始來源求證，切勿據此下單。"
+                 "僅供盤面氛圍參考。</i>")
     return "\n".join(lines)
 
 
