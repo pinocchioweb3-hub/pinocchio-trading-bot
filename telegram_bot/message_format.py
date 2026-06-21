@@ -63,7 +63,9 @@ def _fmt_signal_evidence(sig: dict) -> str:
         s = ev.get("top_trader_slope_7d", 0) or 0
         return f"7d 大戶持倉斜率 {s:+.4f}"
 
-    return _esc(str(ev)[:80])
+    # v83：未知訊號型態 fallback 不再倒 raw evidence dict（防開發者殘渣外洩到可執行卡）；
+    #   改顯示人類可讀訊號名（無對照則用原名），明細導向 /指標。
+    return f"{_esc(_SIGNAL_LABEL.get(name, name))}（詳見 /指標）"
 
 
 def render_fire_message(decision_dict: dict[str, Any]) -> tuple[str, list[list[dict]]]:
