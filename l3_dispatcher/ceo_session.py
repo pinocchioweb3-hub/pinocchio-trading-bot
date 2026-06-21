@@ -357,12 +357,58 @@ def _section_decisions() -> str:
     return "\n".join(lines)
 
 
+def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
+                           demo_n, demo_rejected) -> str:
+    """task#7 CEO 深度綜合：純函式、確定性跨 session 關聯推理（可離線測試）。
+    把『樣本供給 × 模擬盤下單健康 × 復盤優化器晉升狀態』綜合成單一瓶頸歸因——這才是
+    真綜合分析，非欄位回音。資料不足就誠實說無法綜合（紅線③不臆測）。"""
+    if paper_n < 8:
+        return (f"  本輪樣本過少（紙上 {paper_n}/{paper_min}），尚無足夠基礎做跨 session "
+                "綜合分析——誠實不臆測。")
+    sample_short = paper_n < paper_min or live_n < live_min
+    bottleneck = "樣本供給不足（非策略失效）" if sample_short else "樣本達標，待品質/顯著性驗證"
+    demo_note = ""
+    attempts = demo_n + demo_rejected
+    if demo_rejected and attempts > 0 and demo_rejected / attempts >= 0.5:
+        demo_note = (f"；⚠️ 模擬盤拒單率偏高（成交 {demo_n}/拒 {demo_rejected}）卡住實倉樣本"
+                     "——v84 槓桿效率+品質篩選已治本，觀察是否回升")
+    # 注意：L2 閘在「對齊樣本 n_aligned」非原始 paper_n（分桶碎裂使 n_aligned≪paper_n），
+    #   故不以 paper_n 推斷晉升進度（會樂觀高估）；只誠實描述把關機制（對齊全文版口徑）。
+    opt_line = ("復盤優化器：晉升由 L2 四關把關（對齊樣本 n_aligned≥30）——對齊樣本不足時 "
+                "0 晉升（健康 fail-closed、非策略失效，詳見每日優化器報告）")
+    return "\n".join([
+        f"  • 樣本：紙上 {paper_n}/{paper_min}、模擬實倉 {demo_n}、真實 {live_n}/{live_min}{demo_note}",
+        f"  • {opt_line}",
+        f"  → <b>當前瓶頸＝{bottleneck}</b>。把關靠統計嚴謹度，真錢仍人工（紅線①）。",
+    ])
+
+
+def _section_self_assessment() -> str:
+    """🧠 系統自評（CEO 深度綜合層 Layer 2 的最小落地，task#7）。"""
+    try:
+        p = phase0_status()
+    except Exception:
+        return ""
+    demo_n = demo_rejected = 0
+    try:
+        from . import demo_journal
+        demo_n, _ = demo_journal.count_closed_for_phase0()
+        demo_rejected, _ = demo_journal.count_rejected()
+    except Exception:
+        pass
+    body = _synthesize_bottleneck(
+        p.get("paper_n", 0), p.get("paper_min", 100),
+        p.get("live_n", 0), p.get("live_min", 30), demo_n, demo_rejected)
+    return "🧠 <b>系統自評</b>（跨 session 綜合·確定性推理非欄位回音）：\n" + body
+
+
 def build_ceo_brief() -> str:
-    """產生完整 CEO 簡報（兩段式）。純函式，可離線測試。"""
+    """產生完整 CEO 簡報（三段式）。純函式，可離線測試。"""
     now = dt.datetime.now(tz=dt.timezone.utc) + dt.timedelta(hours=8)  # 台北時間
     header = (f"🧭 <b>CEO 每日簡報</b>　{now.strftime('%Y-%m-%d %H:%M')} 台北\n"
               f"<i>由 Claude Code（監督人角色）自動彙整</i>")
-    return f"{header}\n\n{_section_normal()}\n\n{_section_decisions()}"
+    parts = [header, _section_normal(), _section_self_assessment(), _section_decisions()]
+    return "\n\n".join(p for p in parts if p)
 
 
 # ===========================================================================
