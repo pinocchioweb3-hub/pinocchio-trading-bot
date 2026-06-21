@@ -17,6 +17,11 @@ import time
 from dataclasses import dataclass, field
 
 from .fire_queue import stats as queue_stats
+from .plan_snapshot_health import capture_health
+
+# daemon 啟動時刻代理（本模組在 daemon 開機時被 import）。capture_health 用它把
+# 「前一個 daemon 化身（可能跑過期碼）」寫的歷史列排除，只判當前碼的 snapshot 產出。
+_DAEMON_START_TS = time.time()
 
 
 @dataclass
@@ -129,6 +134,27 @@ async def run_health_checks(state: SupervisorState, source) -> list[HealthCheck]
                     detail={"avg_core_stale": round(avg_core_stale, 1),
                             "symbols": hit_syms},
                 ))
+
+    # === 5. plan_snapshot 捕捉退化（唯讀，例外安全；治本「重啟載過期碼→靜默退化」）===
+    # 只在近窗 deepdive 樣本夠且退化（NULL/殘留簽名）才告警；誠實盤整 None 不算退化。
+    try:
+        ch = capture_health(since_ts=_DAEMON_START_TS)
+        if ch.get("verdict") == "degraded":
+            c = ch.get("counts", {})
+            results.append(HealthCheck(
+                kind="plan_snapshot_degraded",
+                severity="warn",
+                message=(
+                    f"進場計畫捕捉退化：近 {ch.get('window_hours')}h {ch.get('sample')} 筆 deepdive 中，"
+                    f"NULL {c.get('null',0)}+解析錯 {c.get('parse_err',0)} 筆"
+                    f"（{ch.get('null_rate'):.0%}）、過期碼殘留 {c.get('stale_leak',0)} 筆"
+                    f"（{ch.get('stale_leak_rate'):.0%}）→ 復盤優化器將拿不到象限標籤。"
+                    f"疑似 daemon 跑到過期工作樹碼，請重啟。"
+                ),
+                detail=ch,
+            ))
+    except Exception as e:
+        print(f"[supervisor] capture_health check skipped: {type(e).__name__}: {e}")
 
     return results
 
