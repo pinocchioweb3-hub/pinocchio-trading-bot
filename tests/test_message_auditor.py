@@ -71,3 +71,30 @@ def test_real_fire_still_has_direction_check():
     # 真交易卡仍受方向檢查保護（沒回歸把保護拿掉）
     no_dir = "🔥 BTC 可立即執行 倉位配置（R） 進場 $65000"  # 缺方向
     assert "trade_msg_no_direction" in check_clarity(no_dir, "fire")
+
+
+# ── v82(2)：旗艦訊號流分類缺口治本 ──
+DEEPDIVE = "🎯 <b>SOL 交易計畫深度分析</b>\n做多 進場 $140 止損 $135 倉位配置（R 計）"
+US_SIGNAL = "🧪🇺🇸 <b>MSTR 永續</b>［美股突破·實驗性］\n✓ 突破 24h 高 做多"
+
+
+def test_deepdive_not_unknown():
+    # 深度分析卡含「倉位配置（R」但 deepdive 強特徵在 fire 之前 → 正確歸 deepdive
+    assert infer_msg_kind(DEEPDIVE) == "deepdive"
+
+
+def test_us_signal_not_unknown():
+    assert infer_msg_kind(US_SIGNAL) == "us_signal"
+
+
+def test_flagship_kinds_get_route_check():
+    # 不再落 unknown→不再被 route 全豁免（deepdive/us_signal 有 KIND_TO_TOPICS 映射）
+    assert check_route("trade", "deepdive") == "ok"
+    assert check_route("trade", "us_signal") == "ok"
+    assert check_route("news", "us_signal").startswith("MISROUTE")  # 錯主題會被抓
+
+
+def test_us_signal_direction_guarded():
+    # us_signal 納入方向護欄：缺方向會被抓
+    no_dir = "🧪🇺🇸 MSTR 永續［美股突破·實驗性］ 量 $4m"
+    assert "trade_msg_no_direction" in check_clarity(no_dir, "us_signal")

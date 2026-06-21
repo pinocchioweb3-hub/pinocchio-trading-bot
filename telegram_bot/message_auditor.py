@@ -99,6 +99,10 @@ STRONG_SIGNATURES = [
     ("anchor",      ("帳本防竄改錨定", "opentimestamps")),  # OTS 比特幣錨定
     ("usquote",     ("美股永續行情",)),                   # 美股永續即時快照（≠美股快訊 usnews）
     ("expiry",      ("掛單逾時作廢", "逾時作廢")),          # 限價掛單逾時取消
+    # v82(2)：旗艦訊號流原無強特徵→落 unknown→被 route/clarity 全豁免＝最重要訊息零護欄。
+    #   置於 fire 之前（deepdive 卡可能含「倉位配置（R」會誤命中 fire）。
+    ("deepdive",  ("交易計畫深度分析",)),                  # LLM 深度分析卡（macro.py:942）
+    ("us_signal", ("美股突破",)),                          # 美股永續突破訊號（us_stock_signals）
     ("system",   ("稽核 session 報告", "worker 崩潰", "機器人上線", "🧵 threads", "token 續期")),
     ("pulse",    ("每小時即時動態",)),
     ("macro",    ("daily macro", "每日宏觀分析")),
@@ -126,6 +130,8 @@ KIND_SIGNATURES = [
 KIND_TO_TOPICS = {
     "fire":      {"trade"},
     "waiting":   {"trade"},
+    "deepdive":  {"trade", "intel"},   # v82(2)：深度分析卡（trade/intel 皆可，避免假誤路由）
+    "us_signal": {"trade"},            # v82(2)：美股訊號併 trade（v36 設計）
     "order_card": {"positions"},
     "tp_sl":     {"positions"},
     "position":  {"positions"},
@@ -199,8 +205,8 @@ def check_clarity(text: str, msg_kind: str) -> list[str]:
     # 佔位/抓取失敗殘跡
     if any(p in norm for p in ("[no title]", "rt @", "net.", "read the full release below")):
         problems.append("placeholder_or_fragment")
-    # 交易類訊息必須有方向
-    if msg_kind in ("fire", "waiting", "tp_sl", "order_card"):
+    # 交易類訊息必須有方向（v82(2)：us_signal 為實際交易訊號，納入方向護欄）
+    if msg_kind in ("fire", "waiting", "tp_sl", "order_card", "us_signal"):
         if not any(d in text for d in ("做多", "做空", "多單", "空單", "long", "short", "bull", "bear")):
             problems.append("trade_msg_no_direction")
     return problems
@@ -278,6 +284,10 @@ async def run_audit_loop(tg_admin, interval_seconds: int = 3600):
                 total = conn.execute(
                     "SELECT COUNT(*) FROM send_log WHERE sent_at > ?",
                     (int(time.time()) - interval_seconds,)).fetchone()[0]
+                # v82(2)：未分類佔比＝分類盲區可見化（unknown 高代表旗艦流漏特徵、護欄失效）
+                unknown_n = conn.execute(
+                    "SELECT COUNT(*) FROM send_log WHERE sent_at > ? AND msg_kind='unknown'",
+                    (int(time.time()) - interval_seconds,)).fetchone()[0]
             finally:
                 conn.close()
             if rows and tg_admin is not None:
@@ -291,6 +301,9 @@ async def run_audit_loop(tg_admin, interval_seconds: int = 3600):
                 lines.append(f"📍 路由疑慮：{len(misroute)}")
                 lines.append(f"♻️ 重複疑慮：{len(dups)}")
                 lines.append(f"❓ 不明確：{len(unclear)}")
+                _uratio = f"（{unknown_n*100//total}%）" if total else ""
+                lines.append(f"❔ 未分類 unknown：{unknown_n}/{total}{_uratio}"
+                             + ("　⚠️ 偏高，恐有旗艦流漏特徵" if total and unknown_n*5 >= total else ""))
                 for r in (misroute[:3] + unclear[:3]):
                     detail = r[3] if (r[3] or "").startswith("MISROUTE") else r[5]
                     lines.append(f"  • [{r[1]}→{r[2]}] {detail}")
