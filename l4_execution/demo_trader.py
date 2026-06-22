@@ -714,12 +714,20 @@ async def fetch_okx_closed_pnl(ex, symbol: str, pos_side: str,
                                *, since_ms: int | None = None) -> dict:
     """從 OKX positions-history 取某標的最近一筆已平倉的 realizedPnl（**真相，非捏造**）。
 
-    realizedPnl 為 OKX 計入手續費/資金費後的淨已實現損益，正是 realized_r 的分子來源。
-    回 {ok, found, pnl_usd, u_time}。找不到（history 尚未回填）→ found=False，呼叫端應
-    保守處理（不平本地帳、下輪重試），**絕不本地推估 PnL**。讀取性質，不另呼 confirm。"""
+    realizedPnl 為 OKX 計入手續費/資金費後的淨已實現損益，正是 realized_r 的分子來源；
+    部分止盈(TP1/TP2 分腿)的已實現損益會由 OKX 累計進整倉平倉後的 realizedPnl，故整倉
+    平倉後取此值即含全部分腿。回 {ok, found, pnl_usd, u_time}。找不到（history 尚未回填）→
+    found=False，呼叫端應保守處理（不平本地帳、下輪重試），**絕不本地推估 PnL**。
+
+    ⚠️ 治本(2026-06-23)：**絕不可**把 since_ms 傳進 ex.fetch_positions_history 的 since 參數。
+    OKX positions-history 的 since/分頁語意會把「晚於該 ts 才平倉」的本倉整個濾掉——實測
+    since=filled_at → 回 0 列（整批已平倉 demo 倉因此永卡 await_pnl、零筆 tp 回填）；since=None
+    → 正確回該倉 realizedPnl（OP +99 / RESOLV +410 等真實止盈）。故改為 since=None 取近 100 筆，
+    再於本地以 uTime 做 scope（只認 uTime≥since_ms 的本倉平倉，避免誤配同標的更早的舊平倉）。"""
     inst_id = f"{symbol}/USDT:USDT"
     try:
-        hist = await ex.fetch_positions_history([inst_id], since=since_ms, limit=50)
+        # since 一律 None（傳 since_ms 會讓 OKX 回 0 列，見上方治本說明）；scope 改在本地做。
+        hist = await ex.fetch_positions_history([inst_id], since=None, limit=100)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "found": False, "error": f"{type(e).__name__}: {e}"}
     cands: list[tuple[int, float]] = []
@@ -733,6 +741,9 @@ async def fetch_okx_closed_pnl(ex, symbol: str, pos_side: str,
             u = int(raw_u) if raw_u else 0
         except (TypeError, ValueError):
             u = 0
+        # 本地 scope：早於本倉成交時刻的平倉屬同標的的舊倉，非本倉 → 跳過（取代壞掉的 API since）。
+        if since_ms and u and u < int(since_ms):
+            continue
         pnl_raw = info.get("realizedPnl")
         if pnl_raw is None:
             pnl_raw = info.get("pnl")

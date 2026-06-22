@@ -146,7 +146,8 @@ def render_nudge(snap: dict) -> str:
     p = snap.get("phase0", {})
     if p:
         lines.append(f"🔬 進度：紙上 {p.get('paper_n', 0)}/{p.get('paper_min', 0)}"
-                     f"｜模擬實倉 {snap.get('demo_n', 0)}/{DEMO_SAMPLE_TARGET}"
+                     f"｜模擬已平倉 {snap.get('demo_n', 0)}/{DEMO_SAMPLE_TARGET}"
+                     f"（在場 {snap.get('demo_live', 0)} 筆）"
                      f"｜真實 {p.get('live_n', 0)}/{p.get('live_min', 0)}")
     if snap.get("blockers"):
         lines.append("🙋 待你處理：" + "；".join(snap["blockers"]))
