@@ -78,9 +78,11 @@ def test_grouping_by_symbol_and_quadrant():
                 [_mk(300 + i, r, q="price_down_oi_up", sym="BTC") for i in range(3)] +
                 [_mk(400 + i, r, q="price_up_oi_up", sym="ETH") for i in range(3)])
         res = ao.run_optimization(rows=rows, at_ms=1, **e)
-        assert res["n_buckets"] == 3
+        # task#62 池化：3 per-symbol + 2 象限池(*,q1)(*,q2) + 1 全域池(*,*) = 6
+        assert res["n_buckets"] == 6 and res["n_pooled"] == 3
         keys = {b["bucket"] for b in res["buckets"]}
-        assert keys == {"BTC|price_up_oi_up", "BTC|price_down_oi_up", "ETH|price_up_oi_up"}
+        assert keys == {"BTC|price_up_oi_up", "BTC|price_down_oi_up", "ETH|price_up_oi_up",
+                        "*|price_up_oi_up", "*|price_down_oi_up", "*|*"}
 
 
 def test_quadrant_parsing():
@@ -117,7 +119,8 @@ def test_candidate_grid_skips_champion_equal_override():
             encoding="utf-8")
         rows = [_mk(i, r) for i in range(5)]
         res = ao.run_optimization(rows=rows, at_ms=1, **e)
-        b = res["buckets"][0]
+        # task#62 池化後 buckets[0] 是全域池；須明選 per-symbol 桶（它才帶該覆寫 champion）
+        b = next(x for x in res["buckets"] if x["bucket"] == "BTC|price_up_oi_up")
         # champion 變成覆寫值；evaluated 不含與 champion 同分配者
         assert b["champion_alloc"] == [0.4, 0.3, 0.3]
         for chal_pol, _v in b["evaluated"]:

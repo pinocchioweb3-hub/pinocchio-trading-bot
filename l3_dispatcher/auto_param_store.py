@@ -46,9 +46,24 @@ def audit_path(path: str | Path | None = None) -> Path:
     return Path(path) if path else data_dir() / AUDIT_NAME
 
 
+POOL = "*"   # task#62 階層池化 sentinel（與 entry_policy_store.POOL 同切面）
+
+
 def bucket_key(symbol: str, quadrant: str) -> str:
     """覆寫桶鍵＝symbol×regime 象限（per-symbol × per-regime 自適應參數）。"""
     return f"{symbol}|{quadrant or 'unknown'}"
+
+
+def _resolution_ladder(symbol: str, quadrant: str) -> list[str]:
+    """task#62 階層式部分池化查找順序（最具體→最一般，去重）：
+        (symbol, quadrant) per-symbol×regime → (POOL, quadrant) 象限池 → (POOL, POOL) 全域池。
+    與 entry_policy_store._resolution_ladder 同切面。最具體且有有效覆寫者勝。"""
+    keys: list[str] = []
+    for sk, qk in ((symbol, quadrant), (POOL, quadrant), (POOL, POOL)):
+        bk = bucket_key(sk, qk)
+        if bk not in keys:
+            keys.append(bk)
+    return keys
 
 
 # ── 分配驗證／正規化 ──────────────────────────────────────────────────
@@ -127,10 +142,14 @@ def resolve_tp_alloc(symbol: str, quadrant: str, *,
     """
     try:
         buckets = _load_active(active_path)
-        rec = buckets.get(bucket_key(symbol, quadrant))
-        if not rec:
-            return None
-        return _norm_alloc(rec.get("tp_alloc"))   # 壞值 → None → 用預設
+        for bk in _resolution_ladder(symbol, quadrant):   # task#62 階梯：具體→象限池→全域池
+            rec = buckets.get(bk)
+            if not rec:
+                continue
+            alloc = _norm_alloc(rec.get("tp_alloc"))       # 壞值→視同此階無覆寫，續找更一般階
+            if alloc is not None:
+                return alloc
+        return None
     except Exception:
         return None
 

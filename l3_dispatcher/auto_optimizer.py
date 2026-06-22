@@ -145,18 +145,31 @@ def run_optimization(*, days: int = 120, at_ms: int | None = None,
         from backtest.l2_stat_gates import TrialLedger, default_ledger_path
         ledger = TrialLedger(default_ledger_path())
 
+    # task#62 階層部分池化（鏡像 entry_policy）：每筆同時進 per-symbol×象限、象限池(跨symbol)、
+    #   全域池(跨一切)。讓碎裂的 per-symbol 桶湊不到 n≥30 時，較一般的池仍可合法達門檻過 L2。
+    #   不降門檻（只合法匯集樣本；FDR 多重比較隨桶數變更嚴）；無覆寫時 resolve 階梯恆回 None。
     groups: dict[tuple[str, str], list[dict]] = {}
     for r in rows:
-        groups.setdefault((r.get("symbol"), _quadrant_of(r)), []).append(r)
+        sym, q = r.get("symbol"), _quadrant_of(r)
+        groups.setdefault((sym, q), []).append(r)               # per-symbol × regime（最具體）
+        groups.setdefault((aps.POOL, q), []).append(r)          # 象限池（跨 symbol、同 regime）
+        groups.setdefault((aps.POOL, aps.POOL), []).append(r)   # 全域池（跨一切）
+
+    def _rank(sym, q):
+        if sym == aps.POOL and q == aps.POOL:
+            return 0   # 全域池（最一般，先處理→具體桶可繼承本輪池化覆寫）
+        return 1 if sym == aps.POOL else 2
 
     buckets = []
-    for (sym, q), trs in sorted(groups.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or "")):
+    for (sym, q), trs in sorted(groups.items(),
+                                key=lambda kv: (_rank(*kv[0]), kv[0][0] or "", kv[0][1] or "")):
         buckets.append(optimize_bucket(sym, q, trs, at_ms=at_ms, ledger=ledger,
                                        active_path=active_path, audit_path=audit_path))
     n_promoted = sum(1 for b in buckets
                      if b["applied"] and b["applied"]["action"] == "promote")
+    n_pooled = sum(1 for b in buckets if b["symbol"] == aps.POOL)
     return {"at_ms": at_ms, "n_buckets": len(buckets), "n_trades": len(rows),
-            "n_promoted": n_promoted, "buckets": buckets}
+            "n_pooled": n_pooled, "n_promoted": n_promoted, "buckets": buckets}
 
 
 # ── 繁中報告（CEO/調參 Session 透明化） ──────────────────────────────
@@ -247,12 +260,13 @@ def _selftest() -> bool:
         assert res["n_promoted"] == 0
         assert aps.resolve_tp_alloc("BTC", "price_up_oi_up", active_path=ap) is None
 
-        # (c) 分桶正確：不同 quadrant 分開
+        # (c) 分桶正確：2 quadrant × 1 symbol → per-symbol 2 + 象限池 2 + 全域池 1 = 5 桶（task#62 池化）
         rows_two = [_mk(200 + i, r, q="price_up_oi_up") for i in range(5)] + \
                    [_mk(300 + i, r, q="price_down_oi_up") for i in range(5)]
         res = run_optimization(rows=rows_two, at_ms=3, ledger=led,
                                active_path=ap, audit_path=au)
-        assert res["n_buckets"] == 2
+        assert res["n_buckets"] == 5, f"應 5 桶(2 per-symbol+2 象限池+1 全域池)，實得 {res['n_buckets']}"
+        assert res["n_pooled"] == 3, f"池化桶應 3，實得 {res['n_pooled']}"
 
         # (d) 帳本鏈完整（未被自動優化器破壞）
         ok, _ = led.verify_chain()
