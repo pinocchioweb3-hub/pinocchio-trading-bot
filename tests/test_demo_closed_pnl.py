@@ -75,3 +75,16 @@ def test_empty_history_found_false():
     ex = _FakeEx([])
     res = _run(dt.fetch_okx_closed_pnl(ex, "X", "long", since_ms=1500))
     assert res["found"] is False
+
+
+def test_scope_floor_must_be_entry_not_fill_time():
+    """LAB 回歸：平倉 uTime 介於 entry_at 與 filled_at 之間（快進快出，filled_at 記錄落後）。
+    呼叫端須傳 entry_at 當下界才找得到；傳 filled_at 會誤排除本倉平倉（永卡 await_pnl）。"""
+    entry_at, close_utime, filled_at = 1000, 1480, 1500   # close 早於 filled 記錄時刻
+    ex = _FakeEx([_row("long", -17.41, close_utime)])
+    # 正確：以 entry_at 當下界 → 找得到本倉平倉
+    ok = _run(dt.fetch_okx_closed_pnl(ex, "LAB", "long", since_ms=entry_at))
+    assert ok["found"] is True and abs(ok["pnl_usd"] + 17.41) < 1e-9
+    # 反例（舊 bug）：以 filled_at 當下界 → 平倉 uTime < filled_at → 誤排除
+    bad = _run(dt.fetch_okx_closed_pnl(ex, "LAB", "long", since_ms=filled_at))
+    assert bad["found"] is False

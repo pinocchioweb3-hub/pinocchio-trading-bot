@@ -723,7 +723,9 @@ async def fetch_okx_closed_pnl(ex, symbol: str, pos_side: str,
     OKX positions-history 的 since/分頁語意會把「晚於該 ts 才平倉」的本倉整個濾掉——實測
     since=filled_at → 回 0 列（整批已平倉 demo 倉因此永卡 await_pnl、零筆 tp 回填）；since=None
     → 正確回該倉 realizedPnl（OP +99 / RESOLV +410 等真實止盈）。故改為 since=None 取近 100 筆，
-    再於本地以 uTime 做 scope（只認 uTime≥since_ms 的本倉平倉，避免誤配同標的更早的舊平倉）。"""
+    再於本地以 uTime 做 scope（只認 uTime≥since_ms 的本倉平倉，避免誤配同標的更早的舊平倉）。
+    ⚠️ since_ms 應傳「下單/進場時刻 entry_at」當下界，**勿傳 filled_at**（本機偵測成交的記錄
+    時刻會落後真實成交，快進快出的單其平倉 uTime 可能早於 filled_at→本倉被誤排除、永卡）。"""
     inst_id = f"{symbol}/USDT:USDT"
     try:
         # since 一律 None（傳 since_ms 會讓 OKX 回 0 列，見上方治本說明）；scope 改在本地做。

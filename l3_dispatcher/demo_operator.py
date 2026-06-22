@@ -334,10 +334,15 @@ async def _monitor(ex, *, now_ms, tg=None) -> dict:
                     dj.touch_synced(iid)
             elif t["status"] == "open":
                 if key not in okx_map:
-                    # OKX 上已無此倉 → 已平倉，取真相 realizedPnl
+                    # OKX 上已無此倉 → 已平倉，取真相 realizedPnl。
+                    # since_ms 作為本地 uTime scope 的「下界」：必須用 entry_at(下單時刻)，
+                    # **不可**用 filled_at——filled_at 是本機輪詢偵測到成交的『記錄時刻』，會落後
+                    # 真實成交達一個輪詢週期；對快速進出的單，平倉 uTime 可能早於 filled_at 數百 ms
+                    # → 用 filled_at 當下界會把本倉平倉誤排除、永卡 await_pnl（LAB 即此例，差 488ms）。
+                    # entry_at 必早於任何平倉 uTime，是安全且正確的下界。
                     res = await dt.fetch_okx_closed_pnl(
                         ex, t["symbol"], t["pos_side"],
-                        since_ms=t.get("filled_at") or t.get("entry_at"))
+                        since_ms=t.get("entry_at") or t.get("filled_at"))
                     if res.get("found"):
                         marker = dj.get_state(f"closing:{iid}", "")
                         reason = infer_exit_reason(marker, res["pnl_usd"])
