@@ -181,6 +181,36 @@ def test_assemble_deepdive_range_quadrant_none():
     assert rgv["oi_price_quadrant"] is None                 # 方向不明不硬湊
 
 
+# --- 4f. _price_trend 最低優先後備：price_chg_24h_pct（24h 已觀測價格方向）+ 死區 ---
+def test_price_trend_from_price_chg_24h():
+    # 高優先源仍優先：有 regime_trend_dir 就不看 24h 變化
+    assert rv._price_trend({"regime_trend_dir": "下", "price_chg_24h_pct": 5.0}) == "down"
+    assert rv._price_trend({"breakout_1h_high": True, "price_chg_24h_pct": -5.0}) == "up"
+    # 前三源全空（deepdive 盤整）→ 退用 24h 變化方向
+    assert rv._price_trend({"price_chg_24h_pct": 3.2}) == "up"
+    assert rv._price_trend({"price_chg_24h_pct": -2.8}) == "down"
+    # 死區：|變化| < 1.0% → 方向不明回 None（不硬湊；紅線③）
+    assert rv._price_trend({"price_chg_24h_pct": 0.4}) is None
+    assert rv._price_trend({"price_chg_24h_pct": -0.9}) is None
+    assert rv._price_trend({"price_chg_24h_pct": 1.0}) == "up"     # 邊界含等號
+    assert rv._price_trend({"price_chg_24h_pct": -1.0}) == "down"
+    # 壞值安全：非數值 → None（exception-safe）
+    assert rv._price_trend({"price_chg_24h_pct": "n/a"}) is None
+    assert rv._price_trend({"price_chg_24h_pct": None}) is None
+
+
+# --- 4g. assemble 端到端（治本回歸）：deepdive 4h 盤整但 24h 有動 → 象限填實 ---
+def test_assemble_deepdive_range_filled_by_24h_change():
+    # 4h ADX<20→trend_dir=None（前三源全空），但 24h 價格 +4.5% + OI +6% → 新多進場。
+    snap = {"oi_delta_pct": 6.0, "regime_trend_dir": None, "price_chg_24h_pct": 4.5}
+    rgv, _ = rv.assemble(snap, direction="bull", include_market=False)
+    assert rgv["oi_price_quadrant"] == "price_up_oi_up"     # 過去恆 None，現已填實
+    # 24h 幾乎沒動（死區內）→ 仍誠實留 None（不因有欄就硬湊）
+    snap_flat = {"oi_delta_pct": 6.0, "regime_trend_dir": None, "price_chg_24h_pct": 0.3}
+    rgv2, _ = rv.assemble(snap_flat, direction="bull", include_market=False)
+    assert rgv2["oi_price_quadrant"] is None
+
+
 # --- 5. assemble(None) 只取市場層，per-symbol 欄全 None ---
 def test_assemble_none_snap_market_only(monkeypatch):
     import l3_dispatcher.market_scanner as ms

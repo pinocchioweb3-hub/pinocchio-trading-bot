@@ -234,6 +234,41 @@ async def _fill_stale_from_binance(sym: str, tf: str, snap: dict,
         pass
 
 
+def _price_chg_24h_pct(series) -> float | None:
+    """由已取回的價格序列算 24h 變化%（與 oi_delta_pct 同窗的『已觀測價格方向』）。
+
+    純讀已 fetch 的序列、按時間戳回看 24h（tf 無關，容缺口）；不發任何新請求、不重算趨勢。
+    序列為舊→新、元素含 {ts, value(=close)}。任何缺料/異常 → None（誠實留空，紅線③）。
+    序列不足 24h（如 lookback=24 的概覽）→ 退用最舊一根當基準（仍是已觀測值，誠實近似）。
+    """
+    try:
+        if not series or len(series) < 2:
+            return None
+        last = series[-1]
+        last_v, last_ts = last.get("value"), last.get("ts")
+        if last_v is None or last_ts is None or not last_v:
+            return None
+        window = 24 * 3600 * 1000 if last_ts > 1e12 else 24 * 3600   # ms vs s 自適應
+        target = last_ts - window
+        ref = None
+        for d in series[:-1]:
+            t = d.get("ts")
+            if t is None:
+                continue
+            if t <= target:
+                ref = d            # 持續更新到最接近 target 且不晚於它的那根
+            else:
+                break              # 序列有序，超過 target 即可停
+        if ref is None:
+            ref = series[0]        # 序列跨度 < 24h → 用最舊一根（誠實近似）
+        ref_v = ref.get("value")
+        if ref_v is None or not ref_v:
+            return None
+        return round((last_v - ref_v) / ref_v * 100, 3)
+    except Exception:
+        return None
+
+
 @_tool
 async def mi_get_snapshot(
     symbol: Annotated[str, Field(description="目標標的（任意命名空間）")],
@@ -245,10 +280,10 @@ async def mi_get_snapshot(
     並行呼叫多個下游、任一失敗 → 該欄填 None 並列入 `stale_fields`，
     不整包失敗。輸出欄位對齊 l2_trigger.types.MarketSnapshot。
 
-    回傳：{symbol, ts, price, oi, funding, cvd, ls_ratio, top_trader_ratio,
-          liq_long, liq_short, btc_gate_open, btc_regime, above_4h_200ma,
-          is_hot, strength_score, atr_pct_7d, vol_24h_vs_30d, cvd_slope_7d,
-          top_trader_slope_7d, oi_delta_7d_pct, higher_lows_7d,
+    回傳：{symbol, ts, price, price_chg_24h_pct, oi, funding, cvd, ls_ratio,
+          top_trader_ratio, liq_long, liq_short, btc_gate_open, btc_regime,
+          above_4h_200ma, is_hot, strength_score, atr_pct_7d, vol_24h_vs_30d,
+          cvd_slope_7d, top_trader_slope_7d, oi_delta_7d_pct, higher_lows_7d,
           stale_fields, sources_used}
     """
     sym = normalize(symbol)
@@ -285,11 +320,14 @@ async def mi_get_snapshot(
     if _ok(price):
         snap["price"] = price.get("price")
         snap["ts"] = price["series"][-1]["ts"] if price.get("series") else None
+        # 24h 價格變化%（與 oi_delta_pct 同窗的已觀測值；復盤象限價格方向後備，純讀序列零新請求）
+        snap["price_chg_24h_pct"] = _price_chg_24h_pct(price.get("series"))
         sources_used.add(price.get("source", "?"))
     else:
         _stale("price", "ts")
         snap["price"] = None
         snap["ts"] = None
+        snap["price_chg_24h_pct"] = None
 
     # OI
     if _ok(oi):

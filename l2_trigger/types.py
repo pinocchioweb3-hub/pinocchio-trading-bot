@@ -71,6 +71,7 @@ class MarketSnapshot:
     # --- Setup A 即時點資料 -----------------------------------------------
     oi: Optional[float] = None
     oi_delta_pct: Optional[float] = None          # OI 24h 變化%
+    price_chg_24h_pct: Optional[float] = None     # 價格 24h 變化%（與 oi_delta_pct 同窗；復盤象限價格方向後備，純觀測）
     funding: Optional[float] = None               # 當前資金費率（小數，如 -0.0001 = -0.01%）
     funding_predicted: Optional[float] = None     # 預估下次
     cvd: Optional[float] = None

@@ -29,6 +29,7 @@ _FUNDING_NEG = -0.0001     # 空方付費 → 偏多有利
 _CVD_SLOPE_MIN = 0.15      # CVD 斜率「明顯」邊界
 _OI_RISE_MIN = 3.0         # OI 24h 上升算「蓄勢」
 _OI_FALL_MAX = -2.0        # OI 24h 下降算「退潮」
+_PRICE_TREND_DEADBAND_PCT = 1.0   # 24h 價格變化 |x|<此值＝方向不明（死區留 None，不硬湊；紅線③）
 
 
 def _get(obj, key):
@@ -124,6 +125,10 @@ def _price_trend(snap):
       3. regime_trend_dir（per-symbol 4h regime 的 classify_regime.trend_dir：上/下；
          盤整為 None）——v56：deepdive 等無突破旗標的來源用此後備，治本『象限恆 None』。
          注意：這是『市場已觀測到的趨勢方向』，非我方下單方向；逆勢單也照市場實況分桶。
+      4. price_chg_24h_pct（24h 價格變化%）——最低優先後備。治本實測缺口：deepdive 在
+         4h 盤整(ADX<20→trend_dir=None)時前三源全空，但『4h 無趨勢 ≠ 24h 沒動』。此欄
+         與 oi_delta_pct 同為 24h 窗的已觀測值，是 OI×價格象限最自然的價格配對。死區
+         ±_PRICE_TREND_DEADBAND_PCT%：微小波動仍回 None（不硬湊方向；紅線③）。
     """
     if _get(snap, "breakout_1h_high") is True:
         return "up"
@@ -137,6 +142,16 @@ def _price_trend(snap):
         return "up"
     if td in ("下", "down", "bear"):
         return "down"
+    chg = _get(snap, "price_chg_24h_pct")   # 後備：24h 已觀測價格方向（同 OI 窗）
+    if chg is not None:
+        try:
+            c = float(chg)
+            if c >= _PRICE_TREND_DEADBAND_PCT:
+                return "up"
+            if c <= -_PRICE_TREND_DEADBAND_PCT:
+                return "down"
+        except (TypeError, ValueError):
+            pass
     return None
 
 
