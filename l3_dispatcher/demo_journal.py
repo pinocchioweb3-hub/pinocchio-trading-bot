@@ -349,12 +349,22 @@ def count_rejected() -> tuple[int, str | None]:
         cnt = int((n[0] if n else 0) or 0)
         if cnt == 0:
             return 0, None
-        row = conn.execute(
-            "SELECT exit_reason FROM demo_trades WHERE status='rejected' "
-            "ORDER BY entry_at DESC LIMIT 1"
-        ).fetchone()
-        raw = (row[0] if row and row[0] else "")
-        return cnt, (_short_reject_hint(raw) or None)
+        # 治本（監督員 r52）：**不可只取最後一筆**拒因——會被最新一筆綁架而貼錯整體標籤
+        #   （10+ 輪誤診即此因）。改聚合全部 rejected、回報「最常見拒因 + 佔比」才誠實。
+        rows = conn.execute(
+            "SELECT exit_reason FROM demo_trades WHERE status='rejected'"
+        ).fetchall()
+        from collections import Counter
+        hints: Counter = Counter()
+        for r in rows:
+            h = _short_reject_hint(r[0] or "")
+            if h:
+                hints[h] += 1
+        if not hints:
+            return cnt, None
+        top_hint, top_n = hints.most_common(1)[0]
+        hint = top_hint if top_n == cnt else f"{top_hint}（最常見：{top_n}/{cnt} 筆）"
+        return cnt, hint
     finally:
         conn.close()
 
@@ -369,7 +379,11 @@ def _short_reject_hint(raw: str) -> str:
         "51010": "OKX 51010：帳戶模式須改為單幣種/跨幣種保證金才可交易永續",
         "51121": "OKX 51121：下單張數須為合約規格整數倍（已修，待重啟生效）",
         "51008": "OKX 51008：模擬盤餘額不足",
-        "51004": "OKX 51004：下單超過可用保證金",
+        # 治本（監督員 r52 親驗原文）：51004 真因＝下單張數超過『該槓桿層級的最大持倉上限』，
+        #   **非**保證金/餘額問題（OKX 原文：sum of order size+position can't be more than N
+        #   contracts which is the maximum position amount under current leverage）。治法＝縮張數
+        #   或降槓桿（高槓桿層級的最大持倉更小）。舊文案「超過可用保證金」會誤導去『補額度』。
+        "51004": "OKX 51004：下單張數超過該槓桿層級最大持倉上限（須縮張數或降槓桿，非餘額問題）",
     }
     for code, msg in known.items():
         if code in s:
