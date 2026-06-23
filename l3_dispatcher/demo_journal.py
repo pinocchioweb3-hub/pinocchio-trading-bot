@@ -388,6 +388,9 @@ def _short_reject_hint(raw: str) -> str:
     for code, msg in known.items():
         if code in s:
             return msg
+    # 系統端預檢拒因（非 OKX 錯誤碼）：白話化，讓本人看得懂這是程式端標的篩選、非帳戶設定。
+    if "not_on_okx" in s:
+        return "not_on_okx：標的不在 OKX 永續可交易清單（系統端篩選問題，非帳戶設定）"
     # 未知碼：去前綴後截短，避免帳本塞整段 JSON
     if s.startswith("reject:"):
         s = s[len("reject:"):]

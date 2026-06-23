@@ -65,11 +65,21 @@ def next_step(*, paper_n, paper_min, live_n, live_min,
         _attempts = demo_n + demo_rejected
         _high_reject = _attempts >= 3 and demo_rejected / _attempts >= 0.5
         if demo_rejected > 0 and _high_reject:
-            hint = f"（最近拒因 {demo_reject_hint}）" if demo_reject_hint else ""
+            hint = f"（最常見拒因：{demo_reject_hint}）" if demo_reject_hint else ""
+            # 治本（監督員 r53，承接 v93 task#12 誠實化）：不再硬寫「改帳戶模式 51010」當唯一卡點。
+            #   親驗 demo_trades 原文：51010 僅佔少數且全為早期、改模式後已不再復發（成交可正常平倉）；
+            #   真正大宗是系統端下單參數（標的不在 OKX 永續清單 / 張數規格 / 槓桿層級持倉上限），屬程式
+            #   修整範圍（CEO/RB-1 待辦），非帳戶設定。據『實際最常見拒因』給對應建議，避免要本人白做工。
+            _h = demo_reject_hint or ""
+            if "51010" in _h or "帳戶模式" in _h:
+                advice = ("拒因多為 OKX 帳戶模式（51010）：模擬盤帳戶須改為單幣種/跨幣種保證金"
+                          "模式才可交易永續——這須由你在 OKX 後台設定。")
+            else:
+                advice = ("拒因多屬系統端下單參數（標的是否在 OKX 永續清單／張數規格／槓桿層級持倉"
+                          "上限），屬程式修整範圍（CEO/RB-1 待辦），非帳戶設定；你無須調整 OKX。")
             return (f"⚠️ 模擬盤操盤手已下單 {_attempts} 次、其中 {demo_rejected} 次被 OKX 拒絕"
                     f"（實倉成交僅 {demo_n}/{DEMO_SAMPLE_TARGET}）{hint}——這是目前卡住實倉樣本的點。"
-                    "請先排除下單被拒原因：多為 OKX 模擬盤帳戶須改為『單幣種/跨幣種保證金』"
-                    "模式才可交易永續（錯誤碼 51010），或張數規格取整（51121，已修待重啟生效）")
+                    + advice)
         tail = f"；同時續累積紙上樣本（{paper_n}/{paper_min}）" if paper_n < paper_min else ""
         return f"模擬盤操盤手運行中，續累積 OKX 實倉樣本（{demo_n}/{DEMO_SAMPLE_TARGET}）{tail}"
     if live_n < live_min:

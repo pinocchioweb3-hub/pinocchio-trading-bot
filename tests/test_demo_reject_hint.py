@@ -54,3 +54,27 @@ def test_count_rejected_zero(monkeypatch, tmp_path):
     monkeypatch.setattr(dj, "DB_PATH", str(tmp_path / "empty.db"))
     dj.init_db()
     assert dj.count_rejected() == (0, None)
+
+
+def test_not_on_okx_is_whitelabelled_as_system_side():
+    # 治本（監督員 r53）：not_on_okx 是系統端預檢拒因，須白話化為「非帳戶設定」，
+    # 不可讓本人看到生 token、更不可被誤導去調 OKX 帳戶。
+    h = dj._short_reject_hint("reject:not_on_okx")
+    assert "not_on_okx" in h            # 保留可辨識 token（聚合用）
+    assert "非帳戶設定" in h            # 明指這非帳戶設定問題
+
+
+def test_next_step_reject_advice_is_reason_aware():
+    # 治本（監督員 r53）：next_step 不得對所有高拒單率都硬寫「改帳戶模式 51010」。
+    from l3_dispatcher.ceo_oversight import next_step
+    # not_on_okx 主導 → 應指向系統端、明說「無須調整 OKX」，不得硬塞 51010 帳戶模式建議
+    s = next_step(paper_n=45, paper_min=100, live_n=0, live_min=30, demo_n=0,
+                  demo_active=True, demo_rejected=5,
+                  demo_reject_hint="not_on_okx：標的不在 OKX 永續可交易清單（最常見：17/37 筆）")
+    assert "被 OKX 拒絕" in s and "0/30" in s
+    assert "無須調整 OKX" in s
+    assert "51010" not in s             # not_on_okx 主導時不得誤導去改帳戶模式
+    # 51010 確實主導時 → 才給帳戶模式建議
+    s2 = next_step(paper_n=45, paper_min=100, live_n=0, live_min=30, demo_n=0,
+                   demo_active=True, demo_rejected=5, demo_reject_hint="51010")
+    assert "51010" in s2 and "帳戶模式" in s2
