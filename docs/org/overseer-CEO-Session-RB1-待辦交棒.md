@@ -4,8 +4,13 @@
 > daemon 常駐模組修補，集中成單一可執行清單。下一個 **CEO Session（有人值守）** 直接照此執行，
 > 免得每輪 overseer 重新發現、散落在 log 行裡浪費 token。
 >
-> 最後更新：**2026-06-23 第52輪心跳序（now≈1782178456）**。狀態快照：daemon PID 27300 健康
-> （01:04 v92(2) 後穩定逾 8h）、唯一真 blocker = 紅線①人類閘。
+> 最後更新：**2026-06-23 第67輪（now≈1782209053）**。狀態快照：daemon PID **52788** 健康
+> （01:03:53 啟動、穩定逾 5h、liveness ~8min 新鮮、err.log absent、watchdog 武裝）、唯一真 blocker = 紅線①人類閘。
+>
+> **🔄 第67輪更新（監督員親驗活樣本，非舊快照）**：
+> 1. **demo 吞吐漏斗（r64 量化，本輪覆核）**：54 嘗試 → 37 拒(68%) → 17 掛單 → 8 entry_expired 餓死(47%) → 7 成交 → 1 pending＝端到端轉換 ~13%。**但此 54 筆全為重啟前歷史**：本輪讀 demo_trades 原文，最新一筆 entry_at 距今 **~5h（即重啟當下）**，自重啟以來 **0 筆新 demo 嘗試**（daemon scanned=15 / fires=0＝無新訊號通過品質閘）。
+> 2. **拒單側（含 not_on_okx）已大致治本、非當前活卡點**：本輪親讀 `demo_operator.py` 確認——not_on_okx 已有**雙層防護**：(a) intake 預過濾 `_okx_demo_universe`（v84 task#8，`:117`）只挑 OKX 模擬盤可交易幣；(b) 送單前 `fetch_okx_contract_spec` 對 BadSymbol/BadRequest 優雅攔截並標 `not_on_okx`+誠實措辭（task#73，`:243-264`）。**自重啟以來 0 新拒單**。故 r64 next_step「先修拒單68%」已**部分過時**——拒單是重啟前歷史殘量，不是活卡點。
+> 3. **真·當前活卡點＝上游出單量近零（fires=0）＋掛單後餓死（task#61 Step B）**，皆 daemon 軌、須人在場走 RB-1。優先序更正：**(1) task#61 Step B 餓死治本（深回踩到期轉市價，解端到端轉換）＞ (2) ①d 樣本速度 vs 品質閘權衡＞ (3) 拒單側僅監看，勿再當主修點**。
 >
 > **⚠️ 本輪重大校正（監督員親驗 exit_reason 原文，非舊快照）**：先前各輪 ledger 把卡點摘成
 > 「OKX 51004：下單超過可用保證金 → 請補模擬盤保證金」。**這是雙重誤判，使用者不需補保證金**：
@@ -55,10 +60,9 @@
 - 自 01:04 重啟 8.4h，demo 操盤手**僅嘗試 1 單**。即使拒單全治好，以此速率也難在合理時間湊滿 demo 樣本。
 - 可能成因＝`is_quality_signal`（R:R≥1.5）品質閘 × 近期低波動少訊號。**非 bug**（保守是 by-design），但 CEO 應有意識權衡「樣本速度 vs 品質門檻」，必要時於模擬盤放寬（紙上仍記全部）。
 
-### ② 【低優先】task#54 宇宙洩漏濾除（not_on_okx / 51155 / BadSymbol）
-- **問題**：美股代號曾洩漏進 OKX 永續路由（17 筆 BadSymbol，24h+ 前已停，但根因濾除未治本）。
-- **定位**：`l3_dispatcher/demo_operator.py`（下單前符號白名單/路由閘）。
-- **修法**：下單前對 OKX 永續 universe 做存在性濾除，非 OKX 上市符號直接跳過不送單。
+### ② 【✅ 大致已治·監督員 r67 親驗，僅監看】task#54 宇宙洩漏濾除（not_on_okx / 51155 / BadSymbol）
+- **問題（歷史）**：美股代號曾洩漏進 OKX 永續路由（17 筆 BadSymbol）。
+- **r67 親驗現況**：`demo_operator.py` 已有**雙層防護**——(a) intake 預過濾 `_okx_demo_universe`（v84 task#8，`:117`）只放行 OKX 模擬盤可交易幣；(b) 送單前 `fetch_okx_contract_spec` 對 BadSymbol/BadRequest 優雅攔截、標 `not_on_okx` + task#73 誠實措辭（`:243-264`，非把有效訊號永久誤標）。**自 01:03 重啟以來 0 新 not_on_okx 拒單**。→ **此項視為大致已治，下個 CEO Session 僅需監看，勿重做**；若仍想加強，可考慮把 `_okx_demo_universe` 快取 TTL 與失敗降級行為覆核一次（純強化、非 blocker）。
 
 ### ③ 【低優先·罕見邊界】51048 PEPE TP 價格序檢查
 - 歷史一筆拒單（51048，TP 價序，PEPE）。`demo_operator.py` TP 價格相對進場/方向的序檢查邊界。非系統性，可併入 ② 一起做。
