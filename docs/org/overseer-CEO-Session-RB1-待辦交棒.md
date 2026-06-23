@@ -4,13 +4,24 @@
 > daemon 常駐模組修補，集中成單一可執行清單。下一個 **CEO Session（有人值守）** 直接照此執行，
 > 免得每輪 overseer 重新發現、散落在 log 行裡浪費 token。
 >
-> 最後更新：**2026-06-23 第67輪（now≈1782209053）**。狀態快照：daemon PID **52788** 健康
+> 最後更新：**2026-06-23 第74輪（now≈1782221661）**。狀態快照：daemon PID **52788** 健康
 > （01:03:53 啟動、穩定逾 5h、liveness ~8min 新鮮、err.log absent、watchdog 武裝）、唯一真 blocker = 紅線①人類閘。
 >
 > **🔄 第67輪更新（監督員親驗活樣本，非舊快照）**：
 > 1. **demo 吞吐漏斗（r64 量化，本輪覆核）**：54 嘗試 → 37 拒(68%) → 17 掛單 → 8 entry_expired 餓死(47%) → 7 成交 → 1 pending＝端到端轉換 ~13%。**但此 54 筆全為重啟前歷史**：本輪讀 demo_trades 原文，最新一筆 entry_at 距今 **~5h（即重啟當下）**，自重啟以來 **0 筆新 demo 嘗試**（daemon scanned=15 / fires=0＝無新訊號通過品質閘）。
 > 2. **拒單側（含 not_on_okx）已大致治本、非當前活卡點**：本輪親讀 `demo_operator.py` 確認——not_on_okx 已有**雙層防護**：(a) intake 預過濾 `_okx_demo_universe`（v84 task#8，`:117`）只挑 OKX 模擬盤可交易幣；(b) 送單前 `fetch_okx_contract_spec` 對 BadSymbol/BadRequest 優雅攔截並標 `not_on_okx`+誠實措辭（task#73，`:243-264`）。**自重啟以來 0 新拒單**。故 r64 next_step「先修拒單68%」已**部分過時**——拒單是重啟前歷史殘量，不是活卡點。
 > 3. **真·當前活卡點＝上游出單量近零（fires=0）＋掛單後餓死（task#61 Step B）**，皆 daemon 軌、須人在場走 RB-1。優先序更正：**(1) task#61 Step B 餓死治本（深回踩到期轉市價，解端到端轉換）＞ (2) ①d 樣本速度 vs 品質閘權衡＞ (3) 拒單側僅監看，勿再當主修點**。
+>
+> **🔄 第74輪更新（監督員親讀 demo_trades 全 54 筆 exit_reason 原文，收斂拒單分類）**：
+> 把 37 筆拒單**正確摺疊**後，拒因不是「not_on_okx 一家獨大」，而是**兩個等大殺手**：
+> **① not_on_okx 17 筆**（標的不在 OKX 永續清單，已雙層治本）＋**② okx_entry_failed 17 筆**（送單被 OKX 退）＋ insufficient_budget 3 筆。
+> ledger 一行 hint 只取「最常見單一桶（17/37 not_on_okx）」，**掩蓋了第二個同樣 17 筆的送單失敗桶**。再拆 ② 的 OKX 原文 sMsg：
+> - **7 筆「Order quantity must be a multiple of …」＝張數非 lotSz 整數倍**（張數規格 bug；[[okx-realmoney-catch]] 記 51121 lotSz 已修 `fetch_okx_contract_spec` 讀 info.lotSz，但此 7 筆顯示對某些幣**仍殘或回歸**，須個別覆驗）。
+> - **5 筆「You can't complete this request under your current …」＝槓桿層級持倉上限/權限**（即 ①b 校正過的 51004 類，非保證金耗盡）。
+> - **2 筆「You can't trade this pair …」＝另一種 not_on_okx 漏網**（雙層過濾未攔到）。
+> - 1 筆 TP 價方向驗證（「TP price should be lower than …」＝方向/價帶 bug）、1 筆 isolated 持倉模式、1 筆 USDT 餘額。
+> **掛單後**（17 筆 closed）：entry_expired 10（餓死＝task#61B）、timeout 3、tp 2、stop 2＝端到端只有 **4 筆**走到真交易結果。
+> **結論不變**（這 54 筆全為重啟前歷史、現 fires=0 零新嘗試，拒單側仍只監看）；但**校正一處**：拒單治本**不等於「not_on_okx 解決就好」**——當 fires 恢復、demo 重新出單時，**lotSz 整數倍 bug（7/54≈13%）會是第二個立即復發的拒單殺手**，須與 task#61B 並列為 RB-1 拒單側待辦（見新增 ①e）。
 >
 > **⚠️ 本輪重大校正（監督員親驗 exit_reason 原文，非舊快照）**：先前各輪 ledger 把卡點摘成
 > 「OKX 51004：下單超過可用保證金 → 請補模擬盤保證金」。**這是雙重誤判，使用者不需補保證金**：
@@ -59,6 +70,13 @@
 ### ①d 【吞吐量觀察·非 RB-1 但需 CEO 判斷】demo 出單量近乎零
 - 自 01:04 重啟 8.4h，demo 操盤手**僅嘗試 1 單**。即使拒單全治好，以此速率也難在合理時間湊滿 demo 樣本。
 - 可能成因＝`is_quality_signal`（R:R≥1.5）品質閘 × 近期低波動少訊號。**非 bug**（保守是 by-design），但 CEO 應有意識權衡「樣本速度 vs 品質門檻」，必要時於模擬盤放寬（紙上仍記全部）。
+
+### ①e 【拒單側·待 fires 恢復前覆驗】lotSz 整數倍 bug 可能仍殘（治本未經足量樣本驗證）
+- **問題（r74 親讀全 54 筆原文）**：okx_entry_failed 17 筆中，**7 筆是「Order quantity must be a multiple of …」＝張數非 lotSz 整數倍**（51121 類），分佈於多個不同幣。此為歷史殘量（皆重啟前）。
+- **與 ③ 的衝突校正**：③ 寫「51121 已治好、勿重修」，其證據是「自 01:04 重啟以來復發＝0」——但 ①d 載明**重啟後總共只嘗試 1 單**，故「1 單 0 復發」**幾乎無統計力**，不足以證明 lotSz 治本對所有幣有效（紅線③：勿過度宣稱已治）。
+- **修法（待 fires 恢復、demo 重新出單時覆驗）**：覆核 `fetch_okx_contract_spec` 對這 7 個幣的 `lotSz`/`minSz`/`ctVal` 解析；確認 contracts 換算後一律向下取整到 lotSz 整數倍再送單。**勿動 strength.py**。
+- **優先序**：低於 task#61B（餓死）；但**高於把拒單側當「已全治」鬆手**——這是當 demo 恢復出單時會立刻復發、吃掉 ~13% 嘗試的第二殺手。
+- **安全**：模擬盤路徑、純下單尺寸計算，不碰真錢/訊號數學。
 
 ### ② 【✅ 大致已治·監督員 r67 親驗，僅監看】task#54 宇宙洩漏濾除（not_on_okx / 51155 / BadSymbol）
 - **問題（歷史）**：美股代號曾洩漏進 OKX 永續路由（17 筆 BadSymbol）。
