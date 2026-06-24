@@ -80,3 +80,29 @@ def test_place_demo_market_entry_uses_market_type(monkeypatch):
     res = asyncio.run(dt.place_demo_market_entry(FakeEx(), plan))
     assert res.get("ok") is True
     assert calls["type"] == "market" and calls["side"] == "buy"  # 市價、多單買
+
+
+def test_cancel_algos_for_symbol_only_matching(monkeypatch):
+    """task#15：清幽靈委託只取消該標的的演算法委託，不誤砍其他標的。"""
+    cancelled = {}
+
+    class FakeEx:
+        async def private_get_trade_orders_algo_pending(self, params):
+            return {"data": [
+                {"algoId": "a1", "instId": "OP-USDT-SWAP"},
+                {"algoId": "a2", "instId": "INJ-USDT-SWAP"},
+                {"algoId": "a3", "instId": "OP-USDT-SWAP"},
+            ]}
+
+        async def private_post_trade_cancel_algos(self, body):
+            cancelled["body"] = body
+            return {"code": "0"}
+
+    async def fake_confirm(ex):
+        return True
+
+    monkeypatch.setattr(demo_guard, "confirm_okx_demo", fake_confirm)
+    n = asyncio.run(dt.cancel_algos_for_symbol(FakeEx(), "OP"))
+    assert n == 2  # 只取消 OP 的兩筆
+    assert {c["algoId"] for c in cancelled["body"]} == {"a1", "a3"}
+    assert all(c["instId"] == "OP-USDT-SWAP" for c in cancelled["body"])  # 不誤砍 INJ

@@ -751,6 +751,28 @@ def convert_gate(direction: str, orig_entry: float, orig_stop: float,
     return True, "ok"
 
 
+async def cancel_algos_for_symbol(ex, symbol: str) -> int:
+    """取消某標的所有 pending 演算法委託(TP/SL conditional)——倉位平倉後清理殘留掛單，
+    治本『幽靈委託』(task#15：倉已平但 attachAlgoOrds 的未觸發 TP/SL 腿仍 live 殘留在 OKX)。
+
+    ⚠️ 呼叫端須先確認『該標的已無任何持倉』再呼叫（否則會誤砍同標的活倉的 TP/SL 保護）。
+    先正向證明模擬盤。回實際取消的演算法委託筆數；任何失敗回 0（不拋例外、不拖垮監控輪）。"""
+    from l4_execution.demo_guard import confirm_okx_demo
+    await confirm_okx_demo(ex)
+    try:
+        res = await ex.private_get_trade_orders_algo_pending(
+            {"instType": "SWAP", "ordType": "conditional"})
+        algos = [a for a in (res.get("data") or [])
+                 if (a.get("instId") or "").split("-")[0] == symbol]
+        if not algos:
+            return 0
+        body = [{"algoId": a.get("algoId"), "instId": a.get("instId")} for a in algos]
+        await ex.private_post_trade_cancel_algos(body)
+        return len(body)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 async def market_close_demo(ex, symbol: str, pos_side: str, contracts: float) -> dict:
     """市價平掉模擬盤某倉的剩餘張數（逾時平倉路徑）。reduceOnly。
     下單面動作 → 先再正向證明模擬盤。contracts ≤ 0 視為無倉、不動。"""

@@ -403,6 +403,16 @@ async def _monitor(ex, *, now_ms, tg=None) -> dict:
                         if marker:
                             dj.set_state(f"closing:{iid}", "")
                         summary["closed"] += 1
+                        # task#15 治本：倉已平 → 清掉該標的殘留的未觸發 TP/SL 演算法委託
+                        #   (attachAlgoOrds 的其餘腿不會隨倉自動取消＝幽靈委託)。僅在該標的
+                        #   已無任何持倉時清，避免誤砍同標的另一活倉的保護單。
+                        if not any(k[0] == t["symbol"] for k in okx_map):
+                            try:
+                                n_cxl = await dt.cancel_algos_for_symbol(ex, t["symbol"])
+                                if n_cxl:
+                                    summary["algos_cancelled"] = summary.get("algos_cancelled", 0) + n_cxl
+                            except Exception:  # noqa: BLE001
+                                pass
                     else:
                         dj.touch_synced(iid)   # history 未回填 → 保守等待，下輪重試
                         summary["await_pnl"] += 1
