@@ -244,6 +244,29 @@ def apply_demo_close(intent_id: str, *, pnl_usd: float, exit_reason: str,
         conn.close()
 
 
+def convert_to_market(intent_id: str, *, entry_price, stop_price, tp1, tp2, tp3,
+                      leverage, notional_usd, margin_usd, contracts, risk_usd,
+                      entry_order_id, entry_at_ms, note) -> bool:
+    """限價到期『轉市價進場』(task#14)：以新的市價計畫覆寫該 pending 單的計畫欄位，狀態維持
+    pending（市價單立即成交，下輪 _monitor 偵測 OKX 持倉→mark_filled→open）。entry_at 重設為
+    轉換時刻＝讓成交/逾時/平倉對帳以新進場為基準（與 v92 same-window scope 對齊）。
+    只動 pending 單（冪等：已成交/已平不覆寫）。回是否確有更新。"""
+    init_db()
+    conn = _conn()
+    try:
+        cur = conn.execute(
+            "UPDATE demo_trades SET entry_price=?, stop_price=?, tp1=?, tp2=?, tp3=?, "
+            "leverage=?, notional_usd=?, margin_usd=?, contracts=?, risk_usd=?, "
+            "entry_order_id=?, entry_at=?, last_synced_at=?, note=? "
+            "WHERE intent_id=? AND status='pending'",
+            (entry_price, stop_price, tp1, tp2, tp3, leverage, notional_usd, margin_usd,
+             contracts, risk_usd, entry_order_id, int(entry_at_ms),
+             int(time.time() * 1000), note, intent_id))
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def touch_synced(intent_id: str) -> None:
     """更新 last_synced_at（監控層每輪核對後呼叫，供「監控有在跑」健康探針）。"""
     init_db()
@@ -263,7 +286,7 @@ def get_live_demo_trades() -> list[dict]:
         rows = conn.execute(
             "SELECT intent_id, cl_ord_id, symbol, setup, direction, entry_price, "
             "stop_price, leverage, contracts, ct_val, risk_usd, entry_order_id, "
-            "status, entry_at, filled_at, paper_id "
+            "status, entry_at, filled_at, paper_id, tp1 "
             "FROM demo_trades WHERE status IN ('pending','open') ORDER BY entry_at"
         ).fetchall()
         out = []
@@ -273,7 +296,7 @@ def get_live_demo_trades() -> list[dict]:
                 "direction": r[4], "entry_price": r[5], "stop_price": r[6],
                 "leverage": r[7], "contracts": r[8], "ct_val": r[9], "risk_usd": r[10],
                 "entry_order_id": r[11], "status": r[12], "entry_at": r[13],
-                "filled_at": r[14], "paper_id": r[15],
+                "filled_at": r[14], "paper_id": r[15], "tp1": r[16],
                 # demo_trader.bucket_risk_check 讀 'symbol' + 'risk_usd' → 形狀相容
                 "pos_side": "long" if r[4] == "bull" else "short",
             })

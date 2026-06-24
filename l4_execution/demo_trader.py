@@ -692,6 +692,65 @@ async def cancel_demo_entry(ex, symbol: str, order_id: str | None,
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+async def place_demo_market_entry(ex, plan: OrderPlan) -> dict:
+    """限價到期『轉市價進場』（task#14＝AB task#59 驗證的 D 政策：救涵蓋率 35%→94%、EV 中性）。
+
+    與 place_demo_plan 同結構，差別只在進場單型別＝market（不帶 price，立即成交），止損/分批
+    止盈仍由 attachAlgoOrds 依附（成交時原子生效，不裸倉）。呼叫端須先做『追價理性閘』與風險閘
+    （別追過頭、別讓 sl 距離爆掉）——本函式只負責安全下單。先正向證明模擬盤（雙重保險）。
+    任何步驟失敗回 {ok:False, error}（呼叫端據此退回 entry_expired，不開半套）。"""
+    from l4_execution.demo_guard import DemoGuardError, confirm_okx_demo
+    if not plan.ok:
+        return {"ok": False, "error": f"plan rejected: {plan.reject_reason}"}
+    if kill_switch_active():
+        return {"ok": False, "error": "kill_switch_active"}
+    await confirm_okx_demo(ex)
+    inst_id = f"{plan.symbol}/USDT:USDT"
+    try:
+        await ex.set_leverage(plan.leverage, inst_id, params={"mgnMode": "isolated"})
+    except Exception:  # noqa: BLE001 — 已是目標槓桿不致命
+        pass
+    params = build_okx_entry_params(plan)
+    try:
+        order = await ex.create_order(symbol=inst_id, type="market", side=plan.side,
+                                      amount=plan.contracts, params=params)
+        return {"ok": True, "entry_order_id": (order or {}).get("id"),
+                "intent_id": plan.intent_id, "cl_ord_id": plan.cl_ord_id}
+    except DemoGuardError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"market entry failed: {e}"}
+
+
+# 追價理性閘常數（轉市價時用）：價格已穿越或逼近 TP1、或新止損距離爆掉 → 放棄轉換、照常作廢
+CONVERT_MAX_SL_MULT = 1.8     # 新 sl 距離 ≤ 原訊號 sl 距離 × 此值才轉（防追太遠把 R 拉爆）
+
+
+def convert_gate(direction: str, orig_entry: float, orig_stop: float,
+                 tp1: float | None, cur_px: float) -> tuple[bool, str]:
+    """限價到期『是否該轉市價』的零下單理性閘（純函式、可離線測）。
+
+    放棄轉換（照常作廢）的情況：①價已穿越 TP1（追進去沒利潤空間）②方向已壞（多單現價≤止損
+    /空單≥止損）③新止損距離 > 原距離×CONVERT_MAX_SL_MULT（價跑太遠，追進去 R 結構爆掉）。"""
+    if cur_px <= 0:
+        return False, "no_price"
+    bull = direction == "bull"
+    if bull and cur_px <= orig_stop:
+        return False, "price_below_stop"
+    if (not bull) and cur_px >= orig_stop:
+        return False, "price_above_stop"
+    if tp1 is not None and tp1 > 0:
+        if bull and cur_px >= tp1:
+            return False, "past_tp1"
+        if (not bull) and cur_px <= tp1:
+            return False, "past_tp1"
+    orig_sl = abs(orig_entry - orig_stop)
+    new_sl = abs(cur_px - orig_stop)
+    if orig_sl > 0 and new_sl > orig_sl * CONVERT_MAX_SL_MULT:
+        return False, "sl_distance_blown"
+    return True, "ok"
+
+
 async def market_close_demo(ex, symbol: str, pos_side: str, contracts: float) -> dict:
     """市價平掉模擬盤某倉的剩餘張數（逾時平倉路徑）。reduceOnly。
     下單面動作 → 先再正向證明模擬盤。contracts ≤ 0 視為無倉、不動。"""

@@ -304,6 +304,53 @@ async def _place_one(ex, signal, *, avail_usd, tg=None) -> dict:
     return {"placed": True, "margin_est": plan.margin_usd}
 
 
+async def _convert_expired_to_market(ex, t, *, now_ms, tg=None) -> dict:
+    """限價逾時 → 過理性閘則轉市價追進（task#14＝AB task#59 D 政策）。
+
+    重建市價計畫：同結構止損、依新進場 re-size 保持風險預算（build_order_plan 自洽重算
+    槓桿/張數/TP）。回 {converted: bool, reason}。任何步驟失敗→converted=False（呼叫端作廢，
+    不開半套）。只動模擬盤、全程 demo_guard 正向證明（紅線①真錢永不到此）。"""
+    from l4_execution import demo_trader as dt
+    from l3_dispatcher import demo_journal as dj
+    sym, direction, iid = t["symbol"], t["direction"], t["intent_id"]
+    try:
+        tk = await ex.fetch_ticker(f"{sym}/USDT:USDT")
+        cur_px = float((tk or {}).get("last") or (tk or {}).get("close") or 0)
+    except Exception:  # noqa: BLE001
+        return {"converted": False, "reason": "no_price"}
+    ok, reason = dt.convert_gate(direction, t.get("entry_price"), t.get("stop_price"),
+                                 t.get("tp1"), cur_px)
+    if not ok:
+        return {"converted": False, "reason": reason}
+    try:
+        spec = await dt.fetch_okx_contract_spec(ex, sym)
+    except Exception:  # noqa: BLE001
+        spec = {"ct_val": t.get("ct_val") or dt.DEFAULT_CT_VAL,
+                "lot_sz": dt.DEFAULT_LOT_SZ, "min_sz": dt.DEFAULT_MIN_SZ}
+    risk = float(t.get("risk_usd") or 0)
+    plan = dt.build_order_plan(sym, direction, cur_px, float(t["stop_price"]),
+                               risk_usd=risk, ct_val=spec["ct_val"], lot_sz=spec["lot_sz"],
+                               min_sz=spec["min_sz"], seq=f"{iid}-mkt")
+    if not plan.ok:
+        return {"converted": False, "reason": f"plan:{plan.reject_reason}"}
+    # 先取消原限價再下市價（避免雙倉）
+    await dt.cancel_demo_entry(ex, sym, t.get("entry_order_id"), t.get("cl_ord_id"))
+    res = await dt.place_demo_market_entry(ex, plan)
+    if not res.get("ok"):
+        return {"converted": False, "reason": f"place:{res.get('error')}"}
+    tps = {leg.label: leg.price for leg in plan.tp_legs}
+    dj.convert_to_market(iid, entry_price=plan.entry, stop_price=plan.sl_trigger,
+                         tp1=tps.get("tp1"), tp2=tps.get("tp2"), tp3=tps.get("tp3"),
+                         leverage=plan.leverage, notional_usd=plan.notional_usd,
+                         margin_usd=plan.margin_usd, contracts=plan.contracts,
+                         risk_usd=plan.realized_risk_usd,
+                         entry_order_id=res.get("entry_order_id"), entry_at_ms=now_ms,
+                         note=f"限價逾時→市價追進 @{cur_px:.6g}")
+    _notify(tg, f"🔄 模擬盤限價逾時轉市價：{sym} {direction} @{cur_px:.6g} "
+                f"×{plan.contracts}張 lev{plan.leverage}（D政策救涵蓋率，紙上）")
+    return {"converted": True, "px": cur_px}
+
+
 async def _monitor(ex, *, now_ms, tg=None) -> dict:
     """以 OKX 真相監控所有未平倉模擬盤單：成交偵測 / 平倉 realizedPnl / 逾時平倉 / 對帳。"""
     from l3_dispatcher import demo_journal as dj
@@ -325,11 +372,17 @@ async def _monitor(ex, *, now_ms, tg=None) -> dict:
                     dj.mark_filled(iid)
                     summary["filled"] += 1
                 elif pending_expired(t["entry_at"], now_ms):
-                    await dt.cancel_demo_entry(ex, t["symbol"], t.get("entry_order_id"),
-                                               t.get("cl_ord_id"))
-                    dj.apply_demo_close(iid, pnl_usd=0.0, exit_reason="entry_expired",
-                                        note="限價逾時未成交")
-                    summary["expired"] += 1
+                    # task#14：限價逾時→先試『轉市價追進』(D 政策，AB task#59 驗證救涵蓋率
+                    #   35→94%、EV 中性)；過理性閘才轉，否則照常作廢。純模擬盤(紅線①)。
+                    conv = await _convert_expired_to_market(ex, t, now_ms=now_ms, tg=tg)
+                    if conv.get("converted"):
+                        summary["converted"] = summary.get("converted", 0) + 1
+                    else:
+                        await dt.cancel_demo_entry(ex, t["symbol"], t.get("entry_order_id"),
+                                                   t.get("cl_ord_id"))
+                        dj.apply_demo_close(iid, pnl_usd=0.0, exit_reason="entry_expired",
+                                            note=f"限價逾時未成交（不轉市價:{conv.get('reason')}）")
+                        summary["expired"] += 1
                 else:
                     dj.touch_synced(iid)
             elif t["status"] == "open":
