@@ -62,7 +62,8 @@ def test_place_demo_market_entry_uses_market_type(monkeypatch):
     class FakeEx:
         headers = {"x-simulated-trading": "1"}
 
-        async def set_leverage(self, *a, **k):
+        async def set_leverage(self, lev, symbol, params=None):
+            calls["lev_params"] = params or {}   # task#17：須帶 posSide(hedge 模式)
             return {}
 
         async def create_order(self, symbol, type, side, amount, params):
@@ -80,6 +81,9 @@ def test_place_demo_market_entry_uses_market_type(monkeypatch):
     res = asyncio.run(dt.place_demo_market_entry(FakeEx(), plan))
     assert res.get("ok") is True
     assert calls["type"] == "market" and calls["side"] == "buy"  # 市價、多單買
+    # task#17：set_leverage 必須帶 posSide(hedge 模式否則 51000、槓桿沒設成→OKX 用 3x 預設)
+    assert calls["lev_params"].get("posSide") == "long"
+    assert calls["lev_params"].get("mgnMode") == "isolated"
 
 
 def test_cancel_algos_for_symbol_only_matching(monkeypatch):

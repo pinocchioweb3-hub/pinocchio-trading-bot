@@ -611,10 +611,16 @@ async def place_demo_plan(ex, plan: OrderPlan, *,
         "attached_tp_legs": [{"label": leg.label, "contracts": leg.contracts,
                               "price": leg.price} for leg in plan.tp_legs],
     }
+    # task#17 治本：帳戶為 hedge(long_short_mode)，OKX isolated set-leverage **必須帶 posSide**，
+    #   否則回 51000 "Parameter posSide error"。舊版沒帶＝每次 set_leverage 都拋例外被吞 →
+    #   槓桿從未真正設定 → OKX 用預設 3x 開倉（帳本卻記 plan.leverage=20，實際 3x＝使用者看到的 3x）。
     try:
-        await ex.set_leverage(plan.leverage, inst_id, params={"mgnMode": "isolated"})
-    except Exception as e:  # noqa: BLE001 — 已是目標槓桿等情形不致命，記錄續行
+        await ex.set_leverage(plan.leverage, inst_id,
+                              params={"mgnMode": "isolated", "posSide": plan.pos_side})
+    except Exception as e:  # noqa: BLE001 — 已是目標槓桿等情形不致命，但記錄以便看見真失敗
         results["leverage_note"] = str(e)
+        print(f"[demo_trader] ⚠️ set_leverage 失敗 {plan.symbol} {plan.pos_side} "
+              f"→{plan.leverage}x：{str(e)[:120]}（實際槓桿可能非預期）")
 
     # 進場 LIMIT + 原生附帶止損/分批止盈（attachAlgoOrds：成交時才一起生效，不裸倉、不 TP-before-fill）
     params = build_okx_entry_params(plan)
@@ -706,10 +712,11 @@ async def place_demo_market_entry(ex, plan: OrderPlan) -> dict:
         return {"ok": False, "error": "kill_switch_active"}
     await confirm_okx_demo(ex)
     inst_id = f"{plan.symbol}/USDT:USDT"
-    try:
-        await ex.set_leverage(plan.leverage, inst_id, params={"mgnMode": "isolated"})
-    except Exception:  # noqa: BLE001 — 已是目標槓桿不致命
-        pass
+    try:  # task#17：hedge 模式 set-leverage 必須帶 posSide（否則 51000 被吞、槓桿沒設成）
+        await ex.set_leverage(plan.leverage, inst_id,
+                              params={"mgnMode": "isolated", "posSide": plan.pos_side})
+    except Exception as e:  # noqa: BLE001
+        print(f"[demo_trader] ⚠️ 轉市價 set_leverage 失敗 {plan.symbol}：{str(e)[:120]}")
     params = build_okx_entry_params(plan)
     try:
         order = await ex.create_order(symbol=inst_id, type="market", side=plan.side,
