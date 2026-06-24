@@ -47,7 +47,12 @@ EXCLUDED_SETUPS = ("us_breakout",)
 INTAKE_MAX_AGE_MIN = int(os.getenv("DEMO_INTAKE_MAX_AGE_MIN", "90"))
 INTAKE_BATCH_LIMIT = int(os.getenv("DEMO_INTAKE_BATCH_LIMIT", "3"))   # 每輪最多開幾筆新倉（保守）
 SCAN_LIMIT = int(os.getenv("DEMO_INTAKE_SCAN_LIMIT", "200"))         # 每輪從 paper 讀新訊號上限
-DEMO_MIN_RR = float(os.getenv("DEMO_MIN_RR", "1.5"))                 # 模擬盤交易訊號品質閘：只開 R:R≥此值（研究 w7r04t691）
+DEMO_MIN_RR = float(os.getenv("DEMO_MIN_RR", "1.2"))                 # 模擬盤交易訊號品質閘：只開 R:R≥此值
+# task#16（2026-06-24，活線診斷）：原 1.5 太嚴——是用 tp1（最近目標）算的『地板 R:R』，
+#   忽略 tp2/tp3 的續航上限；deepdive 訊號 R:R 多落 1.0–1.4，1.5 閘把 26h 內 14 訊號濾掉 11 筆
+#   （只 3 筆過）＝demo 24h 開不出新單＝吞吐量近零、Phase0 樣本累積停滯。改 1.2＝仍濾掉真正差的
+#   (<1.2：AVAX 0.72/ARB 0.97/breakeven 級)，但放行中等 EV(1.2–1.5) → 吞吐約 2×。
+#   這是『選擇門檻』非『統計顯著門檻』——復盤 L2 四關(minTRL/DSR/PBO/FDR)維持嚴格不變、不為湊樣本降統計閘。
 ENTRY_EXPIRY_HOURS = float(os.getenv("DEMO_ENTRY_EXPIRY_HOURS", "8"))  # 限價掛單逾時作廢
 TIME_LIMIT_HOURS = float(os.getenv("DEMO_TIME_LIMIT_HOURS", "24"))     # 持倉逾時平倉（鏡 demo_trader.TIME_LIMIT_HOURS=24）
 
