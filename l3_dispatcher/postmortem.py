@@ -711,8 +711,9 @@ def _fetch_btc_4h_closes(days: int = 1200) -> list[tuple[int, float]]:
 # =====================================================================
 # digest 渲染（人類可讀 .md）
 # =====================================================================
-def render_digest_md(ev: dict, d1: dict, n_new: int, pa: dict | None = None) -> str:
-    """把分桶 EV + 計畫對比 + D1 渲染成 markdown。"""
+def render_digest_md(ev: dict, d1: dict, n_new: int, pa: dict | None = None,
+                     mci: dict | None = None) -> str:
+    """把分桶 EV + 計畫對比 + 缺數據誤判(item-d) + D1 渲染成 markdown。"""
     lines = [
         "# 🔬 皮諾丘交易覆盤（驗屍）摘要",
         "",
@@ -768,6 +769,28 @@ def render_digest_md(ev: dict, d1: dict, n_new: int, pa: dict | None = None) -> 
             lines += ["", "**③ 止損劇本驗證：**"]
             for k, v in sorted(sc.items(), key=lambda x: -x[1]):
                 lines.append(f"- {_STOP_LABEL.get(k, k)}：{v} 筆")
+
+    # 🧩 item-d（v102 治本）：缺數據誤判排行——接 review_attribution.missing_context_impact，
+    #   把『缺哪個數據時平均 R 最差』自動帶進每輪 digest，讓復盤閉環自動指出下一個最該回補的
+    #   因子（過去此分析只在 CLI、未進 daemon）。純觀測、小樣本標未達顯著（紅線③）。
+    if mci:
+        ranked = sorted(
+            (kv for kv in mci.items()
+             if kv[1].get("gap_absent_minus_present") is not None
+             and kv[1].get("n_absent", 0) >= 3 and kv[1].get("n_present", 0) >= 3),
+            key=lambda kv: kv[1]["gap_absent_minus_present"])   # 最負(缺它最傷)在前
+        lines += ["", "## 🧩 缺數據誤判排行（item-d：缺哪個數據時結果最差 → 最該回補）", ""]
+        if ranked:
+            lines += ["| 數據因子 | 缺席n | 在場n | 缺席avgR | 在場avgR | 差距(缺−在) |",
+                      "| --- | ---: | ---: | ---: | ---: | ---: |"]
+            for k, v in ranked[:8]:
+                lines.append(f"| {k} | {v['n_absent']} | {v['n_present']} | "
+                             f"{v['mean_r_when_absent']:+.2f} | {v['mean_r_when_present']:+.2f} | "
+                             f"{v['gap_absent_minus_present']:+.2f} |")
+            lines += ["", "_差距為負＝該數據缺席時平均 R 較差＝引擎下一個最該自動回補的因子；"
+                      "樣本小僅供觀察、未達統計顯著（紅線③）。_"]
+        else:
+            lines.append("（缺席/在場樣本皆未達 3 筆，暫無可比；待樣本累積自動充實）")
 
     lines += ["", "## D1 反事實（deepdive 加 breadth 閘 + BTC 4h>200MA）", "",
               f"- 評估筆數：{d1.get('n_eval', 0)}",
@@ -889,10 +912,19 @@ def run_scan_once(notes_path: Path | None = None,
     btc_4h = _fetch_btc_4h_closes()
     d1 = d1_counterfactual(enriched_all, btc_4h)
 
+    # item-d（v102 治本）：缺數據誤判分析接進 daemon——過去 review_attribution.missing_context_impact
+    #   只在 CLI、digest 只報覆蓋率不報「哪個漏看因子最傷 EV」。純讀、失敗不致命（不阻塞驗屍）。
+    mci = None
+    try:
+        from backtest import review_attribution as _ra
+        mci = _ra.analyze(_ra.load_closed()).get("missing_context_impact")
+    except Exception as e:  # noqa: BLE001
+        print(f"[postmortem] 缺數據誤判分析略過：{type(e).__name__}: {e}")
+
     # 寫 digest（覆寫；它是「最新狀態」快照）
     try:
         dp_.parent.mkdir(parents=True, exist_ok=True)
-        dp_.write_text(render_digest_md(ev, d1, n_written, pa), encoding="utf-8")
+        dp_.write_text(render_digest_md(ev, d1, n_written, pa, mci), encoding="utf-8")
     except Exception as e:
         print(f"[postmortem] digest write failed: {type(e).__name__}: {e}")
 

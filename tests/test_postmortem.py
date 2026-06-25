@@ -538,6 +538,30 @@ def test_enrich_entry_expired_end_to_end_not_traded():
     assert pa["n_with_plan"] == 0
 
 
+def test_render_digest_includes_missing_context_ranking():
+    """v102 item-d：digest 須帶『缺數據誤判排行』，且缺它最傷(gap 最負)排最前；
+    缺席或在場樣本<3 的因子不列入（避免雜訊）。"""
+    mci = {
+        "btc_above_200ma_4h": {"n_absent": 5, "n_present": 6,
+                               "mean_r_when_absent": -0.80, "mean_r_when_present": 0.30,
+                               "gap_absent_minus_present": -1.10},
+        "htf_aligned": {"n_absent": 4, "n_present": 5,
+                        "mean_r_when_absent": -0.20, "mean_r_when_present": 0.10,
+                        "gap_absent_minus_present": -0.30},
+        "whale_net": {"n_absent": 2, "n_present": 9,   # 缺席 n<3 → 應被濾掉
+                      "mean_r_when_absent": -2.0, "mean_r_when_present": 0.0,
+                      "gap_absent_minus_present": -2.0},
+    }
+    out = _pm.render_digest_md({}, {}, 0, None, mci)
+    assert "缺數據誤判排行" in out
+    # 最傷的 btc_above_200ma_4h 要排在 htf_aligned 之前
+    assert out.index("btc_above_200ma_4h") < out.index("htf_aligned")
+    # 樣本不足的 whale_net 不該出現在表內
+    assert "whale_net" not in out
+    # 未提供 mci → 不渲染該段（向後相容）
+    assert "缺數據誤判排行" not in _pm.render_digest_md({}, {}, 0, None)
+
+
 # ---------------------------------------------------------------------------
 # 直跑入口
 # ---------------------------------------------------------------------------
