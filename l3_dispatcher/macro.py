@@ -937,6 +937,12 @@ async def run_per_symbol_loop(tg, source, watchlist, interval_seconds: int = 216
                                            "callback_data": f"dintent:{sym}:{_dir}"}]]
                                         if _actionable else None)
                             card_text = _with_display_mode(text) if _actionable else text
+                            # task#10：可執行卡頂端加『一眼看懂』摘要框（解版面太亂、訊號難找）。
+                            #   純顯示、數字與 📋 JSON 同源；缺料→空字串不影響原卡。
+                            if _actionable:
+                                _summary = _render_signal_summary(sym, meta.get("plan") or {})
+                                if _summary:
+                                    card_text = _summary + "\n\n" + card_text
                             sig_mid = await _send_to_telegram(
                                 tg, card_text,
                                 prefix=(f"🎯 <b>{sym} 交易計畫深度分析</b>\n"
@@ -1092,6 +1098,39 @@ def _display_mode() -> str:
         return m if m in ("novice", "expert") else "novice"
     except Exception:
         return "novice"
+
+
+def _render_signal_summary(sym: str, plan_dict: dict) -> str:
+    """task#10：把可執行 deepdive 計畫濃縮成『一眼看懂』摘要框，置於卡片最上方。
+
+    解使用者回饋『一大串版面、訊號要慢慢找』——方向/進場/止損/止盈 先到位（3–4 行），
+    完整 LLM 論述收到下方。數字一律走 canonical_from_deepdive 單一權威（與『📋 複製 JSON』
+    按鈕同源、不另算），缺料/換算失敗→回空字串（不渲染摘要、不阻斷原卡）。
+    ⛔ 純顯示層：零訊號數學、零下單、零計畫數字變更（只是把既有數字提到最上面）。"""
+    try:
+        from telegram_bot.plan import canonical_from_deepdive
+        c = canonical_from_deepdive(sym, plan_dict)
+    except Exception:  # noqa: BLE001 — 缺 entry/stop 等 → 不渲染摘要，回退原卡
+        return ""
+    dir_zh = "做多 📈" if c.get("direction") == "bull" else "做空 🔻"
+    lo, hi, entry = c.get("entry_low"), c.get("entry_high"), c.get("entry")
+    entry_str = (f"${lo}–${hi}" if (lo is not None and hi is not None and lo != hi)
+                 else f"${entry}（市價）")
+    tps, tr = c.get("tps") or {}, c.get("tp_r") or ()
+    tp_parts = []
+    for i, key in enumerate(("tp1", "tp2", "tp3")):
+        v = tps.get(key)
+        if v is not None and i < len(tr):
+            tp_parts.append(f"TP{i + 1} ${v}({tr[i]}R)")
+    lines = [
+        "📌 <b>一眼看懂</b>（先看這幾行，完整分析在下方）",
+        f"　{dir_zh}　進場 <code>{entry_str}</code>",
+        f"　止損 <code>${c.get('stop')}</code>（＝1R，距 {c.get('sl_distance_pct')}%）",
+    ]
+    if tp_parts:
+        lines.append("　" + " ｜ ".join(tp_parts))
+    lines.append("━━━━━ 完整分析（可略讀）━━━━━")
+    return "\n".join(lines)
 
 
 def _with_display_mode(text: str) -> str:

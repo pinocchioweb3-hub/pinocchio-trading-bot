@@ -170,6 +170,43 @@ def test_with_display_mode_is_pure_display():
         assert needle not in code, f"_with_display_mode 不該含 {needle!r}"
 
 
+# ── 6. task#10：『一眼看懂』摘要框（解版面太亂、訊號難找）─────────────────────
+def test_signal_summary_box_surfaces_actionables_on_top():
+    """摘要框須含方向/進場/止損(1R)/三段TP+R，數字與 canonical 同源。"""
+    plan = {"actionable": True, "direction": "bear", "entry_type": "limit", "entry": None,
+            "entry_lo": 60.95, "entry_hi": 61.55, "stop": 63.35,
+            "tp1": 58.55, "tp2": 55.50, "tp3": 52.85}
+    out = macro._render_signal_summary("HYPE", plan)
+    assert "一眼看懂" in out
+    assert "做空" in out and "60.95" in out and "61.55" in out
+    assert "63.35" in out and "1R" in out
+    assert "TP1" in out and "TP2" in out and "TP3" in out and "R)" in out
+    assert "完整分析" in out          # 分隔線提示下方為完整分析
+
+
+def test_signal_summary_empty_on_missing_plan():
+    """缺料/方向非 bull|bear（中性卡）→ 回空字串，不渲染摘要、不阻斷原卡。"""
+    assert macro._render_signal_summary("X", {"direction": None}) == ""
+    assert macro._render_signal_summary("X", {}) == ""
+
+
+def test_signal_summary_is_pure_display():
+    """摘要框可執行碼不得出現訊號強度/觸發/下單字眼（純顯示層）。"""
+    import ast
+    import inspect
+    import textwrap
+    src = textwrap.dedent(inspect.getsource(macro._render_signal_summary))
+    node = ast.parse(src).body[0]
+    if (node.body and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)):
+        node.body = node.body[1:]
+    code = ast.unparse(node)
+    for needle in ("strength", "l2_trigger", "place_order", "fire_queue",
+                   "record_paper_entry", "set_override", "claim("):
+        assert needle not in code, f"_render_signal_summary 不該含 {needle!r}"
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
