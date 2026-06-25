@@ -300,7 +300,10 @@ class BotConfig:
 
         # 風險（1R）優先序：明確 RISK_PER_TRADE_PCT>0 ＞ 明確 RISK_PER_TRADE_USD
         #                  ＞ 兩者皆未設 → 落 tier 保守 %（小本金永不更激進）
-        pct = _f("RISK_PER_TRADE_PCT", 0.0, 0.0, 20.0)
+        # 安全夾擠上限 20%→5%：20%/單筆＝約 5 連敗近歸零（無法存活），屬誤設量級；
+        # 5% 對齊使用者自定的最大風險偏好上限。注意：以現有紙上 maxDD≈-10.7R，
+        # 即使 5% 也代表帳戶約 -53%，故 5% 為「硬上限」非建議值（建議 1R ≤2.5%）。
+        pct = _f("RISK_PER_TRADE_PCT", 0.0, 0.0, 5.0)
         if pct > 0:
             risk_usd = round(bal * pct / 100, 2)
         elif _is_set("RISK_PER_TRADE_USD"):
@@ -427,5 +430,12 @@ if __name__ == "__main__":
     c = reload()
     assert c.default_leverage == 10, c.default_leverage
     print("✓ ④明確 env 覆寫優先 — micro 帳戶仍可手動設 10x（紅線②可覆寫）")
+
+    # 不變量⑤（v100 安全夾擠）：RISK_PER_TRADE_PCT 上限＝5% — 誤設 10%/20% 一律夾回 5
+    _set("RISK_PER_TRADE_PCT", "10")
+    c = reload()
+    assert c.risk_per_trade_pct == 5.0, c.risk_per_trade_pct
+    _set("RISK_PER_TRADE_PCT", None)
+    print("✓ ⑤RISK_PER_TRADE_PCT 安全上限＝5%（誤設 10% 夾回 5，杜絕災難倉位）")
 
     print("--- 全部不變量通過 ---")
