@@ -33,6 +33,20 @@ def test_samples_met_changes_attribution():
     assert "樣本達標" in out
 
 
+def test_ample_paper_but_unproven_edge_not_mislabeled_as_sample_short():
+    """治本 v101：紙上樣本充足(169≥100)但真錢 0/30(人工閘)＋edge 未顯著(t≈1.07)時，
+    舊版會謊報『樣本供給不足』。修後須誠實歸因『edge 未達統計顯著、非樣本量』。"""
+    out = _synthesize_bottleneck(169, 100, 0, 30, 20, 0, paper_t=1.07)
+    assert "樣本供給不足" not in out          # 不再把『樣本充足』謊報成不足
+    assert "edge 未達統計顯著" in out and "1.07" in out and "非樣本量" in out
+
+
+def test_significant_edge_pending_realmoney_gate():
+    """紙上足且 edge 已顯著(t≥2)、真錢未開 → 歸因到真錢人工閘(紅線①)，非樣本/edge。"""
+    out = _synthesize_bottleneck(169, 100, 0, 30, 20, 0, paper_t=2.5)
+    assert "真錢" in out and "紅線①" in out and "樣本供給不足" not in out
+
+
 def test_build_brief_runs_and_includes_synthesis():
     brief = build_ceo_brief()
     assert isinstance(brief, str) and "系統自評" in brief and "跨 session 綜合" in brief

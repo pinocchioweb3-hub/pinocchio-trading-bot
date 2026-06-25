@@ -164,6 +164,37 @@ def _count_closed(table: str) -> tuple[int, float]:
         return 0, 0.0
 
 
+def _paper_edge_tstat(table: str = "paper_trades") -> float | None:
+    """紙上『真實已平倉』realized_r 的單樣本 t 值（檢定 EV 是否顯著異於 0）。
+
+    t = mean / (sd/√n)。n<2 或 sd=0 → None（無法檢定，誠實不報）。與 _count_closed 同
+    口徑（排除 entry_expired）。供 CEO 自評誠實區分『樣本不足』與『樣本足但 edge 未顯著
+    (t<2)』——治本 _synthesize_bottleneck 把『真錢 0/30 人工閘恆成立』誤報成『樣本供給不足』。
+    註：此為名目 t，未做 n_eff 叢聚校正（叢聚會讓真 t 更低），故為樂觀上界；t<2 即未證實。"""
+    try:
+        conn = sqlite3.connect(_TJ_DB, timeout=5)
+        try:
+            rows = conn.execute(
+                f"SELECT realized_r FROM {table} WHERE status='closed' "
+                f"AND IFNULL(exit_reason,'') != 'entry_expired' "
+                f"AND realized_r IS NOT NULL"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    rs = [float(r[0]) for r in rows if r[0] is not None]
+    n = len(rs)
+    if n < 2:
+        return None
+    mean = sum(rs) / n
+    var = sum((x - mean) ** 2 for x in rs) / (n - 1)
+    sd = var ** 0.5
+    if sd <= 0:
+        return None
+    return mean / (sd / (n ** 0.5))
+
+
 def phase0_status() -> dict:
     """回 Phase 0 解鎖進度（純偵測）。
 
@@ -358,15 +389,29 @@ def _section_decisions() -> str:
 
 
 def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
-                           demo_n, demo_rejected) -> str:
+                           demo_n, demo_rejected, paper_t=None) -> str:
     """task#7 CEO 深度綜合：純函式、確定性跨 session 關聯推理（可離線測試）。
     把『樣本供給 × 模擬盤下單健康 × 復盤優化器晉升狀態』綜合成單一瓶頸歸因——這才是
-    真綜合分析，非欄位回音。資料不足就誠實說無法綜合（紅線③不臆測）。"""
+    真綜合分析，非欄位回音。資料不足就誠實說無法綜合（紅線③不臆測）。
+
+    治本 v101（止損復盤稽核發現的自評誤報）：舊版 sample_short = paper<min OR live<min，
+    因真錢 live 永遠 0/30（紅線①人工閘恆成立）→ 不論紙上累積多少都謊報『樣本供給不足』，
+    掩蓋真瓶頸（樣本其實已足、是 edge 未達統計顯著 t<2）。改成把三條獨立的軸分開歸因。
+    paper_t：紙上 EV 的名目 t 值（_paper_edge_tstat），None=未提供則退回舊式描述。"""
     if paper_n < 8:
         return (f"  本輪樣本過少（紙上 {paper_n}/{paper_min}），尚無足夠基礎做跨 session "
                 "綜合分析——誠實不臆測。")
-    sample_short = paper_n < paper_min or live_n < live_min
-    bottleneck = "樣本供給不足（非策略失效）" if sample_short else "樣本達標，待品質/顯著性驗證"
+    # 優先序：①紙上樣本真不足 ②紙上足但 edge 未顯著(t<2)＝真瓶頸 ③紙上足待真錢人工閘 ④全達標
+    if paper_n < paper_min:
+        bottleneck = "樣本供給不足（非策略失效）"
+    elif paper_t is not None and abs(paper_t) < 2.0:
+        bottleneck = (f"紙上樣本已足（{paper_n}≥{paper_min}）但 edge 未達統計顯著"
+                      f"（名目 t≈{paper_t:.2f}<2，未證實）——真瓶頸是 edge 大小、非樣本量；"
+                      "衝量無用，需把 edge 做大")
+    elif live_n < live_min:
+        bottleneck = f"紙上樣本足、待真錢人工逐筆驗證（{live_n}/{live_min}，紅線①）"
+    else:
+        bottleneck = "樣本達標，待品質/顯著性驗證"
     demo_note = ""
     attempts = demo_n + demo_rejected
     if demo_rejected and attempts > 0 and demo_rejected / attempts >= 0.5:
@@ -398,7 +443,8 @@ def _section_self_assessment() -> str:
         pass
     body = _synthesize_bottleneck(
         p.get("paper_n", 0), p.get("paper_min", 100),
-        p.get("live_n", 0), p.get("live_min", 30), demo_n, demo_rejected)
+        p.get("live_n", 0), p.get("live_min", 30), demo_n, demo_rejected,
+        paper_t=_paper_edge_tstat("paper_trades"))
     return "🧠 <b>系統自評</b>（跨 session 綜合·確定性推理非欄位回音）：\n" + body
 
 
