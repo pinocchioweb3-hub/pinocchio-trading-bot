@@ -173,6 +173,60 @@ def analyze(rows: list[dict]) -> dict:
     }
 
 
+def _find_in_snap(obj, key):
+    """遞迴在 plan_snapshot dict 找 key（可能巢狀於 context_at_entry/regime_at_entry）。"""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            r = _find_in_snap(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+def _ev_t(rs: list) -> dict:
+    """單樣本 EV + 名目 t（n<2 或 sd=0 → t=None）。"""
+    rs = [float(x) for x in rs if x is not None]
+    n = len(rs)
+    if n == 0:
+        return {"n": 0, "ev": None, "t": None}
+    m = sum(rs) / n
+    if n < 2:
+        return {"n": n, "ev": round(m, 3), "t": None}
+    sd = (sum((x - m) ** 2 for x in rs) / (n - 1)) ** 0.5
+    t = round(m / (sd / (n ** 0.5)), 2) if sd > 0 else None
+    return {"n": n, "ev": round(m, 3), "t": t}
+
+
+def trend_alignment_impact(rows: list[dict]) -> dict:
+    """#4『大盤方向濾網』假說量化：順勢(進場方向與 BTC 4h200MA 同向) vs 逆勢 的 realized_r。
+
+    回 {aligned:{n,ev,t}, counter:{n,ev,t}, gap}。gap=順勢EV−逆勢EV，>0＝順勢較優。
+    純讀既有 plan_snapshot（btc_above_200ma_4h × direction），零新請求；樣本小 t<2 一律
+    僅供觀察、不據此硬改進場（待 champion/challenger→L2）。止損復盤 n=6 之全樣本放大驗證。"""
+    aligned, counter = [], []
+    for r in rows:
+        snap = r.get("_snap")
+        rr = r.get("realized_r")
+        if not snap or rr is None:
+            continue
+        # 排除 entry_expired（限價未成交、realized_r=0，從非真實交易）——與 _count_closed/
+        #   phase0 同口徑，否則 0R 灌水稀釋兩組 EV、低估真實差距（紅線③不灌水）。
+        if (r.get("exit_reason") or "").lower() == "entry_expired":
+            continue
+        btc_up = _find_in_snap(snap, "btc_above_200ma_4h")
+        if btc_up is None:
+            continue
+        is_bull = r.get("direction") == "bull"
+        is_aligned = (is_bull and btc_up) or ((not is_bull) and (not btc_up))
+        (aligned if is_aligned else counter).append(rr)
+    a, c = _ev_t(aligned), _ev_t(counter)
+    gap = (round(a["ev"] - c["ev"], 3)
+           if (a["ev"] is not None and c["ev"] is not None) else None)
+    return {"aligned": a, "counter": c, "gap": gap}
+
+
 def render_report(res: dict) -> str:
     o = res["overall"]
     L: list[str] = []

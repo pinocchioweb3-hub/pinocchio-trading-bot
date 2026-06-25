@@ -562,6 +562,33 @@ def test_render_digest_includes_missing_context_ranking():
     assert "缺數據誤判排行" not in _pm.render_digest_md({}, {}, 0, None)
 
 
+def test_trend_alignment_impact_groups_aligned_vs_counter():
+    """#4：順勢(與 BTC 4h200MA 同向) vs 逆勢 分組正確；無快照不計。"""
+    from backtest.review_attribution import trend_alignment_impact
+    rows = [
+        {"direction": "bull", "realized_r": 1.0,
+         "_snap": {"context_at_entry": {"btc_above_200ma_4h": True}}},   # 順勢
+        {"direction": "bull", "realized_r": 0.5, "_snap": {"btc_above_200ma_4h": True}},   # 順勢
+        {"direction": "bull", "realized_r": -1.0, "_snap": {"btc_above_200ma_4h": False}},  # 逆勢
+        {"direction": "bear", "realized_r": 0.8, "_snap": {"btc_above_200ma_4h": False}},   # 順勢(空+大盤空)
+        {"direction": "bull", "realized_r": 9.9, "_snap": None},          # 無快照→不計
+    ]
+    out = trend_alignment_impact(rows)
+    assert out["aligned"]["n"] == 3 and out["counter"]["n"] == 1
+    assert out["gap"] is not None and out["gap"] > 0          # 順勢較優
+
+
+def test_render_digest_includes_trend_alignment_tracking():
+    """#4：digest 須帶『大盤方向濾網假說追蹤』，含順勢/逆勢/EV差距，且 t<2 誠實標註。"""
+    tai = {"aligned": {"n": 13, "ev": 0.70, "t": 1.74},
+           "counter": {"n": 33, "ev": -0.17, "t": -1.05}, "gap": 0.87}
+    out = _pm.render_digest_md({}, {}, 0, None, None, tai)
+    assert "大盤方向濾網" in out and "順勢" in out and "逆勢" in out
+    assert "0.87" in out and "t<2" in out
+    # 無 tai → 不渲染（向後相容）
+    assert "大盤方向濾網" not in _pm.render_digest_md({}, {}, 0, None, None)
+
+
 # ---------------------------------------------------------------------------
 # 直跑入口
 # ---------------------------------------------------------------------------

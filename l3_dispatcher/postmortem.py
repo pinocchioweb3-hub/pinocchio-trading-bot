@@ -712,8 +712,8 @@ def _fetch_btc_4h_closes(days: int = 1200) -> list[tuple[int, float]]:
 # digest 渲染（人類可讀 .md）
 # =====================================================================
 def render_digest_md(ev: dict, d1: dict, n_new: int, pa: dict | None = None,
-                     mci: dict | None = None) -> str:
-    """把分桶 EV + 計畫對比 + 缺數據誤判(item-d) + D1 渲染成 markdown。"""
+                     mci: dict | None = None, tai: dict | None = None) -> str:
+    """把分桶 EV + 計畫對比 + 缺數據誤判(item-d) + 大盤方向濾網追蹤(#4) + D1 渲染成 md。"""
     lines = [
         "# 🔬 皮諾丘交易覆盤（驗屍）摘要",
         "",
@@ -791,6 +791,26 @@ def render_digest_md(ev: dict, d1: dict, n_new: int, pa: dict | None = None,
                       "樣本小僅供觀察、未達統計顯著（紅線③）。_"]
         else:
             lines.append("（缺席/在場樣本皆未達 3 筆，暫無可比；待樣本累積自動充實）")
+
+    # 🧭 #4：大盤方向濾網假說追蹤——順勢(進場與 BTC 4h200MA 同向) vs 逆勢 的 EV。
+    #   止損復盤 n=6 之全樣本放大；複用既有 plan_snapshot、零新請求。樣本足(t≥2)才走 L2 晉升濾網。
+    if tai and ((tai.get("aligned") or {}).get("n") or (tai.get("counter") or {}).get("n")):
+        a = tai.get("aligned") or {}
+        c = tai.get("counter") or {}
+        gap = tai.get("gap")
+        lines += ["", "## 🧭 大盤方向濾網假說追蹤（順勢 vs 逆勢，#4）", "",
+                  f"- 順勢（與 BTC 4h200MA 同向）：n={a.get('n', 0)}　"
+                  f"EV={a.get('ev')}R　t={a.get('t')}",
+                  f"- 逆勢（與大盤相反）：n={c.get('n', 0)}　"
+                  f"EV={c.get('ev')}R　t={c.get('t')}"]
+        if gap is not None:
+            lines.append(f"- **EV 差距（順勢−逆勢）：{gap:+.3f}R**"
+                         + ("　← 順勢較優；待樣本足(t≥2)過 L2 即可晉升『大盤方向濾網』"
+                            if gap > 0 else ""))
+        at = a.get("t")
+        if at is None or abs(at) < 2:
+            lines.append("　_樣本未達統計顯著(t<2)，僅供觀察；不據此硬改進場，待 "
+                         "champion/challenger→L2（紅線③）。_")
 
     lines += ["", "## D1 反事實（deepdive 加 breadth 閘 + BTC 4h>200MA）", "",
               f"- 評估筆數：{d1.get('n_eval', 0)}",
@@ -914,17 +934,19 @@ def run_scan_once(notes_path: Path | None = None,
 
     # item-d（v102 治本）：缺數據誤判分析接進 daemon——過去 review_attribution.missing_context_impact
     #   只在 CLI、digest 只報覆蓋率不報「哪個漏看因子最傷 EV」。純讀、失敗不致命（不阻塞驗屍）。
-    mci = None
+    mci = tai = None
     try:
         from backtest import review_attribution as _ra
-        mci = _ra.analyze(_ra.load_closed()).get("missing_context_impact")
+        _rows = _ra.load_closed()
+        mci = _ra.analyze(_rows).get("missing_context_impact")
+        tai = _ra.trend_alignment_impact(_rows)   # #4：順勢 vs 逆勢 EV 追蹤
     except Exception as e:  # noqa: BLE001
-        print(f"[postmortem] 缺數據誤判分析略過：{type(e).__name__}: {e}")
+        print(f"[postmortem] 缺數據/大盤方向分析略過：{type(e).__name__}: {e}")
 
     # 寫 digest（覆寫；它是「最新狀態」快照）
     try:
         dp_.parent.mkdir(parents=True, exist_ok=True)
-        dp_.write_text(render_digest_md(ev, d1, n_written, pa, mci), encoding="utf-8")
+        dp_.write_text(render_digest_md(ev, d1, n_written, pa, mci, tai), encoding="utf-8")
     except Exception as e:
         print(f"[postmortem] digest write failed: {type(e).__name__}: {e}")
 
