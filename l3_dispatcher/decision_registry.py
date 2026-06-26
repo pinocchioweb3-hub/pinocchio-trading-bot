@@ -49,14 +49,30 @@ def _save(db: dict) -> None:
 
 
 def add_decision(key: str, title: str, detail: str = "",
-                 options: list[str] | None = None) -> int:
-    """新增一筆待決策（idempotent：同 key 已存在且 open → 不重複建，回原 id）。
+                 options: list[str] | None = None,
+                 seed_once: bool = False) -> int:
+    """新增一筆待決策。回 decision id。
 
-    回 decision id。"""
+    去重語意：
+      • 預設（seed_once=False）：同 key 已存在且 **open** → 不重複建，回原 id。
+        （允許「同題重提」——一旦舊卡被 resolved，可再開一張新 open 卡。）
+      • seed_once=True：同 key **曾經存在**（不論 open / resolved）→ 不再建，回最後一筆 id。
+        用於「已知種子」決策：使用者一旦拍板（**含『暫不定案，先擱置』**），
+        daemon 重啟不得復活同題反覆騷擾使用者。日後若條件成熟要重議，
+        應以明確的新 key（如 revenue_waterfall_v2）或人工重開，而非自動復活。
+    """
     db = _load()
-    for it in db["items"]:
-        if it["key"] == key and it["status"] == "open":
-            return it["id"]
+    if seed_once:
+        last_id = None
+        for it in db["items"]:
+            if it["key"] == key:
+                last_id = it["id"]  # 取最後一筆同 key（不論狀態）
+        if last_id is not None:
+            return last_id
+    else:
+        for it in db["items"]:
+            if it["key"] == key and it["status"] == "open":
+                return it["id"]
     db["seq"] += 1
     new_id = db["seq"]
     db["items"].append({
@@ -117,6 +133,12 @@ def render_open(decisions: list[dict] | None = None) -> str:
 # ===========================================================================
 def seed_known_decisions() -> None:
     """把目前已浮現、等發起人拍板的事項寫入佇列（若尚未存在）。"""
+    # seed_once=True：使用者已三度（id=1 2026-06-19、id=4 2026-06-26、id=5）就此題
+    # 表態「暫不定案，先擱置」（理由：機器人尚未成型／Phase 0 未解鎖，待成型後再議）。
+    # 舊版去重只比對 open → 每次 daemon 重啟都把已 resolved 的卡復活成新 open 卡，
+    # 致 ledger 反覆 open_decisions=1 / should_nudge=true，對「分潤比例」這種使用者
+    # 早有定論、且 Phase 0 前根本不啟動的題目反覆騷擾。改用 seed_once 治本：曾拍板過
+    # 就不復活；日後條件成熟要重議，走明確新 key 或人工重開。
     add_decision(
         key="revenue_waterfall_v1",
         title="收益分配四階段瀑布是否核准",
@@ -124,6 +146,7 @@ def seed_known_decisions() -> None:
                 "①先扣成本 ②預留池上限 6 個月成本 ③發起人代墊回補 ④才套 30/50/20；\n"
                 "且 <b>Phase 0 解鎖前完全不啟動任何分潤</b>。"),
         options=["核准此版本", "調整比例（告訴我新數字）", "暫不定案，先擱置"],
+        seed_once=True,
     )
     # v42：舊「15x→3x 一刀切」決策已被「依預算分級」框架取代 → 退場改種新版
     for it in list_open():
