@@ -239,7 +239,9 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         demo_n, _ = demo_journal.count_closed_for_phase0()
         ds = demo_journal.get_demo_stats(30)
         demo_live = ds.get("n_open", 0) + ds.get("n_pending", 0)
-        demo_rejected, demo_reject_hint = demo_journal.count_rejected()
+        # 監督員 r65：只看近 72h 的拒單當『當前卡點』，杜絕早已修好的舊拒因（not_on_okx 全為
+        #   5+ 天前、task#8 後近 72h 為 0）被當成現在的 blocker 長期誤報進 next_step（舊快照陷阱）。
+        demo_rejected, demo_reject_hint = demo_journal.count_rejected(window_sec=72 * 3600)
     except Exception:
         pass
 

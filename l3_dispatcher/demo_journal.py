@@ -357,17 +357,31 @@ def count_closed_for_phase0() -> tuple[int, float]:
         conn.close()
 
 
-def count_rejected() -> tuple[int, str | None]:
-    """供監督層誠實呈現：模擬盤『下單被拒』筆數 + 最近一筆拒因摘要。
+def count_rejected(window_sec: float | None = None,
+                   now_ms: int | None = None) -> tuple[int, str | None]:
+    """供監督層誠實呈現：模擬盤『下單被拒』筆數 + 最常見拒因摘要。
 
     這些不是成交樣本（status='rejected'，已被 count_closed_for_phase0 排除），但若實倉
     一路卡在 0 而拒單一直累積，next_step 不該謊稱「實倉樣本累積中」——要讓本人看到真正
-    卡點（多半是 OKX 帳戶模式 51010 或張數規格 51121）。回 (筆數, 最近拒因摘要|None)。"""
+    卡點（多半是 OKX 帳戶模式 51010 或張數規格 51121）。回 (筆數, 最常見拒因摘要|None)。
+
+    治本（監督員 r65 親驗活樣本）：**舊版無時間窗、聚合全歷史拒單**，使「早已修好的舊拒因」
+    （如 not_on_okx 全為 5+ 天前、task#8 預過濾後近 72h 為 0）被當成『當前卡點』長期誤報
+    進 ledger.next_step——正是本人一再告誡的「用舊快照下結論」陷阱。給 window_sec 時只計近
+    window_sec 秒內（以 entry_at 計）的拒單，反映『現在』真正卡點；window_sec=None＝全歷史
+    （向後相容：帳本稽核與既有測試用）。"""
     init_db()
     conn = _conn()
     try:
+        where = "status='rejected'"
+        params: tuple = ()
+        if window_sec is not None:
+            ref_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+            cutoff_ms = int(ref_ms - window_sec * 1000)
+            where += " AND entry_at >= ?"
+            params = (cutoff_ms,)
         n = conn.execute(
-            "SELECT COUNT(*) FROM demo_trades WHERE status='rejected'"
+            f"SELECT COUNT(*) FROM demo_trades WHERE {where}", params
         ).fetchone()
         cnt = int((n[0] if n else 0) or 0)
         if cnt == 0:
@@ -375,7 +389,7 @@ def count_rejected() -> tuple[int, str | None]:
         # 治本（監督員 r52）：**不可只取最後一筆**拒因——會被最新一筆綁架而貼錯整體標籤
         #   （10+ 輪誤診即此因）。改聚合全部 rejected、回報「最常見拒因 + 佔比」才誠實。
         rows = conn.execute(
-            "SELECT exit_reason FROM demo_trades WHERE status='rejected'"
+            f"SELECT exit_reason FROM demo_trades WHERE {where}", params
         ).fetchall()
         from collections import Counter
         hints: Counter = Counter()

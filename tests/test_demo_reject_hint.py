@@ -56,6 +56,58 @@ def test_count_rejected_zero(monkeypatch, tmp_path):
     assert dj.count_rejected() == (0, None)
 
 
+def test_count_rejected_window_excludes_old_fixed_rejects(monkeypatch, tmp_path):
+    # 治本（監督員 r65）：舊拒因（5+ 天前、已修）不該被當成『當前卡點』。給 window_sec=72h，
+    #   只應計近 72h 內的拒單；7 天前的 not_on_okx 一律排除。
+    import time as _t
+    monkeypatch.setattr(dj, "DB_PATH", str(tmp_path / "w.db"))
+    dj.init_db()
+    now_ms = int(_t.time() * 1000)
+    old_ms = now_ms - 7 * 24 * 3600 * 1000      # 7 天前（已修的 not_on_okx）
+    recent_ms = now_ms - 6 * 3600 * 1000        # 6 小時前（當前真卡點）
+    conn = dj._conn()
+    try:
+        for i in range(17):
+            conn.execute(
+                "INSERT INTO demo_trades(intent_id,symbol,direction,entry_price,stop_price,"
+                "risk_usd,status,exit_reason,entry_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (f"old{i}", "FOO", "bull", 100.0, 90.0, 100.0, "rejected",
+                 "reject:not_on_okx", old_ms, old_ms))
+        conn.execute(
+            "INSERT INTO demo_trades(intent_id,symbol,direction,entry_price,stop_price,"
+            "risk_usd,status,exit_reason,entry_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("new1", "ENA", "bull", 100.0, 90.0, 100.0, "rejected",
+             'reject:entry failed: okx {"sCode":"51010","sMsg":"account mode"}', recent_ms, recent_ms))
+    finally:
+        conn.close()
+    # 全歷史（向後相容）→ 18 筆、not_on_okx 主導
+    cnt_all, hint_all = dj.count_rejected()
+    assert cnt_all == 18 and "not_on_okx" in hint_all
+    # 近 72h 窗 → 只剩 1 筆 51010（舊的 not_on_okx 全被排除，不再誤報為當前卡點）
+    cnt_w, hint_w = dj.count_rejected(window_sec=72 * 3600)
+    assert cnt_w == 1, f"近 72h 應只計近期拒單，實得 {cnt_w}"
+    assert "not_on_okx" not in (hint_w or ""), f"舊拒因不該出現在當前卡點，實得 {hint_w!r}"
+
+
+def test_count_rejected_window_all_old_returns_zero(monkeypatch, tmp_path):
+    # 全部拒單都在窗外（皆已修）→ 近期窗應回 (0, None)，next_step 才不會謊報當前有拒單卡點。
+    import time as _t
+    monkeypatch.setattr(dj, "DB_PATH", str(tmp_path / "w2.db"))
+    dj.init_db()
+    old_ms = int(_t.time() * 1000) - 7 * 24 * 3600 * 1000
+    conn = dj._conn()
+    try:
+        for i in range(5):
+            conn.execute(
+                "INSERT INTO demo_trades(intent_id,symbol,direction,entry_price,stop_price,"
+                "risk_usd,status,exit_reason,entry_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (f"o{i}", "FOO", "bull", 100.0, 90.0, 100.0, "rejected",
+                 "reject:not_on_okx", old_ms, old_ms))
+    finally:
+        conn.close()
+    assert dj.count_rejected(window_sec=72 * 3600) == (0, None)
+
+
 def test_not_on_okx_is_whitelabelled_as_system_side():
     # 治本（監督員 r53）：not_on_okx 是系統端預檢拒因，須白話化為「非帳戶設定」，
     # 不可讓本人看到生 token、更不可被誤導去調 OKX 帳戶。
