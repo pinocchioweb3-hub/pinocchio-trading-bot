@@ -31,6 +31,7 @@ class SupervisorState:
     last_scan_summary: dict | None = None
     last_dispatch_ts: float | None = None
     consecutive_dispatch_failures: int = 0
+    source_fail_streak: int = 0   # v108：連續 source 不健康次數（區分暫時限流 vs 持續故障）
     last_alert_per_kind: dict[str, float] = field(default_factory=dict)
     cooldown_seconds: int = 1800  # 30 分內同類警報節流
 
@@ -59,16 +60,41 @@ async def run_health_checks(state: SupervisorState, source) -> list[HealthCheck]
     now = time.time()
 
     # === 1. Source 活著嗎 ===
+    # 口徑治本(v108)：區分『限流(429,暫時性+免費源fallback+下輪自癒)』vs『真失聯』。
+    #   限流是冷啟動爆量逐檔打 CoinGlass 的已知降級(task#64/#68)——單次blip不該推[嚴重]嚇人。
+    #   暫時限流→info(只記log不推)；持續限流(≥3連續≈15分)→warn[警告]；真連不上(非429)→alert[嚴重]。
     try:
         health = await source.health()
-        if not health.get("ok"):
-            results.append(HealthCheck(
-                kind="source_down",
-                severity="alert",
-                message=f"資料來源 {source.name} 無回應",
-                detail=health,
-            ))
+        if health.get("ok"):
+            state.source_fail_streak = 0
+        else:
+            state.source_fail_streak += 1
+            _d = f"{health.get('details', '')} {health.get('code', '')}".lower()
+            _rate_limited = ("too many requests" in _d or "429" in _d
+                             or ("rate" in _d and "limit" in _d))
+            if _rate_limited:
+                _persistent = state.source_fail_streak >= 3
+                print(f"[supervisor] {source.name} 限流(429) streak="
+                      f"{state.source_fail_streak}（暫時性、免費源接手中）"
+                      + ("→持續，升 warn" if _persistent else "→info 不推"))
+                results.append(HealthCheck(
+                    kind="source_rate_limited",
+                    severity="warn" if _persistent else "info",
+                    message=(f"資料來源 {source.name} 持續限流(429) {state.source_fail_streak} "
+                             "次——免費源接手中，建議降低呼叫頻率(task#68)"
+                             if _persistent else
+                             f"資料來源 {source.name} 暫時限流(429)——免費源接手、下輪自癒（暫時性、無需處理）"),
+                    detail=health,
+                ))
+            else:
+                results.append(HealthCheck(
+                    kind="source_down",
+                    severity="alert",
+                    message=f"資料來源 {source.name} 無回應",
+                    detail=health,
+                ))
     except Exception as e:
+        state.source_fail_streak += 1
         results.append(HealthCheck(
             kind="source_exception",
             severity="alert",
