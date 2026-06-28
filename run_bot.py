@@ -295,6 +295,9 @@ async def amain(args: argparse.Namespace) -> int:
     #      cvd_shadow.jsonl。影子鐵則：只記錄、永不回寫 factors_live/strength/fire/signals、
     #      不發 TG。忠實度閘已 🟢（v61）；晉升「真填 stub」須另過 EV 閘（後續 increment）。
     from l3_dispatcher.cvd_shadow import run_cvd_shadow_loop as _run_cvd_shadow
+    # v107: 「熊底→牛頂」週期/部位層 shadow Session（每日一輪 → cycle_shadow.jsonl + 🌊週期主題；
+    #       純觀測 display-only，永不 import strength/fire/symbol_gate/下單；與 4h 引擎完全隔離）
+    from l3_dispatcher.cycle_session import run_cycle_loop as _run_cycle
     # v69: #66(Q2) 消息面 Phase 0 影子捕捉 — 每小時把當下新聞原子事實(NewsAtom)+既有
     #      narrative_alignment 量化傾向(免費探針)並排記到 news_factor.jsonl。影子鐵則：
     #      只記錄、永不寫 strength/check score/fire/symbol_gate/snapshot 決策欄、永不給
@@ -405,6 +408,8 @@ async def amain(args: argparse.Namespace) -> int:
             interval_s=args.demo_operator_interval, tg=tg_sys)),
         # v55: 監督員 Layer 1（純讀守望 → oversight_ledger.json + 停滯時私人提醒）。
         ("ceo_oversight", lambda: _run_oversight(tg_sys, args.oversight_interval)),
+        # v107: 週期/部位層 shadow Session（每日一輪 → 🌊週期主題；純觀測非進場訊號）
+        ("cycle_session", lambda: _run_cycle(router.client("cycle"))),
     ]
     try:
         await asyncio.gather(*[

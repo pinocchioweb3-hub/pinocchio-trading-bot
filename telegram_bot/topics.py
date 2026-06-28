@@ -35,6 +35,8 @@ TOPIC_DEFS = [
     ("news",      "📰 新聞快訊"),     # Trump·X 推文 / 美股新聞 / 美股行情總覽
     ("system",    "🛠 系統狀態"),     # 開關機 / worker 警報 / supervisor / 版本通知 / 帳本錨定報告
     ("ideas",     "💡 意見箱"),       # 社群建議 + 貢獻積分（開源共建互動入口）
+    ("cycle",     "🌊 週期·熊底→牛頂"),  # 週期/部位層 shadow：每日深度價值帶觀察（純定位非進場；
+    #                                     未 provision thread_id 前 router.client 優雅落 General/主聊）
 ]
 
 # v36 已退役（migrate 後關閉封存）的舊 key → 內容去向：
