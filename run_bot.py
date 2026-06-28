@@ -427,6 +427,25 @@ async def amain(args: argparse.Namespace) -> int:
     return 0
 
 
+def _acquire_single_instance_lock(port: int = 47654):
+    """單實例鎖（v109 治本）：綁定 127.0.0.1:port。綁得上＝本實例是唯一 daemon；
+    綁不上（WSAEADDRINUSE）＝已有 daemon 在跑 → 回 None，呼叫端應立即退出。
+
+    根治『重開機/重啟時 watchdog 與 start_bot.ps1 競態各起一個 → 兩個 daemon 同時下單/
+    搶 DB』：start_bot.ps1 的 kill→start 視窗裡若有第二個啟動源，第二個會綁不上而自退。
+    回傳的 socket 必須由呼叫端持有到行程結束（保持佔用）；行程死亡時 OS 自動釋放。
+    Windows 預設獨佔綁定（不設 SO_REUSEADDR），故第二個 bind 必失敗——正是所需。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
+        return s
+    except OSError:
+        s.close()
+        return None
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--backend", default="coinglass",
@@ -465,6 +484,11 @@ def main() -> int:
                    help="v55: 監督員 Layer 1 盤點間隔秒（預設 1800=30min）")
     p.add_argument("--once", action="store_true")
     p.add_argument("--no-startup-msg", action="store_true")
+    _lock = _acquire_single_instance_lock()   # v109：須在 asyncio.run 期間持續持有
+    if _lock is None:
+        print("[startup] 偵測到已有 run_bot daemon 在執行（單實例鎖 127.0.0.1:47654）——"
+              "本實例立即退出，避免雙 daemon 雙重下單／DB 競態。")
+        return 0
     return asyncio.run(amain(p.parse_args()))
 
 
