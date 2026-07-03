@@ -298,6 +298,9 @@ async def amain(args: argparse.Namespace) -> int:
     # v107: 「熊底→牛頂」週期/部位層 shadow Session（每日一輪 → cycle_shadow.jsonl + 🌊週期主題；
     #       純觀測 display-only，永不 import strength/fire/symbol_gate/下單；與 4h 引擎完全隔離）
     from l3_dispatcher.cycle_session import run_cycle_loop as _run_cycle
+    # v112: OKX Signal Bot 模擬盤(pap)訊號橋——Phase B 水管 demo 半。程式層硬擋只認 pap 端點
+    #       （實盤 host 不在碼中）；未設 SIGNALBOT_PAP_URL/TOKEN 時完全閒置。
+    from l4_execution.signal_bridge import run_signal_bridge_loop as _run_sigbridge
     # v69: #66(Q2) 消息面 Phase 0 影子捕捉 — 每小時把當下新聞原子事實(NewsAtom)+既有
     #      narrative_alignment 量化傾向(免費探針)並排記到 news_factor.jsonl。影子鐵則：
     #      只記錄、永不寫 strength/check score/fire/symbol_gate/snapshot 決策欄、永不給
@@ -410,6 +413,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("ceo_oversight", lambda: _run_oversight(tg_sys, args.oversight_interval)),
         # v107: 週期/部位層 shadow Session（每日一輪 → 🌊週期主題；純觀測非進場訊號）
         ("cycle_session", lambda: _run_cycle(router.client("cycle"))),
+        # v112: pap 訊號橋（未設 env=閒置；只認 OKX 模擬盤端點，紅線①硬擋）
+        ("signal_bridge", lambda: _run_sigbridge(tg_sys)),
     ]
     try:
         await asyncio.gather(*[
