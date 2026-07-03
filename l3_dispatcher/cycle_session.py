@@ -21,13 +21,35 @@ from typing import Optional
 from botpaths import db_path, data_dir
 from l3_dispatcher.cycle_regime import classify_cycle_phase, render_cycle_line, DISCLAIMER
 
-# 目標宇宙：使用者點名的主流/RWA/DeFi/AI + BTC 基準（缺資料者自動略過）。
+# 點名保底宇宙：使用者指定的主流/RWA/DeFi/AI + BTC 基準（缺資料者自動略過）。
 CYCLE_UNIVERSE = [
     "BTC", "ETH", "SOL", "BNB", "XRP",            # 主流/交易所
     "AAVE", "AVAX", "ONDO", "WLFI",               # DeFi / RWA
     "SUI", "APT", "XLM", "HYPE", "ASTER", "OKB",  # L1/DEX/交易所
     "TAO", "RENDER", "FET",                        # AI
 ]
+
+
+def discover_universe(min_days: int = 200) -> list[str]:
+    """v110（使用者回饋「不要只有點名那幾檔」）：自動探索快取裡所有有 ≥min_days 天
+    日線的標的，與點名清單聯集。純讀快取、零網路；壞庫→退回點名清單。"""
+    syms = set(CYCLE_UNIVERSE)
+    try:
+        conn = sqlite3.connect(f"file:{db_path('ohlc_cache.db')}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT symbol, COUNT(*) FROM ohlc WHERE tf='1d' "
+                "GROUP BY symbol HAVING COUNT(*) >= ?", (min_days,)
+            ).fetchall()
+        finally:
+            conn.close()
+        for s, _n in rows:
+            base = (s or "").split("/")[0].split("-")[0].strip().upper()
+            if base and base.isalnum() and not base.startswith("USD"):
+                syms.add(base)
+    except Exception:  # noqa: BLE001 — 探索失敗不致命，用點名保底
+        pass
+    return sorted(syms)
 SHADOW_LOG = data_dir() / "cycle_shadow.jsonl"
 _MIN_DAYS = 200   # 至少 200 天才算（200日均線/Mayer 需要）
 
@@ -88,8 +110,10 @@ def build_cycle_card(reads: list[dict]) -> str:
     rest = [r for r in reads if r["value_zone"] != "deep_value"]
     if rest:
         lines.append("⚪ 其餘")
-        for r in rest:
+        for r in rest[:12]:   # v110：宇宙自動探索後防爆長——其餘段最多 12 檔
             lines.append("　" + render_cycle_line(r["symbol"], r).replace("\n", " "))
+        if len(rest) > 12:
+            lines.append(f"　…另 {len(rest) - 12} 檔（完整見 cycle_shadow.jsonl）")
         lines.append("")
     lines.append(f"⚠️ <i>{DISCLAIMER}</i>")
     return "\n".join(lines)
@@ -113,7 +137,7 @@ def _append_shadow(reads: list[dict]) -> None:
 def run_cycle_once() -> tuple[list[dict], str]:
     """跑一輪：算全宇宙讀數 + 組卡（純函式式，便於離線測試/CLI）。"""
     reads = []
-    for sym in CYCLE_UNIVERSE:
+    for sym in discover_universe():
         try:
             r = compute_cycle_read(sym)
             if r:
