@@ -275,3 +275,41 @@ def test_macro_provenance_non_numeric_present_mass(tmp_path, monkeypatch):
     assert p["present_mass"] is None
     assert p["n_present"] is None
     assert p["floor_bound"] is None
+
+
+# ------------------------------------------------- v114 週/月線層落快照（Fable5 稽核）
+def test_extra_context_nesting_htf_cycle(monkeypatch, tmp_path):
+    """tf_nesting/M2 verdict/cycle zone 全填（死端→快照）；缺料省略鍵。"""
+    import json as _json
+    monkeypatch.setattr(macro, "_read_macro_confluence_score", lambda: None)
+    # cycle_shadow.jsonl 假資料（最新一筆含 SOL 讀數）
+    shadow = tmp_path / "cycle_shadow.jsonl"
+    shadow.write_text(_json.dumps({"reads": [
+        {"symbol": "SOL", "value_zone": "deep_value"}]}) + "\n", encoding="utf-8")
+    import botpaths as _bp
+    monkeypatch.setattr(_bp, "data_dir", lambda: tmp_path)
+    sym_state = {
+        "tf_nesting": {
+            "stage_code": "DOWN_BOUNCE", "alignment_score": 0.62,
+            "divergence_tf": "1w",
+            "layers": [{"tf": "1M", "direction": "down"},
+                       {"tf": "1d", "direction": "up"}],
+        },
+        "htf_alignment": {"verdict": "conflict"},
+    }
+    out = macro._deepdive_extra_context("SOL", sym_state)
+    assert out["nest_stage_code"] == "DOWN_BOUNCE"
+    assert out["nest_alignment_pct"] == 62.0
+    assert out["nest_divergence_tf"] == "1w"
+    assert out["nest_1d_dir"] == "up"
+    assert out["htf_verdict_1d4h"] == "conflict"
+    assert out["cycle_value_zone"] == "deep_value"
+
+
+def test_extra_context_nesting_missing_honest(monkeypatch):
+    """全缺料 → 新鍵全部省略（骨架 None，紅線③不臆測）。"""
+    monkeypatch.setattr(macro, "_read_macro_confluence_score", lambda: None)
+    out = macro._deepdive_extra_context("BTC", {})
+    for k in ("nest_stage_code", "nest_alignment_pct", "nest_divergence_tf",
+              "nest_1d_dir", "htf_verdict_1d4h"):
+        assert k not in out

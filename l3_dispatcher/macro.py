@@ -713,9 +713,49 @@ def _deepdive_extra_context(sym: str, sym_state: dict | None) -> dict:
         _mcs = _read_macro_confluence_score()
         if _mcs is not None:
             out["macro_confluence_score"] = _mcs
+        # v114（Fable5 稽核）：週/月線層落快照——tf_nesting/M2 verdict 早已算好卻從未持久化
+        #   （死端）；純資料重用零新請求，缺料→省略鍵＝骨架 None（紅線③誠實留空）。
+        _nest = (sym_state or {}).get("tf_nesting") or {}
+        if _nest.get("stage_code"):
+            out["nest_stage_code"] = _nest["stage_code"]
+        if _nest.get("alignment_score") is not None:
+            out["nest_alignment_pct"] = round(float(_nest["alignment_score"]) * 100, 1)
+        if _nest.get("divergence_tf") is not None:
+            out["nest_divergence_tf"] = _nest["divergence_tf"]
+        for _ly in _nest.get("layers") or []:
+            if _ly.get("tf") == "1d" and _ly.get("direction"):
+                out["nest_1d_dir"] = _ly["direction"]
+                break
+        _htf = (sym_state or {}).get("htf_alignment") or {}
+        if _htf.get("verdict") and _htf["verdict"] != "unknown":
+            out["htf_verdict_1d4h"] = _htf["verdict"]
+        _cz = _read_cycle_value_zone(sym)
+        if _cz is not None:
+            out["cycle_value_zone"] = _cz
     except Exception:
         return {}
     return out
+
+
+def _read_cycle_value_zone(sym: str) -> str | None:
+    """讀 cycle_shadow.jsonl 最新一筆個股讀數，取該幣的週期價值區（v114）。
+    倒讀最多 30 行找最近的 reads 紀錄；缺檔/缺幣→None（誠實留空）。"""
+    try:
+        import json
+        from botpaths import data_dir
+        p = data_dir() / "cycle_shadow.jsonl"
+        lines = p.read_text(encoding="utf-8").strip().splitlines()
+        for line in reversed(lines[-30:]):
+            try:
+                rec = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            for r in rec.get("reads") or []:
+                if r.get("symbol") == sym and r.get("value_zone"):
+                    return r["value_zone"]
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def _record_deepdive_plan(sym: str, plan: dict | None,

@@ -149,3 +149,50 @@ def test_level_of():
     assert (epo._LEVEL_RANK[epo._LEVEL_GLOBAL]
             < epo._LEVEL_RANK[epo._LEVEL_QUAD]
             < epo._LEVEL_RANK[epo._LEVEL_SYMBOL])
+
+
+# ------------------------------------------------- v114 稽核 rank1/rank3 治本
+def test_plan_prices_uses_shallowest_split_price():
+    """rank1：champion 重放限價須取『實際首格』——bull=最高格、bear=最低格；
+    缺 splits 退回 planned_entry（中點）。這是解開已過 L2 晉升被 self-check 卡死的關鍵。"""
+    import json as _json
+    from l3_dispatcher.entry_policy_optimizer import _plan_prices
+    row = {"direction": "bull", "entry_price": 1612.0, "stop_price": 1580.0, "tp1": 1700.0,
+           "plan_snapshot": _json.dumps({"planned_entry": 1612.0, "planned_stop": 1580.0,
+                                         "planned_tp": {"tp1": 1700.0}}),
+           "entry_splits": _json.dumps([{"price": 1608.0, "frac": 0.6},
+                                        {"price": 1616.0, "frac": 0.4}])}
+    d, limit_px, stop_px, tp_px = _plan_prices(row)
+    assert limit_px == 1616.0            # bull 首格=最高格（價下跌先觸），非中點 1612
+    row_bear = dict(row, direction="bear",
+                    plan_snapshot=_json.dumps({"planned_entry": 1612.0,
+                                               "planned_stop": 1650.0,
+                                               "planned_tp": {"tp1": 1500.0}}))
+    d2, limit2, *_ = _plan_prices(row_bear)
+    assert limit2 == 1608.0              # bear 首格=最低格（價上漲先觸）
+    row_nosplit = dict(row, entry_splits=None)
+    _, limit3, *_ = _plan_prices(row_nosplit)
+    assert limit3 == 1612.0              # 無 splits → 退回 planned_entry
+
+
+def test_loader_filters_to_deepdive_only(tmp_path):
+    """rank3：loader 只收加密 deepdive，美股 us_breakout 不得混入池化桶（統計純淨）。"""
+    import sqlite3
+    import time as _t
+    from l3_dispatcher.entry_policy_optimizer import _load_paper_for_entry
+    db = tmp_path / "tj.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, symbol TEXT, "
+                 "setup TEXT, direction TEXT, entry_price REAL, stop_price REAL, tp1 REAL, "
+                 "entry_at INTEGER, exit_reason TEXT, status TEXT, plan_snapshot TEXT, "
+                 "entry_splits TEXT)")
+    now = int(_t.time() * 1000)
+    conn.execute("INSERT INTO paper_trades (symbol,setup,direction,entry_price,stop_price,"
+                 "tp1,entry_at,exit_reason,status) VALUES "
+                 "('BTC','deepdive','bull',100,95,110,?,'tp3','closed')", (now,))
+    conn.execute("INSERT INTO paper_trades (symbol,setup,direction,entry_price,stop_price,"
+                 "tp1,entry_at,exit_reason,status) VALUES "
+                 "('SOXL','us_breakout','bull',30,28,35,?,'tp3','closed')", (now,))
+    conn.commit(); conn.close()
+    rows = _load_paper_for_entry(days=7, db=str(db))
+    assert len(rows) == 1 and rows[0]["symbol"] == "BTC"   # 美股被濾掉

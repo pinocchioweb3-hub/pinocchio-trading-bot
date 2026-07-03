@@ -38,8 +38,17 @@ _CONTEXT_KEYS: tuple[str, ...] = (
     "btc_above_200ma_4h",    # BTC 是否站上 4h 200MA（大盤濾網）
     "whale_net",             # 巨鯨淨流向
     "wyckoff_phase",         # 威科夫階段
-    "htf_aligned",           # 高時框是否同向
+    "htf_aligned",           # ⚠️命名注意：實為 per-symbol 自身 4h200MA 對齊（非 1d→4h M2）
     "macro_confluence_score",  # 宏觀共振分數
+    # v114（Fable5 稽核 do_now#1/#3/#4）：週/月線層第一次落快照——tf_nesting/M2 verdict/
+    #   cycle 過去全是「算了沒人記」的死端；先記錄不改行為（不為湊樣本改策略），供優化器
+    #   regime-conditioned 分桶與日後 champion/challenger 閘使用。缺料→None 誠實留空。
+    "nest_stage_code",       # tf_nesting 七階段代碼（含月/週線層，如 DOWN_BOUNCE＝空頭反彈）
+    "nest_alignment_pct",    # tf_nesting 各層對齊分數 0-100（大層權重高）
+    "nest_divergence_tf",    # 第一個與主導趨勢翻向的時框（None=全對齊）
+    "nest_1d_dir",           # 1d 層方向（與 btc_above_200ma_4h 組成 Breaking-Bad 4 態影子標籤）
+    "htf_verdict_1d4h",      # M2 真 1d→4h 對齊裁決（aligned/partial/conflict；解 htf_aligned 命名碰撞）
+    "cycle_value_zone",      # 進場當下該幣的週期價值區（deep_value/value/neutral/elevated/euphoria）
 )
 
 # regime（行情狀態）向量骨架；step4 會把這些填實，現在先佔位。

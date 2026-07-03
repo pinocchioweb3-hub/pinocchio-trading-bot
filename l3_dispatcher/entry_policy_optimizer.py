@@ -67,22 +67,24 @@ _ALL_POLICIES = (CHAMPION, CHALLENGER_CONVERT, CHALLENGER_MARKET)
 # ════════════════════════════════════════════════════════════════════════
 #  載入（含 entry_expired；自含查詢）
 # ════════════════════════════════════════════════════════════════════════
-_COLS = ["id", "symbol", "direction", "entry_price", "stop_price", "tp1",
-         "entry_at", "exit_reason", "plan_snapshot"]
+_COLS = ["id", "symbol", "setup", "direction", "entry_price", "stop_price", "tp1",
+         "entry_at", "exit_reason", "plan_snapshot", "entry_splits"]
 
 
 def _load_paper_for_entry(days: int = 120, db=None) -> list[dict]:
     """載入近 days 天『所有已平倉（含 entry_expired 逾時未成交）』紙上單。
 
     與 auto_optimizer 相反：**納入** entry_expired（那是 champion 沒成交、D 要救的樣本）。
-    """
+    v114(稽核rank3)：只收加密 deepdive——池化桶過去混入美股 us_breakout（1h 突破、
+    成交機制不同）＝跨引擎統計污染；晉升決策必須建立在引擎純淨樣本上。"""
     cutoff = int(time.time() * 1000) - days * 86400 * 1000
     conn = sqlite3.connect(str(db or DB_PATH))
     conn.execute("PRAGMA busy_timeout=5000")
     try:
         rows = conn.execute(
             f"SELECT {', '.join(_COLS)} FROM paper_trades "
-            "WHERE status='closed' AND entry_at>=? ORDER BY symbol, entry_at",
+            "WHERE status='closed' AND setup='deepdive' AND entry_at>=? "
+            "ORDER BY symbol, entry_at",
             (cutoff,)).fetchall()
     finally:
         conn.close()
@@ -107,6 +109,18 @@ def _plan_prices(row: dict) -> tuple[str, float, float, float] | None:
         snap = {}
     direction = (snap.get("direction") or row.get("direction") or "").strip()
     limit_px = snap.get("planned_entry", row.get("entry_price"))
+    # v114(稽核rank1治本)：champion 重放的限價必須忠實於「實際首格」——紙上掛的是
+    #   分段限價(entry_splits)，先成交的是最淺格(bull=最高格、bear=最低格)；舊碼用
+    #   中點 planned_entry 重放＝比首格更深 → 現實已成交的單被重放判「未成交」→
+    #   self-check 永久打假 → 已過 L2 四關的晉升被卡死。有 splits 用首格，缺→退回中點。
+    try:
+        _splits = json.loads(row.get("entry_splits") or "")
+        _sp = [float(s["price"]) for s in _splits
+               if isinstance(s, dict) and s.get("price") is not None]
+    except Exception:
+        _sp = []
+    if _sp:
+        limit_px = max(_sp) if direction in ("bull", "long") else min(_sp)
     stop_px = snap.get("planned_stop", row.get("stop_price"))
     tp_px = ((snap.get("planned_tp") or {}).get("tp1")
              if isinstance(snap.get("planned_tp"), dict) else None)

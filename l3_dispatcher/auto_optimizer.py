@@ -54,8 +54,11 @@ def _load_closed_paper(days: int = 120, db=None) -> list[dict]:
     cutoff = int(time.time() * 1000) - days * 86400 * 1000
     conn = sqlite3.connect(str(db or DB_PATH))
     conn.execute("PRAGMA busy_timeout=5000")
-    where = ("WHERE status='closed' AND IFNULL(exit_reason,'')!='entry_expired' "
-             "AND entry_at>=?")
+    # v114(稽核rank3治本)：只收加密 deepdive——池化桶(POOL,q)/(POOL,POOL)過去混入美股
+    #   us_breakout 樣本＝拿另一個引擎的成交行為替加密參數背書（統計污染）。TP 政策的
+    #   消費端是加密路徑；美股引擎日後要優化須另立自己的池，不與加密共池。
+    where = ("WHERE status='closed' AND setup='deepdive' "
+             "AND IFNULL(exit_reason,'')!='entry_expired' AND entry_at>=?")
     try:
         cols = _COLS
         try:
