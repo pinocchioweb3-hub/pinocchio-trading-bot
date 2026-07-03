@@ -134,8 +134,54 @@ def _append_shadow(reads: list[dict]) -> None:
         print(f"[cycle] shadow log 寫入失敗：{type(e).__name__}: {e}")
 
 
+def _dominance_history() -> list[tuple[int, float]]:
+    """從 cycle_shadow.jsonl 讀每日累積的 dominance 點（bottom_dashboard 紀錄）。"""
+    out: list[tuple[int, float]] = []
+    try:
+        with open(SHADOW_LOG, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if rec.get("record_type") == "bottom_dashboard" and rec.get("dominance") is not None:
+                    out.append((rec.get("ts", 0), float(rec["dominance"])))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _build_bottom_dashboard(reads: list[dict]) -> tuple[str, Optional[dict]]:
+    """v111：熊底合流儀表板（BTC 層級、每日一組）。回 (卡頂區塊, shadow紀錄)。
+    任一步失敗→('', None) 不影響原卡（影子鐵則：display-only、失敗不致命）。"""
+    try:
+        from l3_dispatcher import bottom_feeds as bf
+        from l3_dispatcher.bottom_confluence import compute_bottom_score, render_dashboard_block
+        btc = next((r for r in reads if r.get("symbol") == "BTC"), None)
+        if not btc:
+            return "", None
+        inputs, background, overlay = bf.collect_bottom_inputs(
+            price_now=btc.get("price"), mayer=btc.get("mayer"),
+            dist_200wma_pct=btc.get("dist_200wma_pct"),
+            dominance_history=_dominance_history())
+        res = compute_bottom_score(inputs)
+        block = render_dashboard_block(res, background, overlay)
+        rec = {"record_type": "bottom_dashboard", "ts": int(time.time() * 1000),
+               "score": res.get("score"), "band": res.get("band"),
+               "present_mass_pct": res.get("present_mass_pct"),
+               "factor_states": res.get("factor_states"),
+               "inputs": {k: inputs.get(k) for k in
+                          ("mvrv_z", "price", "realized_price", "mayer",
+                           "dist_200wma_pct", "fng_avg30")},
+               "dominance": bf.fetch_dominance_today()}
+        return block, rec
+    except Exception as e:  # noqa: BLE001
+        print(f"[cycle] 熊底儀表板略過（不致命）：{type(e).__name__}: {e}")
+        return "", None
+
+
 def run_cycle_once() -> tuple[list[dict], str]:
-    """跑一輪：算全宇宙讀數 + 組卡（純函式式，便於離線測試/CLI）。"""
+    """跑一輪：算全宇宙讀數 + 熊底儀表板 + 組卡（純函式式，便於離線測試/CLI）。"""
     reads = []
     for sym in discover_universe():
         try:
@@ -145,6 +191,16 @@ def run_cycle_once() -> tuple[list[dict], str]:
         except Exception:  # noqa: BLE001
             continue
     card = build_cycle_card(reads) if reads else ""
+    dash, dash_rec = _build_bottom_dashboard(reads)
+    if dash and card:
+        card = dash + "\n━━━━━━━━━━━━━━\n" + card
+    if dash_rec:
+        try:
+            SHADOW_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(SHADOW_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(dash_rec, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
     return reads, card
 
 
@@ -155,7 +211,8 @@ async def run_cycle_loop(tg=None, interval_seconds: int = 86400):
     await asyncio.sleep(120)   # 啟動延後，讓快取/掃描先暖機
     while True:
         try:
-            reads, card = run_cycle_once()
+            # v111：run_cycle_once 內含外網抓取(CM CSV 可達數十秒)——丟 thread 避免阻塞事件迴圈
+            reads, card = await asyncio.to_thread(run_cycle_once)
             _append_shadow(reads)
             if reads:
                 print(f"[cycle] 週期觀察 {len(reads)} 標的；深度價值帶："
