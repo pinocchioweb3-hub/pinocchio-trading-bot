@@ -578,6 +578,19 @@ def test_trend_alignment_impact_groups_aligned_vs_counter():
     assert out["gap"] is not None and out["gap"] > 0          # 順勢較優
 
 
+def test_render_digest_includes_drift_gauge():
+    """v113：執行落差量表——配對數/兩側EV/落差/收斂判準須上 digest；無配對誠實顯示。"""
+    drift = {"n_pairs": 12, "paper_ev": 0.15, "demo_ev": -0.10,
+             "mean_delta": -0.25, "fill_rate_pct": 60.0}
+    out = _pm.render_digest_md({}, {}, 0, None, None, None, drift)
+    assert "執行落差" in out and "12 對" in out and "-0.250" in out
+    assert "收斂判準" in out
+    empty = _pm.render_digest_md({}, {}, 0, None, None, None, {"n_pairs": 0})
+    assert "尚無可配對樣本" in empty
+    # 不給 drift → 不渲染該段（向後相容）
+    assert "執行落差" not in _pm.render_digest_md({}, {}, 0)
+
+
 def test_render_digest_includes_trend_alignment_tracking():
     """#4：digest 須帶『大盤方向濾網假說追蹤』，含順勢/逆勢/EV差距，且 t<2 誠實標註。"""
     tai = {"aligned": {"n": 13, "ev": 0.70, "t": 1.74},

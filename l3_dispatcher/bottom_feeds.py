@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import time
 from typing import Optional
 
@@ -216,6 +217,46 @@ def fetch_stablecoin_momentum_30d() -> Optional[str]:
         return None
 
 
+def fetch_etf_overlay() -> Optional[str]:
+    """v113（使用者指定）：多資產加密 ETF 淨流（BTC/ETH/XRP/SOL，$79 權益 2026-07-03 活線
+    實證可用；SUI 尚無端點=誠實缺料）。機構/銀行/家辦動向的溫度計。
+
+    ⚠️ 對抗審查裁定不變：ETF 2024 年才誕生、零個熊底歷史（n=0）——**只進 overlay 顯示、
+    永不計入核心分數**（不能假裝有歷史校準）。每日一抓快取，與 coinglass.py 同 auth。"""
+    cached = _cached("etf_multi")
+    if cached is not None:
+        return cached
+    key = os.getenv("COINGLASS_API_KEY", "").strip()
+    if not key:
+        return None
+    parts: list[str] = []
+    try:
+        with httpx.Client(base_url="https://open-api-v4.coinglass.com", timeout=30,
+                          headers={"CG-API-KEY": key, "accept": "application/json"}) as cli:
+            for coin, tag in (("bitcoin", "BTC"), ("ethereum", "ETH"),
+                              ("xrp", "XRP"), ("solana", "SOL")):
+                try:
+                    r = cli.get(f"/api/etf/{coin}/flow-history")
+                    data = (r.json() or {}).get("data") or []
+                    if len(data) < 2:
+                        continue
+                    def _flow(x):
+                        v = x.get("flow_usd")
+                        return float(v) if v is not None else 0.0
+                    d5 = sum(_flow(x) for x in data[-5:]) / 1e6
+                    d30 = sum(_flow(x) for x in data[-30:]) / 1e6
+                    parts.append(f"{tag} 5日{d5:+,.0f}M/30日{d30:+,.0f}M")
+                except Exception:  # noqa: BLE001 — 單一資產失敗不拖累其他
+                    continue
+    except Exception:  # noqa: BLE001
+        return None
+    if not parts:
+        return None
+    s = "ETF淨流(機構動向,n=0無熊底校準僅參考)：" + " ｜ ".join(parts)
+    _put("etf_multi", s)
+    return s
+
+
 def collect_bottom_inputs(price_now: Optional[float], mayer: Optional[float],
                           dist_200wma_pct: Optional[float],
                           dominance_history: Optional[list] = None) -> tuple[dict, dict, dict]:
@@ -233,6 +274,9 @@ def collect_bottom_inputs(price_now: Optional[float], mayer: Optional[float],
     }
     background = fetch_macro_background()
     overlay = {}
+    etf = fetch_etf_overlay()
+    if etf:
+        overlay["🏦"] = etf
     sc = fetch_stablecoin_momentum_30d()
     if sc:
         overlay["🪙"] = sc

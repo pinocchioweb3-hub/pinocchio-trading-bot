@@ -711,9 +711,50 @@ def _fetch_btc_4h_closes(days: int = 1200) -> list[tuple[int, float]]:
 # =====================================================================
 # digest 渲染（人類可讀 .md）
 # =====================================================================
+def paper_demo_drift() -> dict | None:
+    """v113（使用者監管職能）：紙上 vs 模擬盤「同單配對」執行落差——真錢閘的收斂量表。
+
+    demo_trades.paper_id → paper_trades.id 配對（皆已平倉、排除 entry_expired），算：
+    n_pairs / paper_ev / demo_ev / mean_delta(demo−paper) / demo 端成交率。
+    收斂判準（真錢兩閘之一）：mean_delta→0 且 demo_ev>0（真錢行為像 demo 不像紙上）。
+    唯讀、例外安全→None。"""
+    try:
+        conn = _ro_conn(JOURNAL_DB)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        pairs = conn.execute(
+            "SELECT p.realized_r, d.realized_r FROM demo_trades d "
+            "JOIN paper_trades p ON p.id = d.paper_id "
+            "WHERE d.status='closed' AND IFNULL(d.exit_reason,'')!='entry_expired' "
+            "AND p.status='closed' AND IFNULL(p.exit_reason,'')!='entry_expired' "
+            "AND d.realized_r IS NOT NULL AND p.realized_r IS NOT NULL").fetchall()
+        att = conn.execute(
+            "SELECT COUNT(*) FROM demo_trades WHERE status IN ('closed','open') "
+            "OR IFNULL(exit_reason,'')='entry_expired'").fetchone()[0]
+        filled = conn.execute(
+            "SELECT COUNT(*) FROM demo_trades WHERE status IN ('closed','open') "
+            "AND IFNULL(exit_reason,'')!='entry_expired'").fetchone()[0]
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        conn.close()
+    n = len(pairs)
+    if n == 0:
+        return {"n_pairs": 0, "note": "尚無可配對樣本"}
+    pev = sum(p for p, _ in pairs) / n
+    dev = sum(d for _, d in pairs) / n
+    deltas = [d - p for p, d in pairs]
+    return {"n_pairs": n,
+            "paper_ev": round(pev, 3), "demo_ev": round(dev, 3),
+            "mean_delta": round(sum(deltas) / n, 3),
+            "fill_rate_pct": round(filled / att * 100, 1) if att else None}
+
+
 def render_digest_md(ev: dict, d1: dict, n_new: int, pa: dict | None = None,
-                     mci: dict | None = None, tai: dict | None = None) -> str:
-    """把分桶 EV + 計畫對比 + 缺數據誤判(item-d) + 大盤方向濾網追蹤(#4) + D1 渲染成 md。"""
+                     mci: dict | None = None, tai: dict | None = None,
+                     drift: dict | None = None) -> str:
+    """把分桶 EV + 計畫對比 + 缺數據誤判(item-d) + 大盤方向濾網追蹤(#4) + 執行落差 + D1 渲染。"""
     lines = [
         "# 🔬 皮諾丘交易覆盤（驗屍）摘要",
         "",
@@ -811,6 +852,20 @@ def render_digest_md(ev: dict, d1: dict, n_new: int, pa: dict | None = None,
         if at is None or abs(at) < 2:
             lines.append("　_樣本未達統計顯著(t<2)，僅供觀察；不據此硬改進場，待 "
                          "champion/challenger→L2（紅線③）。_")
+
+    # 🔀 v113：紙上 vs 模擬盤執行落差（真錢閘收斂量表；使用者監管職能的核心儀表）
+    if drift is not None:
+        lines += ["", "## 🔀 紙上 vs 模擬盤執行落差（真錢閘收斂量表）", ""]
+        if drift.get("n_pairs", 0) == 0:
+            lines.append("（尚無可配對樣本——demo 平倉後自動累積）")
+        else:
+            lines += [
+                f"- 同單配對：{drift['n_pairs']} 對　紙上 EV {drift['paper_ev']:+.3f}R "
+                f"vs 模擬盤 EV {drift['demo_ev']:+.3f}R",
+                f"- **平均落差(模擬盤−紙上)：{drift['mean_delta']:+.3f}R**"
+                + f"　成交率 {drift['fill_rate_pct']}%" if drift.get("fill_rate_pct") is not None else "",
+                "- _收斂判準（真錢兩閘之一）：落差→0 且模擬盤 EV>0——真錢行為像模擬盤、不像紙上。_",
+            ]
 
     lines += ["", "## D1 反事實（deepdive 加 breadth 閘 + BTC 4h>200MA）", "",
               f"- 評估筆數：{d1.get('n_eval', 0)}",
@@ -943,10 +998,17 @@ def run_scan_once(notes_path: Path | None = None,
     except Exception as e:  # noqa: BLE001
         print(f"[postmortem] 缺數據/大盤方向分析略過：{type(e).__name__}: {e}")
 
+    drift = None
+    try:
+        drift = paper_demo_drift()   # v113：執行落差量表（唯讀、失敗不致命）
+    except Exception as e:  # noqa: BLE001
+        print(f"[postmortem] 執行落差量表略過：{type(e).__name__}: {e}")
+
     # 寫 digest（覆寫；它是「最新狀態」快照）
     try:
         dp_.parent.mkdir(parents=True, exist_ok=True)
-        dp_.write_text(render_digest_md(ev, d1, n_written, pa, mci, tai), encoding="utf-8")
+        dp_.write_text(render_digest_md(ev, d1, n_written, pa, mci, tai, drift),
+                       encoding="utf-8")
     except Exception as e:
         print(f"[postmortem] digest write failed: {type(e).__name__}: {e}")
 
