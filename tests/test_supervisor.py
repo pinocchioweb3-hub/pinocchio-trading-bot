@@ -54,3 +54,34 @@ def test_genuine_outage_stays_alert(monkeypatch):
     st = SupervisorState()
     r = _run(st, {"ok": False, "details": "Connection refused", "code": "API_ERROR"}, monkeypatch)
     assert r[0].kind == "source_down" and r[0].severity == "alert"
+
+
+# ------------------------------------------------- v115 LLM 合成健康告警
+def test_llm_synth_down_alerts_after_3_failures(monkeypatch, tmp_path):
+    """連續失敗≥3 → alert；401 類錯誤附 /login 指引。"""
+    import json as _json
+    import botpaths as _bp
+    monkeypatch.setattr(_bp, "data_dir", lambda: tmp_path)
+    (tmp_path / "synth_health.json").write_text(_json.dumps(
+        {"consecutive_failures": 4,
+         "last_error": "claude exit=1: 401 Invalid authentication"}), encoding="utf-8")
+    st = SupervisorState()
+    r = _run(st, {"ok": True}, monkeypatch)   # source ok，只看 synth 檢查
+    # _run 只回 source* 類——改抓全部
+    res = asyncio.run(run_health_checks(st, FakeSource({"ok": True})))
+    hits = [c for c in res if c.kind == "llm_synth_down"]
+    assert len(hits) == 1 and hits[0].severity == "alert"
+    assert "/login" in hits[0].message and "停擺" in hits[0].message
+
+
+def test_llm_synth_healthy_no_alert(monkeypatch, tmp_path):
+    import json as _json
+    import botpaths as _bp
+    monkeypatch.setattr(_bp, "data_dir", lambda: tmp_path)
+    (tmp_path / "synth_health.json").write_text(_json.dumps(
+        {"consecutive_failures": 2, "last_error": "timeout"}), encoding="utf-8")
+    st = SupervisorState()
+    monkeypatch.setattr(sup, "queue_stats", lambda: {"queued": 0, "failed": 0})
+    monkeypatch.setattr(sup, "capture_health", lambda **k: {"verdict": "ok"})
+    res = asyncio.run(run_health_checks(st, FakeSource({"ok": True})))
+    assert not [c for c in res if c.kind == "llm_synth_down"]   # <3 不吵

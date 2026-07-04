@@ -98,3 +98,25 @@ def test_us_signal_direction_guarded():
     # us_signal 納入方向護欄：缺方向會被抓
     no_dir = "🧪🇺🇸 MSTR 永續［美股突破·實驗性］ 量 $4m"
     assert "trade_msg_no_direction" in check_clarity(no_dir, "us_signal")
+
+
+# ------------------------------------------------- v115 合成健康留痕 + 401-stdout 防呆
+def test_synth_health_record_roundtrip(monkeypatch, tmp_path):
+    import json as _json
+    import botpaths as _bp
+    monkeypatch.setattr(_bp, "data_dir", lambda: tmp_path)
+    from l3_dispatcher.synthesizer import _record_synth_health
+    _record_synth_health(False, "claude exit=1: x")
+    _record_synth_health(False, "claude exit=1: y")
+    st = _json.loads((tmp_path / "synth_health.json").read_text(encoding="utf-8"))
+    assert st["consecutive_failures"] == 2 and "y" in st["last_error"]
+    _record_synth_health(True)
+    st2 = _json.loads((tmp_path / "synth_health.json").read_text(encoding="utf-8"))
+    assert st2["consecutive_failures"] == 0 and st2["last_error"] == ""
+
+
+def test_auth_failure_markers_present():
+    """401 走 stdout 且 exit=0 的實測樣態必須被標記字樣涵蓋（不可當分析結果送出）。"""
+    from l3_dispatcher.synthesizer import _AUTH_FAIL_MARKERS
+    sample = "Failed to authenticate. API Error: 401 Invalid authentication credentials"
+    assert any(m in sample for m in _AUTH_FAIL_MARKERS)

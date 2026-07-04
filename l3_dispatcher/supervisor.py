@@ -102,6 +102,28 @@ async def run_health_checks(state: SupervisorState, source) -> list[HealthCheck]
             detail={"error": str(e)},
         ))
 
+    # === 1.5 LLM 合成健康（v115，治本 2026-07-04 憑證 401 靜默斷流 34h 事故）===
+    # synthesizer 每次合成結果寫 synth_health.json；連續失敗 ≥3（≈跨多輪 deepdive/pulse）
+    # ＝訊號生成事實上停擺 → alert 推播（30 分節流沿用）。401 類錯誤附上 /login 指引。
+    try:
+        import json as _json
+        from botpaths import data_dir as _dd
+        _sh = _json.loads((_dd() / "synth_health.json").read_text(encoding="utf-8"))
+        _cf = int(_sh.get("consecutive_failures", 0))
+        if _cf >= 3:
+            _le = str(_sh.get("last_error", ""))
+            _hint = ("——多為 claude CLI 登入失效：請開終端機執行 claude /login 重新授權"
+                     if ("401" in _le or "auth" in _le.lower()) else "")
+            results.append(HealthCheck(
+                kind="llm_synth_down",
+                severity="alert",
+                message=(f"LLM 合成已連續失敗 {_cf} 次＝訊號生成停擺"
+                         f"（最後錯誤：{_le[:120]}）{_hint}"),
+                detail=_sh,
+            ))
+    except Exception:  # noqa: BLE001 — 無檔案/壞檔＝尚無資料，不告警
+        pass
+
     # === 2. Queue 塞車檢查 ===
     qs = queue_stats()
     queued = qs.get("queued", 0)

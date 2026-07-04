@@ -848,6 +848,37 @@ async def synthesize_per_symbol(symbol: str, sym_state: dict,
     return text, meta
 
 
+def _record_synth_health(ok: bool, error: str = "") -> None:
+    """v115：LLM 合成健康留痕（synth_health.json）——supervisor 讀它，連續失敗≥3 即告警。
+
+    治本 2026-07-04 事故：claude CLI 憑證 401 失效後 deepdive/pulse 靜默斷流 34 小時
+    才被使用者發現（log 有 synth failed 但無推播）。成功→歸零；失敗→累加+記最後錯誤。"""
+    import json as _json
+    import time as _time
+    try:
+        from botpaths import data_dir
+        p = data_dir() / "synth_health.json"
+        try:
+            st = _json.loads(p.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            st = {}
+        if ok:
+            st = {"consecutive_failures": 0, "last_ok_ts": _time.time(), "last_error": ""}
+        else:
+            st["consecutive_failures"] = int(st.get("consecutive_failures", 0)) + 1
+            st["last_error"] = error[:200]
+            st["last_fail_ts"] = _time.time()
+        p.write_text(_json.dumps(st), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — 健康留痕失敗絕不影響合成主流程
+        pass
+
+
+# 401/授權失效有時走 stdout 且 exit=0（實測 2026-07-04）——這些字樣出現在輸出開頭
+# 就是憑證問題，不是分析結果，不可誤當卡片文本送出。
+_AUTH_FAIL_MARKERS = ("Failed to authenticate", "Invalid authentication",
+                      "API Error: 401", "Please run /login")
+
+
 async def _synthesize_with_prompt(system_prompt: str, user_data: str,
                                   timeout_sec: int = 180) -> tuple[str | None, dict]:
     """共用 helper：用 Claude Code Headless 跑任何 system_prompt + user_data。"""
@@ -857,6 +888,7 @@ async def _synthesize_with_prompt(system_prompt: str, user_data: str,
 
     claude_exe = shutil.which("claude")
     if not claude_exe:
+        _record_synth_health(False, "claude CLI not found")
         return None, {"error": "claude CLI not found"}
 
     full_prompt = f"{system_prompt}\n\n---\n{user_data}"
@@ -882,15 +914,24 @@ async def _synthesize_with_prompt(system_prompt: str, user_data: str,
         )
     except asyncio.TimeoutError:
         proc.kill()
+        _record_synth_health(False, f"claude timeout {timeout_sec}s")
         return None, {"error": f"claude timeout {timeout_sec}s"}
 
     if proc.returncode != 0:
-        return None, {"error": f"claude exit={proc.returncode}: {stderr.decode('utf-8', errors='replace')[:300]}"}
+        _err = f"claude exit={proc.returncode}: {stderr.decode('utf-8', errors='replace')[:300]}"
+        _record_synth_health(False, _err)
+        return None, {"error": _err}
 
     text = stdout.decode("utf-8", errors="replace").strip()
     if not text:
+        _record_synth_health(False, "empty output")
         return None, {"error": "empty output"}
+    # v115：401/授權失效可能走 stdout 且 exit=0——擋下，不可把錯誤訊息當分析結果
+    if any(m in text[:200] for m in _AUTH_FAIL_MARKERS):
+        _record_synth_health(False, f"auth failure via stdout: {text[:120]}")
+        return None, {"error": f"claude auth failed: {text[:150]}"}
 
+    _record_synth_health(True)
     text = _sanitize_telegram_html(text)
     return text, {
         "input_chars": len(full_prompt),
