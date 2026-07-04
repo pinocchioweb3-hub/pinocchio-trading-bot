@@ -50,3 +50,42 @@ def test_significant_edge_pending_realmoney_gate():
 def test_build_brief_runs_and_includes_synthesis():
     brief = build_ceo_brief()
     assert isinstance(brief, str) and "系統自評" in brief and "跨 session 綜合" in brief
+
+
+# ------------------------------------------------- v120 學習迴圈健康探針（稽核rank10）
+def _write_audit(tmp_path, fname, rows):
+    import json as _json
+    (tmp_path / fname).write_text(
+        "\n".join(_json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+
+def test_probe_detects_stuck_promotion(tmp_path):
+    """l2_passed=True 且 promote=False（v114 型卡死）→ 必須被抓出。"""
+    import time as _t
+    from l3_dispatcher.ceo_session import probe_learning_loop
+    now = _t.time() * 1000
+    _write_audit(tmp_path, "entry_policy_audit.jsonl", [
+        {"at_ms": now, "bucket": "*|unknown", "l2_passed": True, "promote": False,
+         "reasons": ["self_check_blocked"], "action": "hold"},
+        {"at_ms": now, "bucket": "BTC|q1", "l2_passed": False, "promote": False,
+         "reasons": ["minTRL"], "action": "hold"},
+    ])
+    p = probe_learning_loop(data_dir_fn=lambda: tmp_path)
+    assert len(p["stuck"]) == 1
+    assert p["stuck"][0]["bucket"] == "*|unknown"
+    assert "self_check_blocked" in p["stuck"][0]["reasons"]
+
+
+def test_probe_healthy_and_windowing(tmp_path):
+    """統計未過而 hold＝正常 fail-closed 不報；出窗舊列不掃。"""
+    import time as _t
+    from l3_dispatcher.ceo_session import probe_learning_loop, _section_learning_loop
+    now = _t.time() * 1000
+    _write_audit(tmp_path, "auto_params_audit.jsonl", [
+        {"at_ms": now - 90 * 3600 * 1000, "bucket": "OLD|x",
+         "l2_summary": "✅ 過閘", "promote": False},        # 出窗（90h 前）→ 不算
+        {"at_ms": now, "bucket": "ZEC|unknown",
+         "l2_summary": "❌ 未過閘（n=1）：minTRL✗", "promote": False},
+    ])
+    p = probe_learning_loop(data_dir_fn=lambda: tmp_path)
+    assert p["stuck"] == [] and p["rounds_checked"] >= 1

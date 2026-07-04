@@ -448,12 +448,71 @@ def _section_self_assessment() -> str:
     return "🧠 <b>系統自評</b>（跨 session 綜合·確定性推理非欄位回音）：\n" + body
 
 
+def probe_learning_loop(window_hours: float = 26.0, data_dir_fn=None) -> dict:
+    """v120（稽核rank10）：學習迴圈健康探針——掃兩優化器最新一輪審計，找出
+    『統計已放行（l2_passed=True / l2_summary ✅）但 promote=False』的卡住晉升。
+
+    背景：v114 事故＝一個已過 L2 四關的晉升被 self-check bug 卡死，在 audit jsonl 裡
+    沉默數週無人聞問。此探針把「統計放行、工程卡住」這類最貴的靜默阻塞縮到隔日可見。
+    回 {"stuck": [{file,bucket,reasons}], "rounds_checked": n}；讀檔失敗→誠實空結果。"""
+    import json as _json
+    import time as _time
+    if data_dir_fn is None:
+        from botpaths import data_dir as data_dir_fn
+    cutoff = (_time.time() - window_hours * 3600) * 1000
+    stuck, checked = [], 0
+    for fname in ("entry_policy_audit.jsonl", "auto_params_audit.jsonl"):
+        try:
+            lines = (data_dir_fn() / fname).read_text(encoding="utf-8").splitlines()
+        except Exception:  # noqa: BLE001
+            continue
+        seen_buckets = set()
+        for line in reversed(lines[-800:]):        # 最新一輪在檔尾
+            try:
+                r = _json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if r.get("at_ms", 0) < cutoff:
+                break                               # 出窗即停（檔案按時序 append）
+            checked += 1
+            b = r.get("bucket") or r.get("l2_bucket_key") or "?"
+            if b in seen_buckets:
+                continue
+            seen_buckets.add(b)
+            l2_ok = (r.get("l2_passed") is True
+                     or str(r.get("l2_summary", "")).startswith("✅"))
+            if l2_ok and not r.get("promote"):
+                stuck.append({"file": fname, "bucket": b,
+                              "reasons": (", ".join(map(str, r.get("reasons") or []))
+                                          or r.get("note") or "未知非統計阻因")[:120]})
+    return {"stuck": stuck, "rounds_checked": checked}
+
+
+def _section_learning_loop() -> str:
+    """學習迴圈健康段（v120）：無卡住→一行安靜確認；有卡住→醒目列出。"""
+    try:
+        p = probe_learning_loop()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not p.get("rounds_checked"):
+        return ""      # 窗內無審計（優化輪未跑）→ 不佔版面
+    if not p["stuck"]:
+        return ("🔄 <b>學習迴圈健康</b>：✅ 統計閘與晉升機構一致"
+                f"（近窗掃 {p['rounds_checked']} 筆審計，無「已放行被卡」晉升）")
+    lines = [f"🔄 <b>學習迴圈健康</b>：⚠️ <b>{len(p['stuck'])} 個晉升已過統計閘但被非統計原因卡住</b>"
+             "（v114 教訓：這類靜默阻塞最貴，請優先排查）"]
+    for s in p["stuck"][:5]:
+        lines.append(f"　• {s['bucket']}（{s['file'].split('_audit')[0]}）：{s['reasons']}")
+    return "\n".join(lines)
+
+
 def build_ceo_brief() -> str:
-    """產生完整 CEO 簡報（三段式）。純函式，可離線測試。"""
+    """產生完整 CEO 簡報（四段式）。純函式，可離線測試。"""
     now = dt.datetime.now(tz=dt.timezone.utc) + dt.timedelta(hours=8)  # 台北時間
     header = (f"🧭 <b>CEO 每日簡報</b>　{now.strftime('%Y-%m-%d %H:%M')} 台北\n"
               f"<i>由 Claude Code（監督人角色）自動彙整</i>")
-    parts = [header, _section_normal(), _section_self_assessment(), _section_decisions()]
+    parts = [header, _section_normal(), _section_self_assessment(),
+             _section_learning_loop(), _section_decisions()]
     return "\n\n".join(p for p in parts if p)
 
 
