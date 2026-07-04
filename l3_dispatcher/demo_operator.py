@@ -54,6 +54,12 @@ DEMO_MIN_RR = float(os.getenv("DEMO_MIN_RR", "1.2"))                 # 模擬盤
 #   (<1.2：AVAX 0.72/ARB 0.97/breakeven 級)，但放行中等 EV(1.2–1.5) → 吞吐約 2×。
 #   這是『選擇門檻』非『統計顯著門檻』——復盤 L2 四關(minTRL/DSR/PBO/FDR)維持嚴格不變、不為湊樣本降統計閘。
 ENTRY_EXPIRY_HOURS = float(os.getenv("DEMO_ENTRY_EXPIRY_HOURS", "8"))  # 限價掛單逾時作廢
+# v117（Fable5 稽核 rank2）：餓死型「提早」轉市價——執行落差 −0.289R 的最大單一來源是
+#   50% 鏡像單 entry_expired（價跑掉沒回踩，8h 後才發現已 sl_distance_blown 追不進=
+#   不對稱漏接贏家）。自 MIN_HOURS 起，若價已朝方向跑 ≥PROGRESS_FRAC×R 而限價仍未成交
+#   ＝餓死型，立即走同一 convert_gate 轉市價（同一理性閘、只提早觸發）。
+EARLY_CONVERT_MIN_HOURS = float(os.getenv("DEMO_EARLY_CONVERT_MIN_HOURS", "1.5"))
+EARLY_CONVERT_PROGRESS_FRAC = float(os.getenv("DEMO_EARLY_CONVERT_PROGRESS_FRAC", "0.25"))
 TIME_LIMIT_HOURS = float(os.getenv("DEMO_TIME_LIMIT_HOURS", "24"))     # 持倉逾時平倉（鏡 demo_trader.TIME_LIMIT_HOURS=24）
 
 
@@ -153,6 +159,29 @@ def infer_exit_reason(marker, pnl_usd) -> str:
 def pending_expired(entry_at, now_ms, expiry_hours=ENTRY_EXPIRY_HOURS) -> bool:
     """限價進場單從掛出起逾時未成交 → 作廢（entry_expired）。"""
     return (now_ms - (entry_at or 0)) > expiry_hours * 3600 * 1000
+
+
+def early_convert_ready(direction, entry_price, stop_price, cur_px, entry_at, now_ms,
+                        min_hours=None, progress_frac=None) -> bool:
+    """v117：pending 限價的『餓死型』判準（純函式、零 IO）。
+
+    True 條件（全部成立）：①掛齡 ≥ min_hours（太年輕不追，讓限價自然成交）
+    ②價已朝開單方向跑 ≥ progress_frac×風險距離（=回踩大概率不來了、正在漏接贏家）。
+    True 只代表「值得送 convert_gate 檢查」——最終仍由同一理性閘決定轉不轉
+    （過 TP1 不追、方向壞不追、SL 距離爆不追）。價在進場價壞側（等成交中）永遠 False。"""
+    mh = EARLY_CONVERT_MIN_HOURS if min_hours is None else min_hours
+    pf = EARLY_CONVERT_PROGRESS_FRAC if progress_frac is None else progress_frac
+    if (now_ms - (entry_at or 0)) < mh * 3600 * 1000:
+        return False
+    try:
+        entry, stop, cur = float(entry_price), float(stop_price), float(cur_px)
+    except (TypeError, ValueError):
+        return False
+    risk = abs(entry - stop)
+    if risk <= 0 or cur <= 0:
+        return False
+    progress = (cur - entry) if direction == "bull" else (entry - cur)
+    return progress >= pf * risk
 
 
 def needs_timeout_close(filled_at, entry_at, now_ms, time_limit_hours=TIME_LIMIT_HOURS) -> bool:
@@ -309,8 +338,8 @@ async def _place_one(ex, signal, *, avail_usd, tg=None) -> dict:
     return {"placed": True, "margin_est": plan.margin_usd}
 
 
-async def _convert_expired_to_market(ex, t, *, now_ms, tg=None) -> dict:
-    """限價逾時 → 過理性閘則轉市價追進（task#14＝AB task#59 D 政策）。
+async def _convert_expired_to_market(ex, t, *, now_ms, tg=None, trigger="expiry") -> dict:
+    """限價逾時/餓死 → 過理性閘則轉市價追進（task#14＝AB task#59 D 政策；v117 加 early）。
 
     重建市價計畫：同結構止損、依新進場 re-size 保持風險預算（build_order_plan 自洽重算
     槓桿/張數/TP）。回 {converted: bool, reason}。任何步驟失敗→converted=False（呼叫端作廢，
@@ -350,10 +379,30 @@ async def _convert_expired_to_market(ex, t, *, now_ms, tg=None) -> dict:
                          margin_usd=plan.margin_usd, contracts=plan.contracts,
                          risk_usd=plan.realized_risk_usd,
                          entry_order_id=res.get("entry_order_id"), entry_at_ms=now_ms,
-                         note=f"限價逾時→市價追進 @{cur_px:.6g}")
-    _notify(tg, f"🔄 模擬盤限價逾時轉市價：{sym} {direction} @{cur_px:.6g} "
+                         note=(f"限價逾時→市價追進 @{cur_px:.6g}" if trigger == "expiry"
+                               else f"限價餓死(價跑≥0.25R)提早→市價追進 @{cur_px:.6g}"))
+    _notify(tg, f"🔄 模擬盤限價{'逾時' if trigger == 'expiry' else '餓死提早'}轉市價："
+                f"{sym} {direction} @{cur_px:.6g} "
                 f"×{plan.contracts}張 lev{plan.leverage}（D政策救涵蓋率，紙上）")
     return {"converted": True, "px": cur_px}
+
+
+async def _maybe_early_convert(ex, t, *, now_ms, tg=None) -> dict:
+    """v117：pending 未逾時的餓死型提早轉市價。太年輕→不動；價未跑掉→不動；
+    餓死判準成立→走同一 _convert_expired_to_market（同一 convert_gate 理性閘）。
+    不轉時永不作廢（與逾時路徑不同——時間還沒到，讓限價繼續等）。"""
+    from l4_execution import demo_trader as dt  # noqa: F401（對稱既有 import 風格）
+    if (now_ms - (t.get("entry_at") or 0)) < EARLY_CONVERT_MIN_HOURS * 3600 * 1000:
+        return {"converted": False, "reason": "too_young"}
+    try:
+        tk = await ex.fetch_ticker(f"{t['symbol']}/USDT:USDT")
+        cur_px = float((tk or {}).get("last") or (tk or {}).get("close") or 0)
+    except Exception:  # noqa: BLE001
+        return {"converted": False, "reason": "no_price"}
+    if not early_convert_ready(t["direction"], t.get("entry_price"), t.get("stop_price"),
+                               cur_px, t.get("entry_at"), now_ms):
+        return {"converted": False, "reason": "no_progress"}
+    return await _convert_expired_to_market(ex, t, now_ms=now_ms, tg=tg, trigger="early")
 
 
 async def _monitor(ex, *, now_ms, tg=None) -> dict:
@@ -389,7 +438,14 @@ async def _monitor(ex, *, now_ms, tg=None) -> dict:
                                             note=f"限價逾時未成交（不轉市價:{conv.get('reason')}）")
                         summary["expired"] += 1
                 else:
-                    dj.touch_synced(iid)
+                    # v117（稽核rank2）：未逾時但「餓死型」（價已朝方向跑≥0.25R、限價回踩
+                    #   等不到）→ 提早走同一 convert_gate 轉市價，不再乾等 8h 漏接贏家。
+                    #   不轉（太年輕/無進度/閘拒）→ 照舊掛著等。
+                    conv = await _maybe_early_convert(ex, t, now_ms=now_ms, tg=tg)
+                    if conv.get("converted"):
+                        summary["converted_early"] = summary.get("converted_early", 0) + 1
+                    else:
+                        dj.touch_synced(iid)
             elif t["status"] == "open":
                 if key not in okx_map:
                     # OKX 上已無此倉 → 已平倉，取真相 realizedPnl。
