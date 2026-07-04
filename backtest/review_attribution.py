@@ -75,7 +75,7 @@ def load_closed() -> list[dict]:
     try:
         cur = conn.execute(
             "SELECT id, symbol, setup, direction, realized_r, exit_reason, "
-            "       exit_at, regime, plan_snapshot "
+            "       entry_at, exit_at, regime, plan_snapshot "
             "FROM paper_trades WHERE status='closed' ORDER BY exit_at"
         )
         cols = [c[0] for c in cur.description]
