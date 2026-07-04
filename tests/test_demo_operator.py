@@ -27,3 +27,24 @@ def test_early_convert_ready_pure_judge():
     assert not early_convert_ready("bull", 100, 100, 101.0, now - 2 * H, now, 1.5, 0.25)
     assert not early_convert_ready("bull", 100, 96, 0, now - 2 * H, now, 1.5, 0.25)
     assert not early_convert_ready("bull", None, 96, 101.0, now - 2 * H, now, 1.5, 0.25)
+
+
+# ------------------------------------------------- v119 alt 同向持倉總閘（稽核rank7）
+def test_alt_same_dir_cap_pure_gate():
+    from l3_dispatcher.demo_operator import alt_same_dir_blocked
+    mk = lambda s, d, st="open": {"symbol": s, "direction": d, "status": st}
+    three_bull_alts = [mk("SOL", "bull"), mk("AAVE", "bull"), mk("SUI", "bull", "pending")]
+    # 第 4 筆同向 alt → 擋
+    assert alt_same_dir_blocked("APT", "bull", three_bull_alts, cap=3)
+    # 反方向不擋（空單不受多單佔額影響）
+    assert not alt_same_dir_blocked("APT", "bear", three_bull_alts, cap=3)
+    # 主流 BTC/ETH 永不擋
+    assert not alt_same_dir_blocked("BTC", "bull", three_bull_alts, cap=3)
+    assert not alt_same_dir_blocked("ETH", "bull", three_bull_alts, cap=3)
+    # 在場含 BTC/ETH 不計入 alt 額度
+    mixed = [mk("BTC", "bull"), mk("ETH", "bull"), mk("SOL", "bull")]
+    assert not alt_same_dir_blocked("APT", "bull", mixed, cap=3)   # alt 僅 1 筆
+    # 已平倉/拒單不計
+    stale = three_bull_alts + [mk("LTC", "bull", "closed"), mk("OP", "bull", "rejected")]
+    assert alt_same_dir_blocked("APT", "bull", stale, cap=3)       # 仍是 3 筆活的 → 擋
+    assert not alt_same_dir_blocked("APT", "bull", three_bull_alts[:2], cap=3)  # 2<3 不擋

@@ -60,6 +60,12 @@ ENTRY_EXPIRY_HOURS = float(os.getenv("DEMO_ENTRY_EXPIRY_HOURS", "8"))  # 限價�
 #   ＝餓死型，立即走同一 convert_gate 轉市價（同一理性閘、只提早觸發）。
 EARLY_CONVERT_MIN_HOURS = float(os.getenv("DEMO_EARLY_CONVERT_MIN_HOURS", "1.5"))
 EARLY_CONVERT_PROGRESS_FRAC = float(os.getenv("DEMO_EARLY_CONVERT_PROGRESS_FRAC", "0.25"))
+# v119（稽核rank7）：alt 同向持倉總閘——靜態 CORRELATED_FAMILIES 幾乎不覆蓋實際宇宙
+#   （近期成交 LAB/XPL/RESOLV/LIT… 全 family=None），alt 對 BTC beta 高相關，同方向
+#   疊 N 筆＝同一注下 N 次（止損復盤「一天 −3R 叢集」的結構根源）。保守後備閘：
+#   BTC/ETH 之外同方向在場（pending+open）≥ MAX 筆 → 拒第 N+1 筆。純模擬盤風控。
+ALT_SAME_DIR_MAX = int(os.getenv("DEMO_ALT_SAME_DIR_MAX", "3"))
+_MAJORS = {"BTC", "ETH"}
 TIME_LIMIT_HOURS = float(os.getenv("DEMO_TIME_LIMIT_HOURS", "24"))     # 持倉逾時平倉（鏡 demo_trader.TIME_LIMIT_HOURS=24）
 
 
@@ -182,6 +188,19 @@ def early_convert_ready(direction, entry_price, stop_price, cur_px, entry_at, no
         return False
     progress = (cur - entry) if direction == "bull" else (entry - cur)
     return progress >= pf * risk
+
+
+def alt_same_dir_blocked(symbol, direction, open_trades, cap=None) -> bool:
+    """v119：alt 同向總閘（純函式）。symbol 為 BTC/ETH 主流→永不擋；
+    其餘標的：在場（pending/open）同方向的非主流單已達 cap → True（擋第 N+1 筆）。"""
+    c = ALT_SAME_DIR_MAX if cap is None else cap
+    if (symbol or "").upper() in _MAJORS:
+        return False
+    n = sum(1 for t in (open_trades or [])
+            if (t.get("symbol") or "").upper() not in _MAJORS
+            and t.get("direction") == direction
+            and t.get("status") in ("pending", "open"))
+    return n >= c
 
 
 def needs_timeout_close(filled_at, entry_at, now_ms, time_limit_hours=TIME_LIMIT_HOURS) -> bool:
@@ -323,6 +342,11 @@ async def _place_one(ex, signal, *, avail_usd, tg=None) -> dict:
         return {"placed": False, "reason": plan.reject_reason}
 
     open_trades = dj.get_live_demo_trades()               # 桶風險：當下在倉清單
+    # v119（稽核rank7）：alt 同向總閘——非主流同方向在場已達上限，拒收（審計痕跡可查）
+    if alt_same_dir_blocked(symbol, direction, open_trades):
+        _record("rejected", "reject:alt_same_dir_cap", None,
+                f"alt 同向在場已達 {ALT_SAME_DIR_MAX} 筆（BTC beta 疊注防護），拒第 N+1 筆")
+        return {"placed": False, "reason": "alt_same_dir_cap"}
     res = await dt.place_demo_plan(ex, plan, avail_usd=avail_usd,
                                    open_trades=open_trades,
                                    families=CORRELATED_FAMILIES)
