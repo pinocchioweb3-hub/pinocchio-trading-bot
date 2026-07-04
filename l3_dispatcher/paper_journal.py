@@ -87,6 +87,10 @@ def init_db() -> None:
             ("entry_policy_kind", "ALTER TABLE paper_trades ADD COLUMN entry_policy_kind TEXT"),
             # task#77: 出場偵測檢查點 — 上次已掃到的「最後一根已確認 5m bar」的 ts（epoch ms）。
             ("last_checked_ts", "ALTER TABLE paper_trades ADD COLUMN last_checked_ts INTEGER"),
+            # v118（稽核rank6）：淨值口徑——realized_r 是毛利（零費用/滑價建模），demo 配對
+            #   實測止損中位 ~−1.05R 證明真實成本存在。net_r=毛R−費用R−止損滑價R（保守
+            #   taker雙邊口徑），平倉時並行寫入；毛 realized_r 歷史口徑不動、舊列 NULL 永不回填（紅③）。
+            ("net_r", "ALTER TABLE paper_trades ADD COLUMN net_r REAL"),
         ):
             if col not in existing:
                 try:
@@ -588,6 +592,7 @@ def apply_paper_event(paper_id: int, leg_label: str, size_pct: float,
         sl_dist = abs(entry - stop)
         leg_r = ((exit_price - entry) if direction == "bull"
                  else (entry - exit_price)) / sl_dist
+        # （net_r 由 compute_net_r 於全平時計算——見該函式；此處先保留毛利口徑不動）
         # v26: PnL 按實際成交比例縮放（只進 70% 就只賺/賠 70%）
         leg_pnl = size_pct * RISK_USD * leg_r * (filled_pct if filled_pct else 1.0)
 
@@ -597,10 +602,12 @@ def apply_paper_event(paper_id: int, leg_label: str, size_pct: float,
         now_ms = int(time.time() * 1000)
 
         if new_size <= 0.001 or leg_label in ("stop", "timeout"):
+            gross_r = new_pnl / RISK_USD
+            net_r = compute_net_r(gross_r, entry, stop, leg_label)
             conn.execute(
                 """UPDATE paper_trades SET status='closed', legs_hit=?, size_remaining=0,
-                   pnl_usd=?, realized_r=?, exit_reason=?, exit_at=? WHERE id=?""",
-                (new_legs, new_pnl, new_pnl / RISK_USD, leg_label, now_ms, paper_id),
+                   pnl_usd=?, realized_r=?, net_r=?, exit_reason=?, exit_at=? WHERE id=?""",
+                (new_legs, new_pnl, gross_r, net_r, leg_label, now_ms, paper_id),
             )
             return {"closed": True, "total_pnl": round(new_pnl, 2),
                     "leg_r": round(leg_r, 3), "leg_pnl": round(leg_pnl, 2)}
@@ -612,6 +619,35 @@ def apply_paper_event(paper_id: int, leg_label: str, size_pct: float,
                 "leg_r": round(leg_r, 3), "leg_pnl": round(leg_pnl, 2)}
     finally:
         conn.close()
+
+
+# v118（稽核rank6）：淨值口徑常數——保守 taker 雙邊 + 止損滑價（demo 配對實測校準）。
+_FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.0005"))        # OKX taker 0.05%/邊
+_STOP_SLIP_R = float(os.getenv("PAPER_STOP_SLIP_R", "0.05"))    # demo 配對止損中位 ~−1.05R
+
+
+def compute_net_r(gross_r: float, entry: float, stop: float,
+                  exit_reason: str | None,
+                  fee_rate: float | None = None,
+                  stop_slip_r: float | None = None) -> float | None:
+    """毛 R → 淨 R（純函式）。net = gross − 費用R − 止損滑價R。
+
+    費用R = 2×taker費率×進場價/|進場−止損|（雙邊、全名目；R 單位下張數消掉）。
+    刻意保守：實際進場/TP 多為 maker（更便宜），用 taker 高估成本——若淨 EV 在保守
+    口徑下仍為正，真錢只會更好（真錢閘的誠實方向）。滑價只計 stop 出場（市價滑過）。
+    缺料/退化 → None 誠實留空（紅線③），永不回填舊列。"""
+    fr = _FEE_RATE if fee_rate is None else fee_rate
+    sr = _STOP_SLIP_R if stop_slip_r is None else stop_slip_r
+    try:
+        entry, stop = float(entry), float(stop)
+    except (TypeError, ValueError):
+        return None
+    dist = abs(entry - stop)
+    if dist <= 0 or entry <= 0:
+        return None
+    fee_r = 2 * fr * entry / dist
+    slip_r = sr if (exit_reason or "") == "stop" else 0.0
+    return round(gross_r - fee_r - slip_r, 4)
 
 
 def get_signals_after(after_id: int, limit: int = 200) -> list[dict]:
