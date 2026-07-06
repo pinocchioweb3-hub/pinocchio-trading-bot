@@ -54,3 +54,22 @@ def test_stack_depth_recorded_on_entry(tmp_path, monkeypatch):
     assert rows[id1] == 0        # 首筆
     assert rows[id2] == 1        # 第二筆同向 → 已有 1 筆在場
     assert rows[id3] == 0        # 反向是自己的首筆
+
+
+# ------------------------------------------------- v122 intraday 疊倉閘
+def test_intraday_stack_cap_blocks_third(tmp_path, monkeypatch):
+    """intraday 同幣同向在場達 2 筆 → 第 3 筆回 -1 不入帳；deepdive 不受限；反向不受限。"""
+    import l3_dispatcher.paper_journal as pj
+    db = tmp_path / "tj.db"
+    monkeypatch.setattr(pj, "DB_PATH", db)
+    pj.init_db()
+    a = pj.record_paper_entry("ETH", "intraday", "bear", 1800, 1850, 1750, 1700, 1650)
+    b = pj.record_paper_entry("ETH", "intraday", "bear", 1790, 1840, 1740, 1690, 1640)
+    c3 = pj.record_paper_entry("ETH", "intraday", "bear", 1780, 1830, 1730, 1680, 1630)
+    assert a > 0 and b > 0 and c3 == -1          # 第 3 筆被疊倉閘擋下
+    # deepdive 同幣同向不受此閘（LLM 逐次重新分析的已驗證軌道）
+    d1 = pj.record_paper_entry("ETH", "deepdive", "bear", 1800, 1850, 1750, 1700, 1650)
+    assert d1 > 0
+    # intraday 反向（bull）是自己的首筆 → 放行
+    e1 = pj.record_paper_entry("ETH", "intraday", "bull", 1780, 1730, 1830, 1880, 1930)
+    assert e1 > 0

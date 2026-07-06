@@ -278,14 +278,25 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
     conn = _conn()
     try:
         now_ms = int(time.time() * 1000)
-        # v121：進場當下同幣同向在場筆數（0=首筆）。純觀測落帳、不擋單（先記錄，
-        #   數據說話後才談要不要擋——不為湊樣本改策略的鏡像：也不為降相關硬砍樣本）。
+        # v121：進場當下同幣同向在場筆數（0=首筆）。落帳供統計雙口徑與疊單EV分析。
         try:
             stack_depth = conn.execute(
                 "SELECT COUNT(*) FROM paper_trades WHERE symbol=? AND direction=? "
                 "AND status='open'", (symbol, direction)).fetchone()[0]
         except Exception:  # noqa: BLE001
             stack_depth = None
+        # v122（使用者質疑「同標的重複開超多單」查明根因）：intraday 突破引擎沉睡數月
+        #   （direct_fire 歷史吞吐≈0，稽核實證）後於 2026-07-04 強趨勢中甦醒，每 4h 冷卻
+        #   一到就對同一標的再開一單（3 天 62 筆、ETH 空疊 10 筆）——冷卻閘只防窗內重複、
+        #   不查在場＝設計漏洞。同幣同向在場 ≥MAX 即不再疊（同一突破論點的第 N 次重發
+        #   ≈同一訊號，擋重複屬 v47 symbol_gate 去重精神的補洞，非策略變更）。
+        #   deepdive 不受此限（LLM 逐次重新分析、疊倉輕微、且是已驗證軌道）。
+        if (setup == "intraday" and stack_depth is not None
+                and stack_depth >= _INTRADAY_MAX_STACK):
+            print(f"[paper] {symbol}/{setup}/{direction} 跳過建單：同幣同向已在場 "
+                  f"{stack_depth} 筆 ≥ 上限 {_INTRADAY_MAX_STACK}（v122 疊倉閘，"
+                  f"同一突破論點不重複入帳）")
+            return -1
         if split_mode and zone_lo is not None and zone_hi is not None:
             splits = _compute_entry_splits(direction, zone_lo, zone_hi)
             cur = conn.execute(
@@ -636,6 +647,8 @@ def apply_paper_event(paper_id: int, leg_label: str, size_pct: float,
 # v118（稽核rank6）：淨值口徑常數——保守 taker 雙邊 + 止損滑價（demo 配對實測校準）。
 _FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.0005"))        # OKX taker 0.05%/邊
 _STOP_SLIP_R = float(os.getenv("PAPER_STOP_SLIP_R", "0.05"))    # demo 配對止損中位 ~−1.05R
+# v122：intraday 同幣同向在場疊倉上限（≥此數即不再入帳；deepdive 不受限）。
+_INTRADAY_MAX_STACK = int(os.getenv("PAPER_INTRADAY_MAX_STACK", "2"))
 
 
 def compute_net_r(gross_r: float, entry: float, stop: float,
