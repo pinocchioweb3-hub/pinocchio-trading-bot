@@ -73,3 +73,38 @@ def test_intraday_stack_cap_blocks_third(tmp_path, monkeypatch):
     # intraday 反向（bull）是自己的首筆 → 放行
     e1 = pj.record_paper_entry("ETH", "intraday", "bull", 1780, 1730, 1830, 1880, 1930)
     assert e1 > 0
+
+
+# ------------------------------------------------- v124 StoplossGuard shadow
+def test_dir_stops_24h_recorded(tmp_path, monkeypatch):
+    """同方向近24h止損數落帳：2筆 bull 止損後,新 bull 單記 2、bear 單記 0。"""
+    import sqlite3
+    import time as _t
+    import l3_dispatcher.paper_journal as pj
+    db = tmp_path / "tj.db"
+    monkeypatch.setattr(pj, "DB_PATH", db)
+    pj.init_db()
+    now = int(_t.time() * 1000)
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO paper_trades (symbol,setup,direction,entry_price,stop_price,"
+                 "tp1,entry_at,created_at,status,exit_reason,exit_at) VALUES "
+                 "('SOL','deepdive','bull',80,78,84,?,?,'closed','stop',?)",
+                 (now - 5 * 3600_000,) * 2 + (now - 3 * 3600_000,))
+    conn.execute("INSERT INTO paper_trades (symbol,setup,direction,entry_price,stop_price,"
+                 "tp1,entry_at,created_at,status,exit_reason,exit_at) VALUES "
+                 "('INJ','deepdive','bull',10,9.5,11,?,?,'closed','stop',?)",
+                 (now - 4 * 3600_000,) * 2 + (now - 1 * 3600_000,))
+    # 30h 前的舊止損 → 出窗不計
+    conn.execute("INSERT INTO paper_trades (symbol,setup,direction,entry_price,stop_price,"
+                 "tp1,entry_at,created_at,status,exit_reason,exit_at) VALUES "
+                 "('FIL','deepdive','bull',0.8,0.75,0.9,?,?,'closed','stop',?)",
+                 (now - 40 * 3600_000,) * 2 + (now - 30 * 3600_000,))
+    conn.commit(); conn.close()
+    b1 = pj.record_paper_entry("ETH", "deepdive", "bull", 1800, 1750, 1900, 1950, 2000)
+    s1 = pj.record_paper_entry("ETH", "deepdive", "bear", 1800, 1850, 1700, 1650, 1600)
+    conn = sqlite3.connect(str(db))
+    rows = dict(conn.execute("SELECT id, dir_stops_24h FROM paper_trades "
+                             "WHERE id IN (?,?)", (b1, s1)).fetchall())
+    conn.close()
+    assert rows[b1] == 2      # 24h 內 2 筆 bull 止損（30h 前那筆不計）
+    assert rows[s1] == 0      # bear 方向乾淨

@@ -95,6 +95,11 @@ def init_db() -> None:
             #   設計的自然結果（deepdive 4-6h 重評、論點續存再記一筆），但疊倉樣本高度相關＝
             #   n 灌水根源之一——落帳供雙口徑統計（首筆vs全部）與「疊單訊號EV」分析。舊列 NULL。
             ("stack_depth", "ALTER TABLE paper_trades ADD COLUMN stack_depth INTEGER"),
+            # v124（競品採納#1 Freqtrade StoplossGuard，shadow半）：進場當下「同方向近24h
+            #   已有幾筆止損出場」。連續止損＝方向錯誤的市場證據（止損復盤:空頭大盤連開逆勢
+            #   多單）——先落帳累積，離線分析『guard_stops≥K 的單 EV 是否顯著更差』過閘後
+            #   才把「鎖方向」變真閘。純觀測不擋單。舊列 NULL 永不回填（紅③）。
+            ("dir_stops_24h", "ALTER TABLE paper_trades ADD COLUMN dir_stops_24h INTEGER"),
         ):
             if col not in existing:
                 try:
@@ -285,6 +290,14 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                 "AND status='open'", (symbol, direction)).fetchone()[0]
         except Exception:  # noqa: BLE001
             stack_depth = None
+        # v124（StoplossGuard shadow）：同方向近 24h 止損出場筆數（連續止損=方向錯的證據）。
+        try:
+            dir_stops_24h = conn.execute(
+                "SELECT COUNT(*) FROM paper_trades WHERE direction=? "
+                "AND exit_reason='stop' AND exit_at > ?",
+                (direction, now_ms - 86400_000)).fetchone()[0]
+        except Exception:  # noqa: BLE001
+            dir_stops_24h = None
         # v122（使用者質疑「同標的重複開超多單」查明根因）：intraday 突破引擎沉睡數月
         #   （direct_fire 歷史吞吐≈0，稽核實證）後於 2026-07-04 強趨勢中甦醒，每 4h 冷卻
         #   一到就對同一標的再開一單（3 天 62 筆、ETH 空疊 10 筆）——冷卻閘只防窗內重複、
@@ -304,22 +317,23 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at,
                     entry_splits, entry_filled_pct, entry_state, signal_msg_id, plan_snapshot,
-                    tp_alloc, entry_policy_kind, stack_depth)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?, ?, ?, ?, ?)""",
+                    tp_alloc, entry_policy_kind, stack_depth, dir_stops_24h)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?, ?, ?, ?, ?, ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                  now_ms, fire_id, regime, now_ms, json.dumps(splits), signal_msg_id, ps_json,
-                 tp_alloc_json, eff_entry_policy, stack_depth),
+                 tp_alloc_json, eff_entry_policy, stack_depth, dir_stops_24h),
             )
         else:
             cur = conn.execute(
                 """INSERT INTO paper_trades
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at, entry_filled_pct, entry_state,
-                    signal_msg_id, plan_snapshot, tp_alloc, entry_policy_kind, stack_depth)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?, ?, ?, ?, ?)""",
+                    signal_msg_id, plan_snapshot, tp_alloc, entry_policy_kind, stack_depth,
+                    dir_stops_24h)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?, ?, ?, ?, ?, ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                  now_ms, fire_id, regime, now_ms, signal_msg_id, ps_json, tp_alloc_json,
-                 eff_entry_policy, stack_depth),
+                 eff_entry_policy, stack_depth, dir_stops_24h),
             )
         return cur.lastrowid
     finally:
