@@ -1524,8 +1524,45 @@ async def run_position_tracker_loop(tg, source, interval_seconds: int = 3600):
         sorted_positions, _overview = _position_overview(positions, prices)
         lines.append(_overview)          # v84 task#4：頂部組合摘要（最該先看的在最前）
         lines.append("")
+        # v121（使用者回饋「很多標的物重覆開單」）：同幣同向疊倉聚合顯示。
+        #   疊倉＝「紙上記全」設計的自然結果（deepdive 4-6h 重評、論點續存再記一筆；demo 有
+        #   總閘不會疊），但 50+ 筆逐條刷屏讓真訊號被淹沒 → ≥2 筆同幣同向收合成一行
+        #   （筆數/平均R/最差R/最早進場），單筆維持原詳細格式。純顯示零行為變更。
+        _grp: dict[tuple, list] = {}
+        for o in sorted_positions:
+            _grp.setdefault((o["symbol"], o["direction"], o["_kind"]), []).append(o)
+        _agg_done: set = set()
         for o in sorted_positions:
             sym = o["symbol"]
+            _gkey = (sym, o["direction"], o["_kind"])
+            _members = _grp[_gkey]
+            if len(_members) >= 2:
+                if _gkey in _agg_done:
+                    continue
+                _agg_done.add(_gkey)
+                _cur_g = prices.get(sym)
+                a_emoji, _ = _asset_kind(sym, o.get("setup", ""))
+                dir_zh = "做多" if o["direction"] == "bull" else "做空"
+                if _cur_g is None:
+                    lines.append(f"⚪ {a_emoji}<b>{sym} {dir_zh} ×{len(_members)}</b>"
+                                 f" (價格抓取失敗)")
+                    continue
+                _rs = []
+                for m in _members:
+                    _sd = abs(m["entry_price"] - m["stop_price"]) or 1e-12
+                    _rs.append(((_cur_g - m["entry_price"]) if m["direction"] == "bull"
+                                else (m["entry_price"] - _cur_g)) / _sd)
+                _avg = sum(_rs) / len(_rs)
+                _icon = ("🎯" if _avg >= 1.0 else "🟢" if _avg >= 0.5
+                         else "🟡" if _avg >= 0 else "🟠" if _avg >= -0.5 else "🔴")
+                _oldest = max((now_ms - m["entry_at"]) / 3600000 for m in _members)
+                _tp1n = sum(1 for m in _members if m.get("legs_hit"))
+                lines.append(
+                    f"{_icon} {a_emoji}<b>{sym} {dir_zh} ×{len(_members)} 筆（疊倉）</b>"
+                    f"　均 {_avg:+.2f}R｜最差 {min(_rs):+.2f}R｜最佳 {max(_rs):+.2f}R\n"
+                    f"   首筆 {_oldest:.1f}h 前"
+                    + (f"｜{_tp1n} 筆已過 TP" if _tp1n else ""))
+                continue
             a_emoji, _ = _asset_kind(sym, o.get("setup", ""))
             dir_zh = "做多" if o["direction"] == "bull" else "做空"  # v83：與 FIRE 卡一致中文化
             link = _signal_link(tg, o.get("_link_id"))

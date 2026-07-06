@@ -91,6 +91,10 @@ def init_db() -> None:
             #   實測止損中位 ~−1.05R 證明真實成本存在。net_r=毛R−費用R−止損滑價R（保守
             #   taker雙邊口徑），平倉時並行寫入；毛 realized_r 歷史口徑不動、舊列 NULL 永不回填（紅③）。
             ("net_r", "ALTER TABLE paper_trades ADD COLUMN net_r REAL"),
+            # v121（使用者回饋「重覆開單」）：進場當下同幣同向已在場筆數。疊倉＝「紙上記全」
+            #   設計的自然結果（deepdive 4-6h 重評、論點續存再記一筆），但疊倉樣本高度相關＝
+            #   n 灌水根源之一——落帳供雙口徑統計（首筆vs全部）與「疊單訊號EV」分析。舊列 NULL。
+            ("stack_depth", "ALTER TABLE paper_trades ADD COLUMN stack_depth INTEGER"),
         ):
             if col not in existing:
                 try:
@@ -274,6 +278,14 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
     conn = _conn()
     try:
         now_ms = int(time.time() * 1000)
+        # v121：進場當下同幣同向在場筆數（0=首筆）。純觀測落帳、不擋單（先記錄，
+        #   數據說話後才談要不要擋——不為湊樣本改策略的鏡像：也不為降相關硬砍樣本）。
+        try:
+            stack_depth = conn.execute(
+                "SELECT COUNT(*) FROM paper_trades WHERE symbol=? AND direction=? "
+                "AND status='open'", (symbol, direction)).fetchone()[0]
+        except Exception:  # noqa: BLE001
+            stack_depth = None
         if split_mode and zone_lo is not None and zone_hi is not None:
             splits = _compute_entry_splits(direction, zone_lo, zone_hi)
             cur = conn.execute(
@@ -281,22 +293,22 @@ def record_paper_entry(symbol: str, setup: str, direction: str,
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at,
                     entry_splits, entry_filled_pct, entry_state, signal_msg_id, plan_snapshot,
-                    tp_alloc, entry_policy_kind)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?, ?, ?, ?)""",
+                    tp_alloc, entry_policy_kind, stack_depth)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 'pending', ?, ?, ?, ?, ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                  now_ms, fire_id, regime, now_ms, json.dumps(splits), signal_msg_id, ps_json,
-                 tp_alloc_json, eff_entry_policy),
+                 tp_alloc_json, eff_entry_policy, stack_depth),
             )
         else:
             cur = conn.execute(
                 """INSERT INTO paper_trades
                    (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                     entry_at, fire_id, regime, created_at, entry_filled_pct, entry_state,
-                    signal_msg_id, plan_snapshot, tp_alloc, entry_policy_kind)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?, ?, ?, ?)""",
+                    signal_msg_id, plan_snapshot, tp_alloc, entry_policy_kind, stack_depth)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 'full', ?, ?, ?, ?, ?)""",
                 (symbol, setup, direction, entry_price, stop_price, tp1, tp2, tp3,
                  now_ms, fire_id, regime, now_ms, signal_msg_id, ps_json, tp_alloc_json,
-                 eff_entry_policy),
+                 eff_entry_policy, stack_depth),
             )
         return cur.lastrowid
     finally:

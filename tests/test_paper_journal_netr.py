@@ -35,3 +35,22 @@ def test_degenerate_honest_none():
     assert compute_net_r(1.0, 100, 100, "tp1") is None      # 零風險距離
     assert compute_net_r(1.0, None, 96, "tp1") is None      # 缺進場價
     assert compute_net_r(1.0, 0, 96, "tp1") is None         # 非法價
+
+
+# ------------------------------------------------- v121 stack_depth 落帳
+def test_stack_depth_recorded_on_entry(tmp_path, monkeypatch):
+    """同幣同向第 1/2/3 筆應分別記 stack_depth=0/1/2；反向不計。"""
+    import l3_dispatcher.paper_journal as pj
+    db = tmp_path / "tj.db"
+    monkeypatch.setattr(pj, "DB_PATH", db)
+    pj.init_db()
+    id1 = pj.record_paper_entry("ETH", "deepdive", "bear", 1800, 1850, 1750, 1700, 1650)
+    id2 = pj.record_paper_entry("ETH", "deepdive", "bear", 1790, 1840, 1740, 1690, 1640)
+    id3 = pj.record_paper_entry("ETH", "deepdive", "bull", 1780, 1730, 1830, 1880, 1930)
+    import sqlite3
+    c = sqlite3.connect(str(db))
+    rows = dict(c.execute("SELECT id, stack_depth FROM paper_trades").fetchall())
+    c.close()
+    assert rows[id1] == 0        # 首筆
+    assert rows[id2] == 1        # 第二筆同向 → 已有 1 筆在場
+    assert rows[id3] == 0        # 反向是自己的首筆
