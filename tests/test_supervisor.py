@@ -85,3 +85,55 @@ def test_llm_synth_healthy_no_alert(monkeypatch, tmp_path):
     monkeypatch.setattr(sup, "capture_health", lambda **k: {"verdict": "ok"})
     res = asyncio.run(run_health_checks(st, FakeSource({"ok": True})))
     assert not [c for c in res if c.kind == "llm_synth_down"]   # <3 不吵
+
+
+# ------------------------------------------------- v123 setup 開單速率突變
+def _mk_tj_db(tmp_path, entries):
+    """entries=[(setup, hours_ago)...] → 最小 paper_trades 表。"""
+    import sqlite3 as _sq
+    import time as _t
+    db = tmp_path / "trade_journal.db"
+    if db.exists():
+        db.unlink()
+    conn = _sq.connect(str(db))
+    conn.execute("CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, setup TEXT, "
+                 "entry_at INTEGER)")
+    now = _t.time() * 1000
+    conn.executemany("INSERT INTO paper_trades (setup, entry_at) VALUES (?, ?)",
+                     [(s, now - h * 3600_000) for s, h in entries])
+    conn.commit(); conn.close()
+    return tmp_path
+
+
+def test_setup_rate_surge_detects_dormant_awakening(monkeypatch, tmp_path):
+    """沉睡引擎甦醒（前7日0筆、24h 12筆）→ warn；穩定源（均速）不吵。"""
+    import botpaths as _bp
+    _mk_tj_db(tmp_path, [("intraday", i) for i in range(12)]          # 24h 內 12 筆
+              + [("deepdive", 30 + i * 12) for i in range(10)])       # deepdive 均速背景
+    monkeypatch.setattr(_bp, "db_path", lambda name: tmp_path / name)
+    monkeypatch.setattr(sup, "queue_stats", lambda: {"queued": 0, "failed": 0})
+    monkeypatch.setattr(sup, "capture_health", lambda **k: {"verdict": "ok"})
+    st = SupervisorState()
+    res = asyncio.run(run_health_checks(st, FakeSource({"ok": True})))
+    hits = [c for c in res if c.kind == "setup_rate_surge"]
+    assert len(hits) == 1 and hits[0].severity == "warn"
+    assert "intraday" in hits[0].message and "突變" in hits[0].message
+
+
+def test_setup_rate_surge_quiet_when_steady(monkeypatch, tmp_path):
+    """均速（24h 6筆 vs 日均5）→ 不告警；且 6h 自我節流生效。"""
+    import time as _t
+    import botpaths as _bp
+    _mk_tj_db(tmp_path, [("deepdive", i * 4) for i in range(6)]        # 24h 內 6 筆
+              + [("deepdive", 25 + i * 4.5) for i in range(35)])       # 前 7 日 35 筆 ≈5/日
+    monkeypatch.setattr(_bp, "db_path", lambda name: tmp_path / name)
+    monkeypatch.setattr(sup, "queue_stats", lambda: {"queued": 0, "failed": 0})
+    monkeypatch.setattr(sup, "capture_health", lambda **k: {"verdict": "ok"})
+    st = SupervisorState()
+    res = asyncio.run(run_health_checks(st, FakeSource({"ok": True})))
+    assert not [c for c in res if c.kind == "setup_rate_surge"]
+    # 節流：剛告警過 → 即使突變也不重複
+    st2 = SupervisorState(); st2.last_alert_per_kind["setup_rate_surge"] = _t.time()
+    _mk_tj_db(tmp_path, [("intraday", i) for i in range(15)])
+    res2 = asyncio.run(run_health_checks(st2, FakeSource({"ok": True})))
+    assert not [c for c in res2 if c.kind == "setup_rate_surge"]

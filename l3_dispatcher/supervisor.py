@@ -124,6 +124,40 @@ async def run_health_checks(state: SupervisorState, source) -> list[HealthCheck]
     except Exception:  # noqa: BLE001 — 無檔案/壞檔＝尚無資料，不告警
         pass
 
+    # === 1.6 各 setup 開單速率突變（v123）===
+    # 教訓 2026-07-06：intraday 突破引擎沉睡數月後在強趨勢中甦醒（3 天 62 筆、同幣疊 10 筆），
+    # 是使用者看持倉畫面先發現、不是監控——監督面從此觀測「每個訊號源的開單速率」：
+    # 近 24h ≥10 筆且 >4× 前 7 日日均 → warn（沉睡甦醒/迴圈異常/市場劇變皆值得人先知道）。
+    try:
+        if now - state.last_alert_per_kind.get("setup_rate_surge", 0) >= 6 * 3600:
+            import sqlite3 as _sq
+            from botpaths import db_path as _dbp
+            _conn = _sq.connect(f"file:{_dbp('trade_journal.db')}?mode=ro", uri=True)
+            try:
+                _now_ms = now * 1000
+                _r24 = dict(_conn.execute(
+                    "SELECT setup, COUNT(*) FROM paper_trades WHERE entry_at > ? "
+                    "GROUP BY setup", (_now_ms - 86400_000,)).fetchall())
+                _r7d = dict(_conn.execute(
+                    "SELECT setup, COUNT(*) FROM paper_trades WHERE entry_at BETWEEN ? AND ? "
+                    "GROUP BY setup", (_now_ms - 8 * 86400_000, _now_ms - 86400_000)).fetchall())
+            finally:
+                _conn.close()
+            for _s, _n24 in _r24.items():
+                _base = _r7d.get(_s, 0) / 7.0
+                if _n24 >= 10 and _n24 > 4 * max(_base, 1.0):
+                    results.append(HealthCheck(
+                        kind="setup_rate_surge",
+                        severity="warn",
+                        message=(f"訊號源 {_s} 開單速率突變：24h 開 {_n24} 筆 vs 前 7 日均 "
+                                 f"{_base:.1f} 筆/日——沉睡引擎甦醒或市場劇變，"
+                                 f"建議檢視疊倉/樣本純度"),
+                        detail={"setup": _s, "n24": _n24, "daily_base": round(_base, 2)},
+                    ))
+                    break     # 一次一則足矣（配合 6h 自我節流）
+    except Exception:  # noqa: BLE001 — 觀測性檢查失敗不致命
+        pass
+
     # === 2. Queue 塞車檢查 ===
     qs = queue_stats()
     queued = qs.get("queued", 0)
