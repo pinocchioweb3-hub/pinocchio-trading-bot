@@ -232,10 +232,20 @@ def _free_usdt(bal) -> float:
 
 
 async def _make_ex():
-    """每輪全新 ex（避免共享 headers 的 TOCTOU），先正向證明模擬盤。"""
+    """每輪全新 ex（避免共享 headers 的 TOCTOU），先正向證明模擬盤。
+
+    v125：confirm 失敗（網路抖動等）時必須先 close 再 raise——否則已建立的
+    aiohttp session 被 GC 時對 stderr 噴 Unclosed client session 警告（err.log 汙染）。"""
     from l4_execution import demo_guard
     ex = demo_guard.make_demo_exchange()
-    await demo_guard.confirm_okx_demo(ex)
+    try:
+        await demo_guard.confirm_okx_demo(ex)
+    except BaseException:
+        try:
+            await ex.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     return ex
 
 
