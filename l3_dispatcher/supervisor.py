@@ -158,6 +158,47 @@ async def run_health_checks(state: SupervisorState, source) -> list[HealthCheck]
     except Exception:  # noqa: BLE001 — 觀測性檢查失敗不致命
         pass
 
+    # === 1.6 系統資源健康（v128，使用者要求「定時排查電腦狀態」）===
+    # 背景：兩次「當機」驗屍無藍屏/無硬體錯誤，但 RAM 曾壓到 <11%（Chrome+多開
+    # Claude+WSL）——記憶體耗盡型凍機不留事件紀錄，正是無聲當機的頭號嫌疑。
+    # RAM 可用 <1.5GB→warn、<0.8GB→alert；C 槽 <10GB→warn、<3GB→alert。
+    # 自帶 3h 節流（資源吃緊常持續數小時，30 分一響太吵）。零依賴（ctypes+shutil）。
+    try:
+        import ctypes
+        import shutil as _sh
+
+        class _MEMSTAT(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        _ms = _MEMSTAT(); _ms.dwLength = ctypes.sizeof(_MEMSTAT)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(_ms))
+        _avail_gb = _ms.ullAvailPhys / 1024 ** 3
+        _free_gb = _sh.disk_usage("C:\\").free / 1024 ** 3
+        _sys_checks = []
+        if _avail_gb < 0.8:
+            _sys_checks.append(("sys_memory_low", "alert",
+                                f"記憶體僅剩 {_avail_gb:.1f}GB＝凍機高風險（無聲當機主嫌）"
+                                "——請關閉閒置的瀏覽器分頁/多餘 Claude 視窗"))
+        elif _avail_gb < 1.5:
+            _sys_checks.append(("sys_memory_low", "warn",
+                                f"記憶體吃緊（剩 {_avail_gb:.1f}GB）——建議關閉閒置應用，"
+                                "避免整機凍住（交易機器人本身僅佔 ~300MB）"))
+        if _free_gb < 3:
+            _sys_checks.append(("sys_disk_low", "alert", f"C 槽僅剩 {_free_gb:.1f}GB"))
+        elif _free_gb < 10:
+            _sys_checks.append(("sys_disk_low", "warn", f"C 槽偏低（剩 {_free_gb:.1f}GB）"))
+        for _kind, _sev, _msg in _sys_checks:
+            if now - state.last_alert_per_kind.get(_kind, 0) < 10800:   # 3h 自我節流
+                continue
+            results.append(HealthCheck(kind=_kind, severity=_sev, message=_msg,
+                                       detail={"ram_avail_gb": round(_avail_gb, 2),
+                                               "disk_free_gb": round(_free_gb, 1)}))
+    except Exception:  # noqa: BLE001 — 非 Windows/取值失敗＝不檢查，不告警
+        pass
+
     # === 2. Queue 塞車檢查 ===
     qs = queue_stats()
     queued = qs.get("queued", 0)

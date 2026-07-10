@@ -137,3 +137,45 @@ def test_setup_rate_surge_quiet_when_steady(monkeypatch, tmp_path):
     _mk_tj_db(tmp_path, [("intraday", i) for i in range(15)])
     res2 = asyncio.run(run_health_checks(st2, FakeSource({"ok": True})))
     assert not [c for c in res2 if c.kind == "setup_rate_surge"]
+
+
+# ------------------------------------------------- v128 系統資源健康
+def test_sys_health_thresholds_and_throttle(monkeypatch, tmp_path):
+    """低記憶體→告警(帶建議);3h 節流生效;資源充足→安靜。用假 ctypes/shutil 注入。"""
+    import time as _t
+    import botpaths as _bp
+    monkeypatch.setattr(_bp, "data_dir", lambda: tmp_path)   # synth_health 不存在→跳過
+    monkeypatch.setattr(_bp, "db_path", lambda name: tmp_path / name)
+    monkeypatch.setattr(sup, "queue_stats", lambda: {"queued": 0, "failed": 0})
+    monkeypatch.setattr(sup, "capture_health", lambda **k: {"verdict": "ok"})
+
+    import ctypes as _ct
+    import shutil as _shu
+
+    def _fake_memstat(avail_gb):
+        def fake_global(byref_obj):
+            obj = byref_obj._obj
+            obj.ullAvailPhys = int(avail_gb * 1024 ** 3)
+            return 1
+        return fake_global
+
+    class _FakeK32:
+        GlobalMemoryStatusEx = staticmethod(_fake_memstat(0.5))   # 0.5GB → alert
+    monkeypatch.setattr(_ct, "windll",
+                        type("W", (), {"kernel32": _FakeK32()})(), raising=False)
+    monkeypatch.setattr(_shu, "disk_usage",
+                        lambda p: type("D", (), {"free": 200 * 1024 ** 3})())  # 磁碟充足
+    st = SupervisorState()
+    res = asyncio.run(run_health_checks(st, FakeSource({"ok": True})))
+    hits = [c for c in res if c.kind == "sys_memory_low"]
+    assert len(hits) == 1 and hits[0].severity == "alert"
+    assert "凍機" in hits[0].message and "Claude" in hits[0].message
+    # 3h 節流：剛告警過 → 同輪再跑不重複
+    st.last_alert_per_kind["sys_memory_low"] = _t.time()
+    res2 = asyncio.run(run_health_checks(st, FakeSource({"ok": True})))
+    assert not [c for c in res2 if c.kind == "sys_memory_low"]
+    # 資源充足 → 安靜
+    _FakeK32.GlobalMemoryStatusEx = staticmethod(_fake_memstat(8.0))
+    st3 = SupervisorState()
+    res3 = asyncio.run(run_health_checks(st3, FakeSource({"ok": True})))
+    assert not [c for c in res3 if c.kind.startswith("sys_")]
