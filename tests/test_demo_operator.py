@@ -48,3 +48,40 @@ def test_alt_same_dir_cap_pure_gate():
     stale = three_bull_alts + [mk("LTC", "bull", "closed"), mk("OP", "bull", "rejected")]
     assert alt_same_dir_blocked("APT", "bull", stale, cap=3)       # 仍是 3 筆活的 → 擋
     assert not alt_same_dir_blocked("APT", "bull", three_bull_alts[:2], cap=3)  # 2<3 不擋
+
+
+# ------------------------------------------------- v127 智能動態倉位閘（使用者設計）
+def test_dynamic_slot_gate_base_and_max():
+    from l3_dispatcher.demo_operator import dynamic_slot_gate
+    mk = lambda s, st="open", ct=10.0: {"symbol": s, "pos_side": "short",
+                                        "status": st, "contracts": ct}
+    # 基礎槽：在場 2 < 3 → 放行
+    ok, why = dynamic_slot_gate([mk("ETH"), mk("SOL")], {}, base=3, bonus=2)
+    assert ok and "base_slot" in why
+    # 絕對上限：在場 5 ≥ 3+2 → 擋（就算全鎖利）
+    five = [mk(s) for s in ("A", "B", "C", "D", "E")]
+    sizes = {(t["symbol"], "short"): 4.0 for t in five}      # 全部已減倉=鎖利
+    ok, why = dynamic_slot_gate(five, sizes, base=3, bonus=2)
+    assert not ok and "max_slots" in why
+
+
+def test_dynamic_slot_gate_profit_unlock():
+    from l3_dispatcher.demo_operator import dynamic_slot_gate
+    mk = lambda s, st="open", ct=10.0: {"symbol": s, "pos_side": "short",
+                                        "status": st, "contracts": ct}
+    three = [mk("ETH"), mk("SOL"), mk("FIL")]
+    # ①三單皆已鎖利（OKX 現量 < 原始張數 → TP 腿落袋）→ 解鎖第 4 槽
+    locked = {("ETH", "short"): 4.0, ("SOL", "short"): 6.0, ("FIL", "short"): 5.0}
+    ok, why = dynamic_slot_gate(three, locked, base=3, bonus=2)
+    assert ok and "profit_unlocked" in why
+    # ②任一單未鎖利（現量=原始）→ 不解鎖
+    partial = {**locked, ("FIL", "short"): 10.0}
+    ok, why = dynamic_slot_gate(three, partial, base=3, bonus=2)
+    assert not ok and "FIL" in why
+    # ③有 pending 掛單 → 不可能鎖利 → 不解鎖
+    with_pending = three[:2] + [mk("APT", st="pending")]
+    ok, why = dynamic_slot_gate(with_pending, locked, base=3, bonus=2)
+    assert not ok and "pending" in why
+    # ④OKX 查不到現量 → fail-closed 不解鎖
+    ok, why = dynamic_slot_gate(three, {}, base=3, bonus=2)
+    assert not ok

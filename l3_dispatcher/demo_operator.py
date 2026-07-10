@@ -66,6 +66,13 @@ EARLY_CONVERT_PROGRESS_FRAC = float(os.getenv("DEMO_EARLY_CONVERT_PROGRESS_FRAC"
 #   BTC/ETH 之外同方向在場（pending+open）≥ MAX 筆 → 拒第 N+1 筆。純模擬盤風控。
 ALT_SAME_DIR_MAX = int(os.getenv("DEMO_ALT_SAME_DIR_MAX", "3"))
 _MAJORS = {"BTC", "ETH"}
+# v127（使用者設計「智能動態倉管」）：基礎槽位 3、盈利解鎖加碼槽 2。
+#   平時最多同時 3 單；只有當「全部在場單的 TP1 腿已在 OKX 實際成交＝利潤已落袋」
+#   （交易所現量 < 原始張數，讀真相非猜價格）才解鎖第 4/5 單——用已鎖定的利潤
+#   去買額外曝險，而非用本金疊注。⚠️鎖利判定＝TP 腿部分平倉落袋，非移動止損到保本
+#   （自家 1366 訊號 AB 已證保本移損顯著拖累 EV，不做）。
+DEMO_BASE_SLOTS = int(os.getenv("DEMO_BASE_SLOTS", "3"))
+DEMO_BONUS_SLOTS = int(os.getenv("DEMO_BONUS_SLOTS", "2"))
 TIME_LIMIT_HOURS = float(os.getenv("DEMO_TIME_LIMIT_HOURS", "24"))     # 持倉逾時平倉（鏡 demo_trader.TIME_LIMIT_HOURS=24）
 
 
@@ -188,6 +195,33 @@ def early_convert_ready(direction, entry_price, stop_price, cur_px, entry_at, no
         return False
     progress = (cur - entry) if direction == "bull" else (entry - cur)
     return progress >= pf * risk
+
+
+def dynamic_slot_gate(active_trades, okx_sizes, base=None, bonus=None) -> tuple[bool, str]:
+    """v127：智能動態倉位閘（純函式）。回 (放行?, 原因)。
+
+    規則（使用者設計）：
+      ①在場 < base → 放行（基礎槽）。
+      ②在場 ≥ base+bonus → 一律擋（絕對上限）。
+      ③base 已滿 → 只有「全部在場單已鎖利」才放行加碼槽：
+          鎖利 ＝ status='open' 且 OKX 實際張數 < 原始張數×0.99（TP 腿已成交落袋）。
+          pending 掛單不可能鎖利 → 有 pending 即不解鎖；OKX 現量查不到 → fail-closed 不解鎖。
+    active_trades=journal 在場列（pending+open）；okx_sizes={(symbol,pos_side): 現量張數}。"""
+    b = DEMO_BASE_SLOTS if base is None else base
+    x = DEMO_BONUS_SLOTS if bonus is None else bonus
+    n = len(active_trades or [])
+    if n < b:
+        return True, f"base_slot({n}/{b})"
+    if n >= b + x:
+        return False, f"max_slots({n}>={b + x})"
+    for t in active_trades:
+        if t.get("status") != "open":
+            return False, f"slots_full_pending未鎖利({t.get('symbol')})"
+        cur = okx_sizes.get((t.get("symbol"), t.get("pos_side")))
+        orig = float(t.get("contracts") or 0)
+        if cur is None or orig <= 0 or float(cur) >= orig * 0.99:
+            return False, f"slots_full_{t.get('symbol')}未鎖利"
+    return True, f"profit_unlocked_bonus({n + 1}/{b + x})"
 
 
 def alt_same_dir_blocked(symbol, direction, open_trades, cap=None) -> bool:
@@ -352,6 +386,19 @@ async def _place_one(ex, signal, *, avail_usd, tg=None) -> dict:
         return {"placed": False, "reason": plan.reject_reason}
 
     open_trades = dj.get_live_demo_trades()               # 桶風險：當下在倉清單
+    # v127（使用者設計）：智能動態倉位閘——平時最多 BASE 槽；全部在場單鎖利
+    #   （TP 腿已在 OKX 成交落袋）才解鎖 BONUS 加碼槽。OKX 讀取失敗→fail-closed 不解鎖。
+    try:
+        _okx_pos = await dt.fetch_okx_positions(ex)
+        _okx_sizes = {(p["symbol"], p["pos_side"]): p["contracts"] for p in _okx_pos}
+    except Exception:  # noqa: BLE001
+        _okx_sizes = {}
+    _slot_ok, _slot_why = dynamic_slot_gate(open_trades, _okx_sizes)
+    if not _slot_ok:
+        _record("rejected", f"reject:slot_gate:{_slot_why}", None,
+                f"智能倉位閘：{_slot_why}（基礎{DEMO_BASE_SLOTS}槽,鎖利解鎖至"
+                f"{DEMO_BASE_SLOTS + DEMO_BONUS_SLOTS}槽）")
+        return {"placed": False, "reason": f"slot_gate:{_slot_why}"}
     # v119（稽核rank7）：alt 同向總閘——非主流同方向在場已達上限，拒收（審計痕跡可查）
     if alt_same_dir_blocked(symbol, direction, open_trades):
         _record("rejected", "reject:alt_same_dir_cap", None,
