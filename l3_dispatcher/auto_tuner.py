@@ -199,9 +199,13 @@ async def _run_daily_review(tg) -> None:
     才寫覆寫表（樣本<30→0 晉升→零行為變更），真錢執行層永不讀（紅線①）。
     """
     # v56 task#52：每日先把已平倉樣本蒸餾進教訓庫（derived view，DB 為真相源）
+    # v129（監督員發現+RB-1）：本函式的同步重活（lessons 蒸餾/優化器數百桶重放/報告）
+    # 過去直接跑在事件迴圈上→整個 daemon 心跳停 ~24 分→watchdog 誤判死機、近 8 天 6 天
+    # 把 daemon 砍在復盤半路。修法＝同步段全部 to_thread（鏡像 v111 cycle 前例），
+    # 事件迴圈保持轉動、scheduler 心跳照常戳、watchdog 不再誤殺。
     try:
         from l3_dispatcher.lessons_store import rebuild_lessons_file
-        res = rebuild_lessons_file()
+        res = await asyncio.to_thread(rebuild_lessons_file)
         print(f"[auto_tuner] lessons rebuilt: {res['n']} 筆"
               f"（正向 {res['n_positive']}／僥倖 {res['n_lucky']}／賠 {res['n_loss']}）")
     except Exception as e:
@@ -212,7 +216,7 @@ async def _run_daily_review(tg) -> None:
     # （minTRL≥30 fail-closed、DSR/PBO/FDR），非人工逐次點頭。今日樣本<30→0 晉升→零行為變更。
     try:
         from l3_dispatcher import auto_optimizer
-        opt = auto_optimizer.run_optimization()
+        opt = await asyncio.to_thread(auto_optimizer.run_optimization)
         print(f"[auto_tuner] auto_optimizer: {opt['n_buckets']} 桶、"
               f"{opt['n_promoted']} 晉升")
         opt_rep = auto_optimizer.render_report(opt)
@@ -239,7 +243,7 @@ async def _run_daily_review(tg) -> None:
     except Exception as e:
         print(f"[auto_tuner] entry_policy_optimizer error: {type(e).__name__}: {e}")
     try:
-        rep = build_report()
+        rep = await asyncio.to_thread(build_report)
         if rep and tg is not None:
             await tg.send_message(rep, parse_mode="HTML")
             print("[auto_tuner] report sent")
