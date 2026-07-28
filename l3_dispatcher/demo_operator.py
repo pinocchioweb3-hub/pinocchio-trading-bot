@@ -676,6 +676,17 @@ async def _intake(ex, *, now_ms, tg=None) -> dict:
         summary["universe_size"] = len(uni)
     selected, new_hwm = select_new_signals(rows, hwm, now_ms, tradable_symbols=uni)
     summary["selected"] = len(selected)
+    # v138：被宇宙過濾的訊號要出聲留痕——OKX demo 環境只上列部分代幣化美股
+    # （實測 NVDA/MRVL 在、MU/SNDK/QQQ/SOXL 只在實盤），靜默跳過會讓鏡像缺口不可見。
+    # hwm 同輪推進過這些列，故每檔只印一次不洗版。
+    if uni is not None:
+        missed = sorted({(r.get("symbol") or "").upper() for r in rows
+                         if r.get("status") == "open"
+                         and (r.get("symbol") or "").upper() not in uni})
+        if missed:
+            summary["not_in_demo_universe"] = missed
+            print(f"[demo_op] intake：{','.join(missed)} 不在 OKX demo 可交易宇宙"
+                  "（demo 環境未上列；紙上照記、實盤金鑰後可交易）→ 跳過鏡像")
 
     if selected:
         bal = await ex.fetch_balance({"type": "swap"})
