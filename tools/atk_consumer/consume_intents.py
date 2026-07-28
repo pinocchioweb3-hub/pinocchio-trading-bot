@@ -41,8 +41,11 @@ RISK_USD = 100.0                 # 每筆風險預算（1R）
 RISK_USD_CAP = 150.0             # 風險絕對上限
 NOTIONAL_CAP_USD = 3000.0        # 單筆名義值上限（防張數換算出錯爆倉）
 LEVERAGE = 5                     # 保守槓桿（美股代幣永續上限 25x，取遠低於上限）
+TIMEOUT_HOURS = 24.0             # 持倉逾時強制平倉（對齊紙上 us_breakout 24h 口徑）
+DAILY_STOP_USD = 300.0           # 日虧熔斷（≈3R）：當日已實現虧損達此值→今日不再接新單
 OUTBOX = Path(os.path.expandvars(r"%LOCALAPPDATA%\TradingBot\intent_outbox"))
 STATE = Path(os.path.expandvars(r"%LOCALAPPDATA%\TradingBot\atk_consumer_state.json"))
+POS_STATE = Path(os.path.expandvars(r"%LOCALAPPDATA%\TradingBot\atk_positions.json"))
 
 
 # Windows 陷阱：npm 全域裝的 okx 是 okx.cmd shim，subprocess 不走 shell 找不到裸名
@@ -134,8 +137,107 @@ def ensure_leverage(inst_id: str, pos_side: str, dry: bool) -> None:
         print(f"⚠️ 設槓桿失敗 {inst_id}/{pos_side}（沿用現值繼續）：{out[:120]}")
 
 
+# ── 倉位管理（v139：對帳／逾時平倉／日虧熔斷） ──────────────────────────
+def _load_positions() -> dict:
+    try:
+        return json.loads(POS_STATE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {"open": {}, "day_pnl": {}}
+
+
+def _save_positions(ps: dict) -> None:
+    try:
+        POS_STATE.write_text(json.dumps(ps, ensure_ascii=False, indent=1),
+                             encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _day_key(ts: float | None = None) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(ts or time.time()))
+
+
+def timed_out(placed_at_s: float, now_s: float,
+              limit_h: float = TIMEOUT_HOURS) -> bool:
+    """持倉逾時判定（純函式）。"""
+    return (now_s - placed_at_s) > limit_h * 3600
+
+
+def breaker_tripped(day_pnl: dict, now_s: float | None = None,
+                    stop_usd: float = DAILY_STOP_USD) -> bool:
+    """日虧熔斷（純函式）：今日(UTC)已實現虧損 ≤ −stop_usd → True。"""
+    return float(day_pnl.get(_day_key(now_s), 0.0)) <= -abs(stop_usd)
+
+
+def _realized_pnl_since(inst_id: str, since_s: float) -> float | None:
+    """粗算該 instId 自 since 起的已實現損益（fillPnl+fee 合計）。查失敗回 None。"""
+    code, out = _okx(["swap", "fills", "--instId", inst_id])
+    if code != 0 or not out.strip().startswith(("[", "{")):
+        return None
+    try:
+        fills = json.loads(out)
+        fills = fills if isinstance(fills, list) else fills.get("data", [])
+        total = 0.0
+        for f in fills:
+            ts = float(f.get("ts") or 0) / 1000.0
+            if ts >= since_s:
+                total += float(f.get("fillPnl") or 0) + float(f.get("fee") or 0)
+        return total
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def manage_positions(dry: bool) -> None:
+    """每輪管理：①對帳（OKX 上已消失＝TP/SL 已了結→記日損益）②逾時強平。
+    任何查詢失敗→本輪跳過該倉不猜（下輪重試）。"""
+    ps = _load_positions()
+    if not ps.get("open"):
+        return
+    code, out = _okx(["account", "positions"])
+    if code != 0 or not out.strip().startswith(("[", "{")):
+        return                                   # 查不到就不動，別誤判平倉
+    plist = json.loads(out)
+    plist = plist if isinstance(plist, list) else plist.get("data", [])
+    live = {(p.get("instId"), p.get("posSide")): float(p.get("pos") or 0)
+            for p in plist}
+    now_s = time.time()
+    for iid, rec in list(ps["open"].items()):
+        key = (rec["inst_id"], rec["pos_side"])
+        if live.get(key, 0.0) == 0.0:
+            # 已了結（TP/SL/手動）→ 記日損益後移出
+            pnl = _realized_pnl_since(rec["inst_id"], rec["placed_at"])
+            if pnl is not None:
+                dk = _day_key()
+                ps["day_pnl"][dk] = float(ps["day_pnl"].get(dk, 0.0)) + pnl
+                print(f"🏁 {rec['inst_id']} {rec['pos_side']} 已了結，"
+                      f"已實現≈{pnl:+.2f} USDT（今日累計 {ps['day_pnl'][dk]:+.2f}）")
+            else:
+                print(f"🏁 {rec['inst_id']} {rec['pos_side']} 已了結（損益查詢失敗，"
+                      "不計入熔斷口徑）")
+            ps["open"].pop(iid, None)
+        elif timed_out(rec["placed_at"], now_s):
+            if dry:
+                print(f"DRY-RUN: 逾時平倉 {rec['inst_id']} {rec['pos_side']}")
+                continue
+            code, out = _okx(["swap", "close", "--instId", rec["inst_id"],
+                              "--mgnMode", "isolated",
+                              "--posSide", rec["pos_side"], "--autoCxl"])
+            print(("⏱ 逾時平倉已送出 " if code == 0 else "❌ 逾時平倉失敗 ")
+                  + f"{rec['inst_id']}（持有 {(now_s - rec['placed_at']) / 3600:.1f}h）"
+                  + ("" if code == 0 else f"：{out[:120]}"))
+            # 不立即移出：下輪對帳確認消失後才記損益
+    # 舊日損益只留 14 天
+    ps["day_pnl"] = {k: v for k, v in ps["day_pnl"].items()
+                     if k >= _day_key(time.time() - 14 * 86400)}
+    _save_positions(ps)
+
+
 def place(intent: dict, sz: float, dry: bool) -> bool:
-    """市價開倉＋附掛 TP1/SL（attach 式，避開官方 #15 計畫委託 bug）。"""
+    """市價開倉＋附掛 TP1/SL（attach 式，避開官方 #15 計畫委託 bug）。
+
+    誠實註記：目前為「TP1 全平」口徑（觸及 TP1 平全倉），與紙上帳的 TP1/2/3
+    分批階梯不同——首階段實測的紙上vs實際基差之一，30 筆驗證期會量測後再決定
+    是否上分批（多腿附掛）。"""
     ensure_leverage(intent["inst_id"], intent["pos_side"], dry)
     args = ["swap", "place",
             "--instId", intent["inst_id"],
@@ -174,6 +276,12 @@ def main() -> int:
 
     while True:
         now_ms = time.time() * 1000
+        # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
+        manage_positions(a.dry_run)
+        halted_today = breaker_tripped(_load_positions().get("day_pnl", {}))
+        if halted_today:
+            print(f"⛔ 日虧熔斷已觸發（≤ -{DAILY_STOP_USD:.0f} USDT）——今日不接新單，"
+                  "既有倉位照常管理")
         for p in sorted(OUTBOX.glob("*.json")):
             try:
                 intent = json.loads(p.read_text(encoding="utf-8"))
@@ -190,6 +298,8 @@ def main() -> int:
                 print(f"⏭ {iid} {intent.get('symbol')} 已過期——跳過")
                 done.add(iid)
                 continue
+            if halted_today:
+                continue                     # 熔斷日不接新單；intent 未記 done，明日過期自清
             sz = contracts_for(intent["inst_id"], intent["entry"], intent["stop"], ct_cache)
             if sz is None:
                 print(f"❌ {iid} 張數換算失敗——跳過（不猜）")
@@ -199,6 +309,14 @@ def main() -> int:
             # intent 過期窗兜底——永久性錯誤最多重試到 expires_at）
             if place(intent, sz, a.dry_run):
                 done.add(iid)
+                if not a.dry_run:
+                    ps = _load_positions()
+                    ps["open"][iid] = {"inst_id": intent["inst_id"],
+                                       "pos_side": intent["pos_side"],
+                                       "symbol": intent.get("symbol"),
+                                       "contracts": sz,
+                                       "placed_at": time.time()}
+                    _save_positions(ps)
         state["done"] = sorted(done)[-500:]
         try:
             STATE.write_text(json.dumps(state), encoding="utf-8")
