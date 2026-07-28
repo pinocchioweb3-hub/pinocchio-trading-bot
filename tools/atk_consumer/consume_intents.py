@@ -116,8 +116,27 @@ def contracts_for(inst_id: str, entry: float, stop: float, ct_val_cache: dict) -
     return round(sz, 8)
 
 
+_LEV_SET: set = set()
+
+
+def ensure_leverage(inst_id: str, pos_side: str, dry: bool) -> None:
+    """開單前設槓桿（v99 教訓：OKX 預設 3x，hedge 模式 isolated 必須帶 posSide 逐邊設，
+    否則靜默沿用預設）。失敗只警告不擋單——槓桿影響資金效率，風險由止損距離決定。"""
+    key = (inst_id, pos_side)
+    if dry or key in _LEV_SET:
+        return
+    code, out = _okx(["swap", "leverage", "--instId", inst_id,
+                      "--lever", str(LEVERAGE), "--mgnMode", "isolated",
+                      "--posSide", pos_side])
+    if code == 0:
+        _LEV_SET.add(key)
+    else:
+        print(f"⚠️ 設槓桿失敗 {inst_id}/{pos_side}（沿用現值繼續）：{out[:120]}")
+
+
 def place(intent: dict, sz: float, dry: bool) -> bool:
     """市價開倉＋附掛 TP1/SL（attach 式，避開官方 #15 計畫委託 bug）。"""
+    ensure_leverage(intent["inst_id"], intent["pos_side"], dry)
     args = ["swap", "place",
             "--instId", intent["inst_id"],
             "--side", intent["side"],
@@ -126,8 +145,8 @@ def place(intent: dict, sz: float, dry: bool) -> bool:
             "--sz", str(sz),
             "--tdMode", "isolated",
             "--clOrdId", intent["cl_ord_id"],
-            "--tpTriggerPx", str(intent["tp1"]), "--tpOrdPx", "-1",
-            "--slTriggerPx", str(intent["stop"]), "--slOrdPx", "-1"]
+            "--tpTriggerPx", str(intent["tp1"]), "--tpOrdPx=-1",
+            "--slTriggerPx", str(intent["stop"]), "--slOrdPx=-1"]
     if dry:
         print("DRY-RUN:", "okx --profile demo " + " ".join(args))
         return True
@@ -176,8 +195,10 @@ def main() -> int:
                 print(f"❌ {iid} 張數換算失敗——跳過（不猜）")
                 done.add(iid)
                 continue
-            place(intent, sz, a.dry_run)
-            done.add(iid)
+            # 只在成功時記已處理：失敗留給下輪重試（OKX clOrdId 冪等擋重複成交，
+            # intent 過期窗兜底——永久性錯誤最多重試到 expires_at）
+            if place(intent, sz, a.dry_run):
+                done.add(iid)
         state["done"] = sorted(done)[-500:]
         try:
             STATE.write_text(json.dumps(state), encoding="utf-8")
