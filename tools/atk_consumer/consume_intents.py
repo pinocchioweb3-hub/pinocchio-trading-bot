@@ -242,31 +242,111 @@ def manage_positions(dry: bool) -> None:
     _save_positions(ps)
 
 
-def place(intent: dict, sz: float, dry: bool) -> bool:
-    """市價開倉＋附掛 TP1/SL（attach 式，避開官方 #15 計畫委託 bug）。
+TP_WEIGHTS3 = (0.40, 0.30, 0.30)   # 對齊 demo 帳 TP1/2/3 分腿口徑（尾腿吃餘數）
 
-    誠實註記：目前為「TP1 全平」口徑（觸及 TP1 平全倉），與紙上帳的 TP1/2/3
-    分批階梯不同——首階段實測的紙上vs實際基差之一，30 筆驗證期會量測後再決定
-    是否上分批（多腿附掛）。"""
-    ensure_leverage(intent["inst_id"], intent["pos_side"], dry)
-    args = ["swap", "place",
+
+def split_tp_levels(sz: float, lot: float, min_sz: float,
+                    tps: list[float]) -> list[tuple[float, float]]:
+    """分批止盈分腿（純函式）。tps=有價位的 TP 清單（1~3 個）。
+    回 [(觸發價, 腿張數)...]：權重 3腿=40/30/30、2腿=50/50、1腿=100%；
+    各腿 floor 到 lot、尾腿吃餘數；不足 minSz 的腿併入尾腿。"""
+    tps = [p for p in tps if p]
+    if not tps or sz <= 0:
+        return []
+    weights = {1: (1.0,), 2: (0.5, 0.5), 3: TP_WEIGHTS3}[min(len(tps), 3)]
+    legs: list[tuple[float, float]] = []
+    used = 0.0
+    for i, (px, w) in enumerate(zip(tps, weights)):
+        if i == len(weights) - 1:
+            leg = round(sz - used, 8)                    # 尾腿吃餘數
+        else:
+            leg = int(sz * w / lot) * lot
+        if leg < min_sz:
+            continue                                      # 太小的腿讓尾腿吸收
+        legs.append((px, round(leg, 8)))
+        used = round(used + leg, 8)
+    if not legs:                                          # 全部太小→單腿 100%
+        return [(tps[0], sz)]
+    # 若中間腿被跳過導致餘數沒分完，把差額補到最後一腿
+    diff = round(sz - sum(l for _, l in legs), 8)
+    if diff > 0:
+        px, l = legs[-1]
+        legs[-1] = (px, round(l + diff, 8))
+    return legs
+
+
+def _leg_args(intent: dict, leg_sz: float, tp_px: float, cl_ord_id: str) -> list[str]:
+    """單腿下單參數：市價進場＋附掛該腿 TP＋整段 SL（OCO，已驗證原語）。"""
+    return ["swap", "place",
             "--instId", intent["inst_id"],
             "--side", intent["side"],
             "--posSide", intent["pos_side"],
             "--ordType", "market",
-            "--sz", str(sz),
+            "--sz", str(leg_sz),
             "--tdMode", "isolated",
-            "--clOrdId", intent["cl_ord_id"],
-            "--tpTriggerPx", str(intent["tp1"]), "--tpOrdPx=-1",
+            "--clOrdId", cl_ord_id,
+            "--tpTriggerPx", str(tp_px), "--tpOrdPx=-1",
             "--slTriggerPx", str(intent["stop"]), "--slOrdPx=-1"]
-    if dry:
-        print("DRY-RUN:", "okx --profile demo " + " ".join(args))
+
+
+def _leg_ok(code: int, out: str) -> bool:
+    """腿級下單成功判定：sCode=0。"""
+    return code == 0 and ('"sCode": "0"' in out or '"sCode":"0"' in out)
+
+
+def _order_exists(inst_id: str, cl_ord_id: str) -> bool | None:
+    """該 clOrdId 的單是否已存在（含已成交）。回 True/False/None(查詢失敗)。
+
+    ⚠️ 真冪等的關鍵（2026-07-29 demo 活測教訓）：OKX 只對「掛單中」的 clOrdId
+    擋重複——市價單成交後同 clOrdId 可再下＝重試會加倍持倉。所以每腿下單前
+    必須先查單，查到任何狀態（含 filled）都算已處理；查詢失敗→不下單（fail-closed）。"""
+    code, out = _okx(["swap", "get", "--instId", inst_id, "--clOrdId", cl_ord_id])
+    if code == 0 and '"ordId"' in out:
         return True
-    code, out = _okx(args)
-    ok = code == 0
-    print(("✅" if ok else "❌") + f" {intent['inst_id']} {intent['side']} sz={sz} "
-          f"→ {out[:200]}")
-    return ok
+    if "51603" in out or "doesn't exist" in out or "does not exist" in out:
+        return False
+    return None
+
+
+def place(intent: dict, sz: float, dry: bool,
+          spec: dict | None = None) -> bool:
+    """分批止盈下單（v140）：拆成多筆市價進場單，各帶「自己那腿的 TP＋同一止損價」
+    的附掛 OCO——只用已驗證的單附掛原語（CLI --tpLevel 多腿會丟失 SL，activedemo
+    實測 50015/無SL，不可用）。OKX 同向合併成一倉，各 OCO 管自己那段：
+    TP1 觸發→只平那腿、其餘腿的 SL 續存＝與紙上 40/30/30 階梯同語義。
+    每腿 clOrdId 加尾碼 a/b/c 冪等；部分失敗→回 False 由外層重試（已成腿撞
+    51016 重複視為成功，不會重複開倉）。單一 TP 時維持原單筆路徑。"""
+    ensure_leverage(intent["inst_id"], intent["pos_side"], dry)
+    tps = [intent.get("tp1"), intent.get("tp2"), intent.get("tp3")]
+    legs = (split_tp_levels(sz, spec["lotSz"], spec["minSz"], tps)
+            if spec else [])
+    if len(legs) < 2:
+        legs = [(float(intent["tp1"]), sz)]
+    all_ok = True
+    for i, (tp_px, leg_sz) in enumerate(legs):
+        cl = (f"{intent['cl_ord_id']}{chr(97 + i)}" if len(legs) > 1
+              else intent["cl_ord_id"])[:24]
+        args = _leg_args(intent, leg_sz, tp_px, cl)
+        if dry:
+            print("DRY-RUN:", "okx --profile demo " + " ".join(args))
+            continue
+        # 真冪等：下單前先查此腿 clOrdId 是否已存在（含已成交）——
+        # OKX 不擋已成交市價單的 clOrdId 重用，重試盲下會加倍持倉
+        exists = _order_exists(intent["inst_id"], cl)
+        if exists is True:
+            print(f"↩️ 腿{i + 1}/{len(legs)} clOrdId={cl} 已存在（上輪已成）——跳過")
+            continue
+        if exists is None:
+            print(f"⚠️ 腿{i + 1}/{len(legs)} 查單失敗——本輪不下這腿（fail-closed，下輪重試）")
+            all_ok = False
+            continue
+        code, out = _okx(args)
+        ok = _leg_ok(code, out)
+        all_ok = all_ok and ok
+        print(("✅" if ok else "❌")
+              + f" {intent['inst_id']} {intent['side']} 腿{i + 1}/{len(legs)} "
+              f"sz={leg_sz} tp={tp_px} → {out[:160]}")
+    return all_ok
 
 
 def main() -> int:
@@ -317,7 +397,7 @@ def main() -> int:
                 continue
             # 只在成功時記已處理：失敗留給下輪重試（OKX clOrdId 冪等擋重複成交，
             # intent 過期窗兜底——永久性錯誤最多重試到 expires_at）
-            if place(intent, sz, a.dry_run):
+            if place(intent, sz, a.dry_run, spec=ct_cache.get(intent["inst_id"])):
                 done.add(iid)
                 if not a.dry_run:
                     ps = _load_positions()
