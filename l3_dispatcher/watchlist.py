@@ -130,10 +130,29 @@ class WatchlistManager:
         # silently `continue`（見 coinglass.py），使回傳 items 少於請求數＝模型對市場
         # 部分失明。這裡用「請求數 vs 回傳數」算出被丟幾檔，先量測截斷率再決定是否治本。
         # items / chosen 照常往下走 → 不改候選覆蓋、不過回測閘、不碰任何下單數學。
+        # v141：CoinGlass 訂閱 2026-07-08 到期（帳單證實）→ 宇宙空時自動降級用
+        # 免費 OKX 大宗源（free_strength_universe，讀 scanner.db 零網路）。
+        # 閘的分寸：EV 回測閘管的是「取代活著的 CG」；此處只在 CG 給零檔（=全盲）
+        # 時頂上——有東西永遠勝過失明。CG 若復活（items 非空）自動回主源，
+        # 屆時「免費源當主源」仍須過回測閘。provenance 全程留痕（紅線③）。
+        universe_source = "coinglass"
+        if not items:
+            try:
+                from l3_dispatcher.free_strength_universe import build_free_universe
+                free = build_free_universe(pool)
+                if free.get("items"):
+                    items = free["items"]
+                    universe_source = "okx_free_fallback"
+                    print(f"[refresh] ⚠️ CoinGlass 宇宙空（訂閱到期）→ 降級用免費 "
+                          f"OKX 大宗源 {len(items)} 檔（provenance=okx_free_fallback）")
+            except Exception as e:  # noqa: BLE001 — 降級失敗回原空宇宙行為
+                print(f"[refresh] 免費源降級失敗（維持原行為）：{type(e).__name__}: {e}")
+
         n_universe = len(items)
         n_dropped = max(0, n_pool - n_universe)
         universe_telemetry = {"n_pool": n_pool, "n_universe": n_universe,
-                              "n_dropped": n_dropped, "errored": False}
+                              "n_dropped": n_dropped, "errored": False,
+                              "universe_source": universe_source}
 
         # 硬性過濾（低流動性、極端漲跌、過熱費率）
         # 註：ret_7d_pct 由 mi_get_strength_universe 用 ret_24h × 5 估算
@@ -200,9 +219,11 @@ class WatchlistManager:
         #   決策證據。重用同一輪 CoinGlass items（不另 burst）、零網路（讀 scanner.db）。
         #   絕不影響 chosen；任何錯誤吞掉續跑。
         try:
-            from l3_dispatcher.free_strength_universe import (
-                append_shadow, compare_universes)
-            append_shadow(compare_universes(pool, items, chosen, self.trading_size))
+            # v141：降級模式下 items 本身就是免費源——自比對無意義，跳過影子
+            if universe_source == "coinglass":
+                from l3_dispatcher.free_strength_universe import (
+                    append_shadow, compare_universes)
+                append_shadow(compare_universes(pool, items, chosen, self.trading_size))
         except Exception:
             pass
 
