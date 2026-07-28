@@ -629,11 +629,28 @@ async def _monitor(ex, *, now_ms, tg=None) -> dict:
         okx_list, tracked_keys, external_ok_keys=atk_external_keys())
     if should_halt:
         dj.set_halt(reason)
+        dj.set_state("halt_clear_streak", "0")
         summary["halt"] = reason
         _notify(tg, f"⛔ 模擬盤操盤手對帳漂移 → 已停新單：{reason}")
-    elif untracked:
-        # ATK 消費鏈的已知外部單——只記錄不 halt（v134）
-        summary["atk_external"] = len(untracked)
+    else:
+        if untracked:
+            # ATK 消費鏈的已知外部單——只記錄不 halt（v134）
+            summary["atk_external"] = len(untracked)
+        # v137：halt 自動復核——漂移已消失（本輪完整對帳零敵意未追蹤倉）連續 2 輪
+        # 才自動解除，防 API 瞬時空回應誤清。7/09 殘閂靜默鎖 intake 19 天的治本。
+        was_halted, old_reason = dj.is_halted()
+        if was_halted:
+            streak = int(dj.get_state("halt_clear_streak", "0") or 0) + 1
+            if streak >= 2:
+                dj.clear_halt()
+                dj.set_state("halt_clear_streak", "0")
+                summary["halt_cleared"] = old_reason
+                print(f"[demo_op] ✅ 對帳漂移已消失（連續{streak}輪乾淨）→ 自動解除停單"
+                      f"（原因曾為：{old_reason}）")
+                _notify(tg, f"✅ 模擬盤停單自動解除：對帳漂移已消失（原：{old_reason}）")
+            else:
+                dj.set_state("halt_clear_streak", str(streak))
+                summary["halt_clear_pending"] = streak
     return summary
 
 
@@ -729,6 +746,7 @@ async def run_demo_operator_loop(interval_s: int = 180, tg=None):
     空轉（兩把鑰匙未開）時安靜不洗版；有錯誤才印。"""
     import asyncio
     await asyncio.sleep(20)
+    last_halt_log = 0.0
     while True:
         try:
             res = await run_demo_operator_cycle(tg=tg)
@@ -740,6 +758,14 @@ async def run_demo_operator_loop(interval_s: int = 180, tg=None):
                 if any(mon.get(k) for k in ("filled", "closed", "expired",
                                             "timeout_initiated")) or ink.get("placed"):
                     print(f"[demo_op] cycle: monitor={mon} intake={ink}")
+                # v137：halted 狀態每小時至少出聲一次——7/09 殘閂靜默 19 天的教訓，
+                # 停擺不可以是隱形的
+                if res.get("intake_skipped", "").startswith("halted"):
+                    now = time.time()
+                    if now - last_halt_log > 3600:
+                        last_halt_log = now
+                        print(f"[demo_op] ⏸ intake 停單中（{res['intake_skipped']}）"
+                              "——漂移消失會自動解除；手動解除：--clear-halt")
         except Exception as e:  # noqa: BLE001
             print(f"[demo_op] loop error: {type(e).__name__}: {e}")
         await asyncio.sleep(interval_s)
@@ -863,7 +889,21 @@ if __name__ == "__main__":
     ap.add_argument("--status", action="store_true", help="列帳本/高水位/halt（零下單）")
     ap.add_argument("--cycle-once", action="store_true",
                     help="連 OKX 跑一輪（受兩把鑰匙與 kill switch 約束）")
+    ap.add_argument("--clear-halt", action="store_true",
+                    help="手動解除對帳漂移停單旗標（v137；先自行確認 OKX 無殘留持倉）")
     args = ap.parse_args()
+
+    if args.clear_halt:
+        from l3_dispatcher import demo_journal as _dj
+        _dj.init_db()
+        was, why = _dj.is_halted()
+        if was:
+            _dj.clear_halt()
+            _dj.set_state("halt_clear_streak", "0")
+            print(f"已解除 halt（原因曾為：{why}）")
+        else:
+            print("目前沒有 halt，無事可做")
+        raise SystemExit(0)
 
     # --status / --cycle-once 要連線/讀帳本 → 需 .env（金鑰、旗標）；--selftest 保持離線無 env。
     if args.status or getattr(args, "cycle_once", False):

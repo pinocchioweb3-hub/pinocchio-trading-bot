@@ -179,17 +179,22 @@ def fetch_dominance_today() -> Optional[float]:
 
 
 def dominance_direction_90d(history: list[tuple[int, float]]) -> Optional[bool]:
-    """90 日方向：需本地累積 ≥30 天（每日 shadow 記一點）才判——不足誠實回 None。
-    history=[(ts_ms, dominance_pct)...]。"""
+    """90 日方向：需本地累積 ≥30 個「不重複日」才判——不足誠實回 None。
+    history=[(ts_ms, dominance_pct)...]。
+    v137：daemon 重啟補跑會造成同日多點——按 UTC 日去重取末筆再數天數與算首尾
+    7 日均，否則點數灌水提早過閘、7 日平滑塌縮成同日重複值（稽核實證 51 點僅 25 日）。"""
     if not history:
         return None
     now = time.time() * 1000
     window = [(t, v) for t, v in history if now - t <= 90 * 86400_000]
-    if len(window) < 30:
+    by_day: dict[int, float] = {}
+    for t, v in sorted(window):
+        by_day[int(t // 86400_000)] = v          # 同日取末筆
+    days = [by_day[k] for k in sorted(by_day)]
+    if len(days) < 30:
         return None
-    window.sort()
-    first_avg = sum(v for _, v in window[:7]) / min(7, len(window))
-    last_avg = sum(v for _, v in window[-7:]) / min(7, len(window))
+    first_avg = sum(days[:7]) / 7
+    last_avg = sum(days[-7:]) / 7
     return last_avg > first_avg
 
 

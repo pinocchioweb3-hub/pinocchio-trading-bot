@@ -204,11 +204,43 @@ def run_cycle_once() -> tuple[list[dict], str]:
     return reads, card
 
 
+def _last_dashboard_age_s() -> Optional[float]:
+    """cycle_shadow.jsonl 最後一筆 bottom_dashboard 的年齡（秒）。無紀錄回 None。"""
+    last_ts = None
+    try:
+        with open(SHADOW_LOG, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if rec.get("record_type") == "bottom_dashboard" and rec.get("ts"):
+                    last_ts = float(rec["ts"])
+    except Exception:  # noqa: BLE001
+        return None
+    if last_ts is None:
+        return None
+    if last_ts > 1e12:                      # ms → s
+        last_ts /= 1000.0
+    return max(0.0, time.time() - last_ts)
+
+
 async def run_cycle_loop(tg=None, interval_seconds: int = 86400):
     """24/7 週期觀測 worker（每日一輪）。tg=已綁定 cycle 主題的 client（缺則不推、僅寫log）。
 
     影子鐵則：純觀測；不 import strength/fire；不下單；不碰真錢。"""
     await asyncio.sleep(120)   # 啟動延後，讓快取/掃描先暖機
+    # v137：啟動守衛（仿 daily_macro startup skip）——20h 內已發過儀表板就不重跑首輪，
+    # 治「部署重啟日 🌊 同分卡連發 7 張＋dominance 歷史同日灌水」（2026-07-28 稽核實證）
+    try:
+        age_s = _last_dashboard_age_s()
+        if age_s is not None and age_s < 20 * 3600:
+            wait = max(600, int(interval_seconds) - int(age_s))
+            print(f"[cycle] startup skip（{age_s / 3600:.1f}h 前已發過儀表板），"
+                  f"{wait / 3600:.1f}h 後再跑")
+            await asyncio.sleep(wait)
+    except Exception:  # noqa: BLE001
+        pass
     while True:
         try:
             # v111：run_cycle_once 內含外網抓取(CM CSV 可達數十秒)——丟 thread 避免阻塞事件迴圈
