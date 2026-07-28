@@ -163,10 +163,20 @@ def timed_out(placed_at_s: float, now_s: float,
     return (now_s - placed_at_s) > limit_h * 3600
 
 
+WEEKLY_STOP_USD = 750.0          # 週虧熔斷（≈7.5R）：近 7 日合計虧損達此值→停接新單
+
+
 def breaker_tripped(day_pnl: dict, now_s: float | None = None,
-                    stop_usd: float = DAILY_STOP_USD) -> bool:
-    """日虧熔斷（純函式）：今日(UTC)已實現虧損 ≤ −stop_usd → True。"""
-    return float(day_pnl.get(_day_key(now_s), 0.0)) <= -abs(stop_usd)
+                    stop_usd: float = DAILY_STOP_USD,
+                    week_stop_usd: float = WEEKLY_STOP_USD) -> bool:
+    """日/週雙層熔斷（純函式）：今日(UTC)已實現虧損 ≤ −stop_usd，
+    或近 7 日(UTC)合計 ≤ −week_stop_usd → True。"""
+    now_s = now_s or time.time()
+    if float(day_pnl.get(_day_key(now_s), 0.0)) <= -abs(stop_usd):
+        return True
+    week_keys = {_day_key(now_s - d * 86400) for d in range(7)}
+    week_total = sum(float(v) for k, v in day_pnl.items() if k in week_keys)
+    return week_total <= -abs(week_stop_usd)
 
 
 def _realized_pnl_since(inst_id: str, since_s: float) -> float | None:

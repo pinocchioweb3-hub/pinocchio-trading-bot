@@ -30,10 +30,20 @@ def test_breaker_holds_on_small_loss_or_profit():
     assert not ci.breaker_tripped({}, now, stop_usd=300.0)
 
 
-def test_breaker_ignores_yesterday():
+def test_breaker_daily_ignores_yesterday_but_weekly_catches_it():
     now = time.time()
     yesterday = ci._day_key(now - 86400)
-    assert not ci.breaker_tripped({yesterday: -9999.0}, now, stop_usd=300.0)
+    # 昨日大虧不觸發「日」熔斷，但 ≤−750 觸發「週」熔斷
+    assert ci.breaker_tripped({yesterday: -9999.0}, now, stop_usd=300.0)
+    # 週窗內小虧合計未達 −750 → 不觸發
+    spread = {ci._day_key(now - d * 86400): -100.0 for d in range(7)}
+    assert not ci.breaker_tripped(spread, now, stop_usd=300.0, week_stop_usd=750.0)
+    # 週窗內合計 −770 → 觸發
+    spread2 = {ci._day_key(now - d * 86400): -110.0 for d in range(7)}
+    assert ci.breaker_tripped(spread2, now, stop_usd=300.0, week_stop_usd=750.0)
+    # 8 天前的舊虧不入週窗
+    old = {ci._day_key(now - 8 * 86400): -9999.0}
+    assert not ci.breaker_tripped(old, now, stop_usd=300.0, week_stop_usd=750.0)
 
 
 def test_profile_hardcoded_demo():
