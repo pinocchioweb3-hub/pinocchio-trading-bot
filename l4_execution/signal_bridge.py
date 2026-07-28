@@ -87,7 +87,8 @@ def scan_new_events(last_id: int, sent: set) -> tuple[list[dict], int]:
     try:
         rows = conn.execute(
             "SELECT id, symbol, direction, status FROM paper_trades "
-            "WHERE setup='deepdive' AND id > ? ORDER BY id", (last_id - 200,)
+            "WHERE setup IN ('deepdive','us_breakout') AND id > ? ORDER BY id",
+            (last_id - 200,)
         ).fetchall()
         for pid, sym, direction, status in rows:
             max_id = max(max_id, pid)
