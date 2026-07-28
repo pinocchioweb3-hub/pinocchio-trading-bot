@@ -1669,7 +1669,7 @@ async def run_performance_loop(tg, target_hour_utc: int = 0,
             # v21-B: 成績卡圖片（最近 6 筆已平倉，輸贏都上卡）
             try:
                 from .report_card import render_report_cards
-                card = render_report_cards(6)
+                card = await asyncio.to_thread(render_report_cards, 6)
                 if card:
                     await tg.send_photo(card, caption="🗂 最近平倉成績卡（紙上驗證帳，不挑單）")
             except Exception as e:
@@ -1679,7 +1679,7 @@ async def run_performance_loop(tg, target_hour_utc: int = 0,
             #      純讀 paper_trades，各引擎分線，誠實標註「紙上模擬・非實盤」。
             try:
                 from .equity_curve import render_equity_curve
-                curve = render_equity_curve()
+                curve = await asyncio.to_thread(render_equity_curve)
                 if curve:
                     await tg.send_photo(curve, caption=(
                         "📈 紙上驗證帳累積 R 走勢（非實盤績效・兩引擎分線・"

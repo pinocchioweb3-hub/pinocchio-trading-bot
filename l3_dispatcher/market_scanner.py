@@ -439,7 +439,7 @@ async def run_market_scanner_loop(tg, interval_seconds: int = 300):
                     try:
                         from l3_dispatcher.scanner_viz import (
                             quadrant_summary_line, render_quadrant_chart)
-                        chart = render_quadrant_chart()
+                        chart = await asyncio.to_thread(render_quadrant_chart)
                         if chart:
                             cap = ("🧭 全市場資金流向圖（4h OI × 價格）\n"
                                    + quadrant_summary_line())

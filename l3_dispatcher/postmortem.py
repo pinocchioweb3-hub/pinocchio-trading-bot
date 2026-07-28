@@ -1058,14 +1058,14 @@ async def run_postmortem_loop(tg, scan_interval_seconds: int = 21600,
     last_weekly_date: str | None = None
     while True:
         try:
-            stats = run_scan_once()
+            stats = await asyncio.to_thread(run_scan_once)
             print(f"[postmortem] scan: new={stats['n_new']} total={stats['n_total']}")
 
             now = dt.datetime.now(tz=dt.timezone.utc)
             today_key = now.strftime("%Y-%m-%d")
             # 週一且到點且今天還沒推過 → 推週報
             if now.weekday() == 0 and now.hour >= weekly_hour_utc and last_weekly_date != today_key:
-                rep = build_weekly_report()
+                rep = await asyncio.to_thread(build_weekly_report)
                 if rep and tg is not None:
                     await tg.send_message(rep, parse_mode="HTML")
                     print("[postmortem] weekly report sent")

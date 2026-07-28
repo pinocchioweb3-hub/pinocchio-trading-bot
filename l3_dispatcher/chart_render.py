@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -856,7 +857,9 @@ async def render_symbol_chart(symbol: str, tf: str = "4h", bars: int = 120,
                     oi_delta_pct=overlays.get("oi_delta_24h"))
             except Exception:
                 pass
-        return render_smc_chart(symbol, candles, smc, tf=tf, plan=plan, overlays=overlays)
+        # matplotlib 渲染是同步重活——卸到執行緒，別阻塞事件迴圈（v129 watchdog 誤殺同族）
+        return await asyncio.to_thread(
+            render_smc_chart, symbol, candles, smc, tf=tf, plan=plan, overlays=overlays)
     except Exception as e:
         print(f"[chart] {symbol} error: {type(e).__name__}: {e}")
         return None
