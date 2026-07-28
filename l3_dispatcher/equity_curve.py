@@ -3,7 +3,8 @@
 設計：把 paper_trades 已平倉（排除 entry_expired 限價未成交）依平倉時間排序，
     各引擎獨立累積 R（risk-multiple），畫成時間軸折線圖（深色，TradingView 風格）。
     加密 deepdive 與美股 us_breakout 分兩條線——合併會誤導（兩引擎數學完全不同），
-    且美股樣本量不足、統計不可信，必須在圖上誠實標註（紅線③：不捏造績效）。
+    美股 2026-07-28 起已過預註冊統計閘（PSRc>=0.95），但仍為紙上毛利口徑、
+    真錢未驗，圖上照標不作對外宣稱（紅線③雙向誠實）。
 
 誠實邊界：
     * 標題與頁尾明示「紙上模擬驗證 · 非實盤績效」。實倉 trades 表 0 筆，畫不出實盤戰績。
@@ -88,6 +89,24 @@ def _raw_rs() -> dict[str, list[float]]:
     return out
 
 
+def _net_stats() -> dict[str, dict]:
+    """淨帳（扣費）統計。net_r 欄 v118 起才落帳→只統計有資料的列並標明 n，
+    永不把毛/淨混算或回填（紅線③）。"""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT setup, COUNT(net_r), IFNULL(SUM(net_r),0) FROM paper_trades "
+            "WHERE status='closed' AND IFNULL(exit_reason,'')!='entry_expired' "
+            "AND net_r IS NOT NULL GROUP BY setup='us_breakout'").fetchall()
+    finally:
+        conn.close()
+    out = {"crypto": {"n": 0, "sum": 0.0}, "us": {"n": 0, "sum": 0.0}}
+    for setup, n, s in rows:
+        key = "us" if setup == "us_breakout" else "crypto"
+        out[key] = {"n": int(n), "sum": float(s)}
+    return out
+
+
 def render_equity_curve() -> Path | None:
     """渲染紙上驗證帳累積 R 走勢圖。無已平倉資料回 None。"""
     try:
@@ -97,6 +116,7 @@ def render_equity_curve() -> Path | None:
         raw = _raw_rs()
         cs = _stats(series["crypto"], raw["crypto"])
         ss = _stats(series["us"], raw["us"])
+        net = _net_stats()
 
         fig, ax = plt.subplots(figsize=(10.0, 5.4), facecolor=BG)
         ax.set_facecolor(BG)
@@ -115,7 +135,10 @@ def render_equity_curve() -> Path | None:
             ax.plot(xs, ys, color=CRYPTO_COL, linewidth=2.2, marker="o",
                     markersize=3.5, label=(
                         f"加密 deepdive　n={cs['n']}　"
-                        f"累積 {cs['cum_r']:+.2f}R　勝率 {cs['win_rate']:.0f}%"))
+                        f"累積 {cs['cum_r']:+.2f}R　勝率 {cs['win_rate']:.0f}%"
+                        + (f"\n淨帳(扣費·近{net['crypto']['n']}筆有費用資料) "
+                           f"{net['crypto']['sum']:+.2f}R"
+                           if net['crypto']['n'] else "")))
             ax.fill_between(xs, ys, 0, color=CRYPTO_COL, alpha=0.07)
             ax.annotate(f"{cs['cum_r']:+.2f}R", (xs[-1], ys[-1]),
                         color=CRYPTO_COL, fontsize=11, fontweight="bold",
@@ -130,7 +153,10 @@ def render_equity_curve() -> Path | None:
                         # 誠實雙面：過閘照登、真錢 0 筆與紙上毛利口徑照標（紅線③雙向誠實）。
                         # 「>=」非「≥」：JhengHei 缺 U+2265 字型，≥ 會噴 UserWarning 汙染 err.log
                         f"美股 us_breakout（紙上·已過統計閘 PSRc>=0.95·真錢未驗）　n={ss['n']}　"
-                        f"累積 {ss['cum_r']:+.2f}R"))
+                        f"累積 {ss['cum_r']:+.2f}R"
+                        + (f"\n淨帳(扣費·近{net['us']['n']}筆有費用資料) "
+                           f"{net['us']['sum']:+.2f}R"
+                           if net['us']['n'] else "")))
             ax.annotate(f"{ss['cum_r']:+.2f}R", (xs[-1], ys[-1]),
                         color=US_COL, fontsize=10, xytext=(6, 0),
                         textcoords="offset points", va="center", alpha=0.9)
@@ -154,8 +180,10 @@ def render_equity_curve() -> Path | None:
                  color=MUTED, fontsize=10, va="top")
 
         fig.text(0.07, 0.02,
+                 # v136-3：美股 2026-07-28 已過預註冊統計閘——舊「樣本量不足」措辭過時；
+                 # 換上里程碑鐵則措辭（紙上毛利口徑·真錢未驗·不作對外宣稱）
                  "Y 軸為 R（風險倍數），非報酬率　|　兩引擎數學不同故分線　|　"
-                 "美股樣本量不足、勝率不可作績效宣稱　|　輸贏全記，不挑單",
+                 "美股已過統計閘·紙上毛利口徑·真錢未驗·不作對外宣稱　|　輸贏全記，不挑單",
                  color=MUTED, fontsize=8.5, va="bottom")
 
         plt.subplots_adjust(top=0.86, bottom=0.13, left=0.085, right=0.96)
