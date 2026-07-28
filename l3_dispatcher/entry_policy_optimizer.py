@@ -329,8 +329,12 @@ async def run_entry_optimization(*, days: int = 120, at_ms: int | None = None,
         ledger = TrialLedger(default_ledger_path())
 
     plans, quad_by_pid, candles_by_pid = await load_plans_and_candles(rows, get_ohlc=get_ohlc)
-    res = optimize_entry(plans, quad_by_pid, candles_by_pid, at_ms=at_ms, ledger=ledger,
-                         active_path=active_path, audit_path=audit_path)
+    # v130（獵捕workflow）：optimize_entry=119桶×逐根重放+trial_ledger全檔re-parse，實測
+    #   72.5s 純同步——v129 只包了 auto_tuner 的 3 段、漏了這段（它在 await 皮下面）。
+    #   丟 thread 讓事件迴圈/心跳照轉（async 取 K 線段留在迴圈上）。
+    res = await asyncio.to_thread(
+        optimize_entry, plans, quad_by_pid, candles_by_pid, at_ms=at_ms, ledger=ledger,
+        active_path=active_path, audit_path=audit_path)
     res["n_rows"] = len(rows)
     res["n_eligible"] = len(plans)
     return res

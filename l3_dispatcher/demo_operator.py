@@ -386,6 +386,15 @@ async def _place_one(ex, signal, *, avail_usd, tg=None) -> dict:
         return {"placed": False, "reason": plan.reject_reason}
 
     open_trades = dj.get_live_demo_trades()               # 桶風險：當下在倉清單
+    # v130（獵捕workflow·真bug治本）：OKX hedge mode 同幣同向會「併倉」成單一交易所
+    #   部位→一筆 realizedPnl 無法歸屬兩個 intent（LAB/BTC 已實證同一筆 pnl 被雙重記帳、
+    #   R 虛增 +1.30）。同幣同向已有在場 demo 單 → 拒收新鏡像，杜絕歸屬歧義（紙上不受
+    #   影響照記全部；歷史 4 筆錯帳不回改=帳本不可變性，僅文件註記）。
+    if any(t.get("symbol") == symbol and t.get("direction") == direction
+           and t.get("status") in ("pending", "open") for t in open_trades):
+        _record("rejected", "reject:dup_pos_merge_risk", None,
+                "同幣同向已在場（OKX hedge 併倉會使 realizedPnl 無法歸屬兩單）")
+        return {"placed": False, "reason": "dup_pos_merge_risk"}
     # v127（使用者設計）：智能動態倉位閘——平時最多 BASE 槽；全部在場單鎖利
     #   （TP 腿已在 OKX 成交落袋）才解鎖 BONUS 加碼槽。OKX 讀取失敗→fail-closed 不解鎖。
     try:

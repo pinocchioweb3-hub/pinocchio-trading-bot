@@ -85,3 +85,20 @@ def test_dynamic_slot_gate_profit_unlock():
     # ④OKX 查不到現量 → fail-closed 不解鎖
     ok, why = dynamic_slot_gate(three, {}, base=3, bonus=2)
     assert not ok
+
+
+# ------------------------------------------------- v130 同幣同向併倉防護
+def test_dup_position_merge_risk_logic():
+    """同幣同向在場（pending/open）→ 應被拒（OKX hedge 併倉歸屬歧義防護）。
+    純邏輯驗證（鏡像 _place_one 內的判斷式）。"""
+    open_trades = [{"symbol": "BTC", "direction": "bear", "status": "open"},
+                   {"symbol": "LAB", "direction": "bull", "status": "pending"},
+                   {"symbol": "SOL", "direction": "bull", "status": "closed"}]
+    def dup(symbol, direction):
+        return any(t.get("symbol") == symbol and t.get("direction") == direction
+                   and t.get("status") in ("pending", "open") for t in open_trades)
+    assert dup("BTC", "bear")            # 同幣同向 open → 擋
+    assert dup("LAB", "bull")            # 同幣同向 pending → 擋
+    assert not dup("BTC", "bull")        # 反向 → 放行
+    assert not dup("SOL", "bull")        # closed 不算在場 → 放行
+    assert not dup("ETH", "bear")        # 不同幣 → 放行
