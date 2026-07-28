@@ -164,7 +164,8 @@ def _count_closed(table: str) -> tuple[int, float]:
         return 0, 0.0
 
 
-def _paper_edge_tstat(table: str = "paper_trades") -> float | None:
+def _paper_edge_tstat(table: str = "paper_trades",
+                      setup: str | None = None) -> float | None:
     """紙上『真實已平倉』realized_r 的單樣本 t 值（檢定 EV 是否顯著異於 0）。
 
     t = mean / (sd/√n)。n<2 或 sd=0 → None（無法檢定，誠實不報）。與 _count_closed 同
@@ -174,11 +175,16 @@ def _paper_edge_tstat(table: str = "paper_trades") -> float | None:
     try:
         conn = sqlite3.connect(_TJ_DB, timeout=5)
         try:
-            rows = conn.execute(
-                f"SELECT realized_r FROM {table} WHERE status='closed' "
-                f"AND IFNULL(exit_reason,'') != 'entry_expired' "
-                f"AND realized_r IS NOT NULL"
-            ).fetchall()
+            # v131：支援分引擎口徑——混引擎單一 t（曾測得 2.93）會把「美股已過閘、
+            #   加密未過」兩個相反真相攪成一個誤導數字（獵捕workflow口徑稽核發現）。
+            _sql = (f"SELECT realized_r FROM {table} WHERE status='closed' "
+                    f"AND IFNULL(exit_reason,'') != 'entry_expired' "
+                    f"AND realized_r IS NOT NULL")
+            _args: tuple = ()
+            if setup:
+                _sql += " AND setup=?"
+                _args = (setup,)
+            rows = conn.execute(_sql, _args).fetchall()
         finally:
             conn.close()
     except Exception:
@@ -444,7 +450,12 @@ def _section_self_assessment() -> str:
     body = _synthesize_bottleneck(
         p.get("paper_n", 0), p.get("paper_min", 100),
         p.get("live_n", 0), p.get("live_min", 30), demo_n, demo_rejected,
-        paper_t=_paper_edge_tstat("paper_trades"))
+        paper_t=_paper_edge_tstat("paper_trades", setup="deepdive"))
+    # v131：分引擎附註（瓶頸敘事以加密 deepdive 為主體＝OKX 路徑的鑰匙；美股另列）
+    _us_t = _paper_edge_tstat("paper_trades", setup="us_breakout")
+    if _us_t is not None:
+        body += (f"\n（分引擎：美股 t≈{_us_t:.2f}，已過預註冊統計閘 PSRc≥0.95"
+                 f"——紙上毛利口徑、真錢 0 筆，不作對外宣稱）")
     return "🧠 <b>系統自評</b>（跨 session 綜合·確定性推理非欄位回音）：\n" + body
 
 

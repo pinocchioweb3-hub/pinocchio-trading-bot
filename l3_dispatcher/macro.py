@@ -1683,7 +1683,7 @@ async def run_performance_loop(tg, target_hour_utc: int = 0,
                 if curve:
                     await tg.send_photo(curve, caption=(
                         "📈 紙上驗證帳累積 R 走勢（非實盤績效・兩引擎分線・"
-                        "美股樣本不足不可作績效宣稱）"))
+                        "美股紙上已過統計閘 PSRc≥0.95・真錢 0 筆不作對外績效宣稱）"))
             except Exception as e:
                 print(f"[performance] equity curve error: {type(e).__name__}: {e}")
         except Exception as e:

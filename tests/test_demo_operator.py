@@ -102,3 +102,14 @@ def test_dup_position_merge_risk_logic():
     assert not dup("BTC", "bull")        # 反向 → 放行
     assert not dup("SOL", "bull")        # closed 不算在場 → 放行
     assert not dup("ETH", "bear")        # 不同幣 → 放行
+
+
+# ------------------------------------------------- v131 美股代幣化永續鏡像
+def test_excluded_setups_v131():
+    """rule_planner 永不入 demo；us_breakout 依 DEMO_MIRROR_US 開放（預設開）。"""
+    from l3_dispatcher.demo_operator import EXCLUDED_SETUPS, is_crypto_signal
+    assert "rule_planner" in EXCLUDED_SETUPS
+    assert "us_breakout" not in EXCLUDED_SETUPS      # 預設 DEMO_MIRROR_US=1
+    assert is_crypto_signal("us_breakout")            # 現在放行鏡像
+    assert not is_crypto_signal("rule_planner")       # 未過 L2 引擎永不入
+    assert is_crypto_signal("deepdive")

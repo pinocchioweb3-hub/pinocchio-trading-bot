@@ -42,7 +42,14 @@ ACTIVE_FLAG = "DEMO_OPERATOR_ACTIVE"        # 鑰匙②（預設關）
 _TRUTHY = ("1", "true", "yes", "on")
 
 # 只鏡像加密訊號（排除美股 us_breakout：走另一條，且非 OKX 永續宇宙）
-EXCLUDED_SETUPS = ("us_breakout",)
+# v131（使用者指正）：OKX 有美股代幣化永續（實測我方 8 檔標的 100% 覆蓋:NVDA/QQQ/
+#   SOXL/INTC/MRVL/MU/ORCL/SNDK 皆有 -USDT-SWAP）→ 美股引擎（已過預註冊統計閘
+#   PSRc=0.99）開放 demo 鏡像，量測「真股價訊號 vs 代幣化永續執行」的基差/滑價
+#   ——紙上證明與真錢之間缺的執行保真度拼圖，在 OKX 模擬盤上實測。
+#   'rule_planner'（無LLM備援計畫器,未過L2）永不入 demo（獵捕workflow鐵則）。
+_MIRROR_US = os.getenv("DEMO_MIRROR_US", "1") == "1"
+EXCLUDED_SETUPS = ("rule_planner",) + (() if _MIRROR_US else ("us_breakout",))
+US_MAX_CONCURRENT = int(os.getenv("DEMO_US_MAX_CONCURRENT", "2"))  # 美股專屬小額槽,不擠壓加密樣本累積
 # 只鏡像「近 N 分鐘內」的新訊號——daemon 曾離線時不回補陳舊訊號（價位早已失效）
 INTAKE_MAX_AGE_MIN = int(os.getenv("DEMO_INTAKE_MAX_AGE_MIN", "90"))
 INTAKE_BATCH_LIMIT = int(os.getenv("DEMO_INTAKE_BATCH_LIMIT", "3"))   # 每輪最多開幾筆新倉（保守）
@@ -395,6 +402,16 @@ async def _place_one(ex, signal, *, avail_usd, tg=None) -> dict:
         _record("rejected", "reject:dup_pos_merge_risk", None,
                 "同幣同向已在場（OKX hedge 併倉會使 realizedPnl 無法歸屬兩單）")
         return {"placed": False, "reason": "dup_pos_merge_risk"}
+    # v131：美股專屬併發上限——代幣化永續鏡像用自己的小額槽（預設 2），
+    #   不擠壓加密引擎的 demo 樣本累積（加密才是 OKX 真錢路的統計瓶頸）。
+    if signal.get("setup") == "us_breakout":
+        _n_us = sum(1 for t in open_trades
+                    if t.get("setup") == "us_breakout"
+                    and t.get("status") in ("pending", "open"))
+        if _n_us >= US_MAX_CONCURRENT:
+            _record("rejected", "reject:us_slot_cap", None,
+                    f"美股代幣化永續在場已達 {US_MAX_CONCURRENT} 筆（專屬槽上限）")
+            return {"placed": False, "reason": "us_slot_cap"}
     # v127（使用者設計）：智能動態倉位閘——平時最多 BASE 槽；全部在場單鎖利
     #   （TP 腿已在 OKX 成交落袋）才解鎖 BONUS 加碼槽。OKX 讀取失敗→fail-closed 不解鎖。
     try:

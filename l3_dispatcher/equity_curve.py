@@ -125,7 +125,10 @@ def render_equity_curve() -> Path | None:
             xs, ys = _xy(series["us"])
             ax.plot(xs, ys, color=US_COL, linewidth=1.8, linestyle="--",
                     marker="s", markersize=3.0, alpha=0.85, label=(
-                        f"美股 us_breakout（實驗·樣本不足·統計不可信）　n={ss['n']}　"
+                        # v131：舊標籤凍結在 n≈21 時代；2026-07-28 起 n=109/n_eff=96、
+                        # PSRc=0.99 已過預註冊統計閘（crypto_ev_significance 切口④）。
+                        # 誠實雙面：過閘照登、真錢 0 筆與紙上毛利口徑照標（紅線③雙向誠實）。
+                        f"美股 us_breakout（紙上·已過統計閘 PSRc≥0.95·真錢未驗）　n={ss['n']}　"
                         f"累積 {ss['cum_r']:+.2f}R"))
             ax.annotate(f"{ss['cum_r']:+.2f}R", (xs[-1], ys[-1]),
                         color=US_COL, fontsize=10, xytext=(6, 0),
