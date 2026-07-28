@@ -32,6 +32,7 @@ CLI：
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -156,16 +157,39 @@ def select_new_signals(rows, hwm, now_ms, *, max_age_min=INTAKE_MAX_AGE_MIN,
     return picked, new_hwm
 
 
-def classify_untracked_halt(okx_positions, tracked_keys):
+def classify_untracked_halt(okx_positions, tracked_keys, external_ok_keys=frozenset()):
     """OKX 上有、本地帳本未追蹤的持倉 → 致命漂移（人工開倉/崩潰殘留/金鑰污染）→ 應 halt。
+    external_ok_keys（v134）：ATK 消費鏈依 intent_outbox 的 demo_only intent 開的倉
+    ＝已知外部單，不算漂移（只回報在 untracked_list 供記錄，不 halt）。
     回 (should_halt, reason, untracked_list)。"""
     untracked = [p for p in okx_positions
                  if (p.get("symbol"), p.get("pos_side")) not in tracked_keys]
-    if untracked:
+    hostile = [p for p in untracked
+               if (p.get("symbol"), p.get("pos_side")) not in external_ok_keys]
+    if hostile:
         desc = ", ".join(
-            f"{p.get('symbol')}/{p.get('pos_side')}×{p.get('contracts')}" for p in untracked)
+            f"{p.get('symbol')}/{p.get('pos_side')}×{p.get('contracts')}" for p in hostile)
         return True, f"OKX 出現未追蹤持倉：{desc}", untracked
-    return False, "", []
+    return False, "", untracked
+
+
+def atk_external_keys() -> set:
+    """讀 intent_outbox 裡 execution_policy=demo_only 的 intent → {(symbol, pos_side)}。
+    這些是 ATK 消費鏈（使用者側腳本）可能在同一 demo 帳戶開的倉——已知外部單白名單。
+    讀失敗→空集合（fail-closed：寧可誤 halt 也不放過真漂移）。"""
+    keys: set = set()
+    try:
+        from botpaths import data_dir
+        for p in (data_dir() / "intent_outbox").glob("*.json"):
+            try:
+                it = json.loads(p.read_text(encoding="utf-8"))
+                if it.get("execution_policy") == "demo_only":
+                    keys.add((it.get("symbol"), it.get("pos_side")))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return keys
 
 
 def infer_exit_reason(marker, pnl_usd) -> str:
@@ -601,11 +625,15 @@ async def _monitor(ex, *, now_ms, tg=None) -> dict:
             summary["errors"] += 1
             print(f"[demo_op] 監控 {iid} 失敗：{type(e).__name__}: {e}")
 
-    should_halt, reason, _ = classify_untracked_halt(okx_list, tracked_keys)
+    should_halt, reason, untracked = classify_untracked_halt(
+        okx_list, tracked_keys, external_ok_keys=atk_external_keys())
     if should_halt:
         dj.set_halt(reason)
         summary["halt"] = reason
         _notify(tg, f"⛔ 模擬盤操盤手對帳漂移 → 已停新單：{reason}")
+    elif untracked:
+        # ATK 消費鏈的已知外部單——只記錄不 halt（v134）
+        summary["atk_external"] = len(untracked)
     return summary
 
 
@@ -731,7 +759,10 @@ def _selftest() -> bool:  # noqa: C901
 
     # is_crypto_signal
     check(is_crypto_signal("deepdive"), "deepdive 為加密訊號")
-    check(not is_crypto_signal("us_breakout"), "us_breakout 排除")
+    # v131：us_breakout 是否可鏡像取決於 DEMO_MIRROR_US
+    check(is_crypto_signal("us_breakout") == ("us_breakout" not in EXCLUDED_SETUPS),
+          "us_breakout 依 DEMO_MIRROR_US 決定排除與否")
+    check(not is_crypto_signal("rule_planner"), "rule_planner 永遠排除")
     check(is_crypto_signal(None), "None setup 視為加密（保守收）")
 
     # infer_exit_reason
@@ -756,6 +787,12 @@ def _selftest() -> bool:  # noqa: C901
     check(halt and len(untr) == 1 and untr[0]["symbol"] == "ETH", "未追蹤 ETH 倉 → halt")
     halt2, _, _ = classify_untracked_halt(okx, {("BTC", "long"), ("ETH", "short")})
     check(not halt2, "全部追蹤 → 不 halt")
+    halt3, _, untr3 = classify_untracked_halt(
+        okx, tracked, external_ok_keys={("ETH", "short")})
+    check(not halt3 and len(untr3) == 1, "未追蹤但在 ATK 白名單 → 不 halt 仍回報")
+    halt4, _, _ = classify_untracked_halt(
+        okx, tracked, external_ok_keys={("SOL", "long")})
+    check(halt4, "白名單不含該倉 → 照樣 halt")
 
     # select_new_signals：基本選取 + 排除 + 高水位推進
     rows = [
@@ -770,15 +807,20 @@ def _selftest() -> bool:  # noqa: C901
         {"id": 14, "setup": "deepdive", "status": "open", "direction": "bear",
          "entry_price": 200, "stop_price": 210, "entry_at": now - 1 * 60 * 1000},  # 合格
     ]
+    # v131 起 us_breakout 是否排除取決於 DEMO_MIRROR_US——預期值依 EXCLUDED_SETUPS 動態算
+    us_excluded = "us_breakout" in EXCLUDED_SETUPS
+    want_ids = [10, 14] if us_excluded else [10, 11, 14]
     sel, nhwm = select_new_signals(rows, hwm=5, now_ms=now, max_age_min=90, limit=5)
     sel_ids = [s["id"] for s in sel]
-    check(sel_ids == [10, 14], f"選中合格 [10,14]（得 {sel_ids}）")
+    check(sel_ids == want_ids, f"選中合格 {want_ids}（得 {sel_ids}）")
     check(nhwm == 14, f"全掃完高水位=14（得 {nhwm}）")
 
     # 額度滿 → 合格但延後者不被高水位跳過
     sel2, nhwm2 = select_new_signals(rows, hwm=5, now_ms=now, max_age_min=90, limit=1)
     check([s["id"] for s in sel2] == [10], "limit=1 只選 10")
-    check(nhwm2 == 13, f"高水位停在 14 之前(=13，11/12/13 已決定不合格)（得 {nhwm2}）")
+    # 美股排除時 11/12/13 皆不合格→hwm 推到 13；美股鏡像開啟時 11 合格但額度滿→hwm 停在 10
+    want_hwm2 = 13 if us_excluded else 10
+    check(nhwm2 == want_hwm2, f"高水位停在下一合格單之前(={want_hwm2})（得 {nhwm2}）")
 
     # 已處理過的 id 不重選
     sel3, nhwm3 = select_new_signals(rows, hwm=13, now_ms=now, max_age_min=90, limit=5)
