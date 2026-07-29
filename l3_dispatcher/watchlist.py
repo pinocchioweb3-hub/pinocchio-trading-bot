@@ -148,6 +148,16 @@ class WatchlistManager:
             except Exception as e:  # noqa: BLE001 — 降級失敗回原空宇宙行為
                 print(f"[refresh] 免費源降級失敗（維持原行為）：{type(e).__name__}: {e}")
 
+        # v142：來源留痕上快照（紅線③）——把本輪生效的來源寫進零依賴葉模組，
+        # 供 plan_snapshot 在「進場那一刻」凍進快照。沒有這一步，免費源時代與
+        # CG 時代的加密樣本日後在帳上分不出來（topN_agreement=0.0＝選股實質已換），
+        # 而快照只能前向累積、永不回填。純觀測，失敗吞掉不影響 refresh。
+        try:
+            from l3_dispatcher.universe_provenance import set_universe_source
+            set_universe_source(universe_source)
+        except Exception:
+            pass
+
         n_universe = len(items)
         n_dropped = max(0, n_pool - n_universe)
         universe_telemetry = {"n_pool": n_pool, "n_universe": n_universe,

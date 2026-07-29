@@ -61,6 +61,31 @@ _REGIME_KEYS: tuple[str, ...] = (
 )
 
 
+# 唯三會走「加密強度宇宙」的進場路徑。美股引擎（us_breakout）走獨立的 1h 突破投票
+# 流程、完全不經加密宇宙——它日後若也接快照，universe_source 必須留 None，而不是被
+# 誤標成加密宇宙的來源（紅線③：寧可誠實留空，絕不貼錯標）。
+_CRYPTO_SOURCES: frozenset[str] = frozenset(
+    {"direct_fire", "macro_deepdive", "waiting_trigger"})
+
+
+def _resolve_universe_source(source: str) -> str | None:
+    """讀『進場那一刻生效的加密強度宇宙來源』（v142，純觀測留痕）。
+
+    讀的是 universe_provenance 這支零依賴葉模組的狀態（watchlist.refresh 寫入），
+    不是活查詢：零 I/O、零網路、零策略數學，因此不違反本模組「純資料組裝」鐵則，
+    也不會把 strength 數學經由 watchlist 拖進來（CI ast 護欄仍成立）。
+
+    非加密路徑 → None；模組未載入／從未 refresh 過／任何例外 → None（誠實留空）。
+    """
+    if source not in _CRYPTO_SOURCES:
+        return None
+    try:
+        from .universe_provenance import get_universe_source
+        return get_universe_source()
+    except Exception:
+        return None
+
+
 def vol_regime_from_atr(atr) -> str:
     """以 7 日 ATR%（波動度）把進場當下分桶成 vol_trend——復盤引擎跨進場路徑的唯一口徑。
 
@@ -232,6 +257,13 @@ def build_plan_snapshot(*, source: str, direction: str,
             # task#70：context_at_entry 各欄的計分口徑 provenance（純觀測中繼欄；與 _CONTEXT_KEYS
             # 嚴格分離、不進 missing_context_keys、永不參與 rr/expected_r/方向）。缺/壞型別 → None。
             "context_provenance": context_provenance if isinstance(context_provenance, dict) else None,
+            # v142：進場那刻的加密強度宇宙來源（coinglass / okx_free_fallback / None）。
+            # 純觀測留痕欄——與 _CONTEXT_KEYS 嚴格分離、不進 missing_context_keys、
+            # 永不參與 rr/expected_r/方向。存在理由：CoinGlass 訂閱 7/08 到期後免費源
+            # 事實上已成主源，而 topN_agreement=0.0 代表選股實質換掉了，兩個時代的
+            # 加密樣本**不可直接合併統計**；沒有這一欄，日後在帳上分不出來。只能前向
+            # 累積——封存快照永不回填（紅線③）。美股路徑恆 None（不經加密宇宙）。
+            "universe_source": _resolve_universe_source(source),
         }
     except Exception:
         return None
