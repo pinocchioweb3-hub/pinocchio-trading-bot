@@ -122,14 +122,28 @@ def contracts_for(inst_id: str, entry: float, stop: float, ct_val_cache: dict) -
 _LEV_SET: set = set()
 
 
-def ensure_leverage(inst_id: str, pos_side: str, dry: bool) -> None:
+def leverage_for_trade(entry: float, stop: float, max_lev: int | None = None) -> int:
+    """清算永不先於止損（v84 哲學）：止損距離 × 槓桿 ≤ 70%清算距離。
+    lev = min(上限, 70/止損%)，下限 3。槓桿只影響保證金效率，風險由止損距離決定。"""
+    max_lev = max_lev or LEVERAGE
+    if not entry or not stop or entry <= 0:
+        return min(max_lev, 5)
+    stop_pct = abs(entry - stop) / entry * 100.0
+    if stop_pct <= 0:
+        return min(max_lev, 5)
+    return max(3, min(int(max_lev), int(70.0 / stop_pct)))
+
+
+def ensure_leverage(inst_id: str, pos_side: str, dry: bool,
+                    lev: int | None = None) -> None:
     """開單前設槓桿（v99 教訓：OKX 預設 3x，hedge 模式 isolated 必須帶 posSide 逐邊設，
     否則靜默沿用預設）。失敗只警告不擋單——槓桿影響資金效率，風險由止損距離決定。"""
-    key = (inst_id, pos_side)
+    lev = lev or LEVERAGE
+    key = (inst_id, pos_side, lev)
     if dry or key in _LEV_SET:
         return
     code, out = _okx(["swap", "leverage", "--instId", inst_id,
-                      "--lever", str(LEVERAGE), "--mgnMode", "isolated",
+                      "--lever", str(lev), "--mgnMode", "isolated",
                       "--posSide", pos_side])
     if code == 0:
         _LEV_SET.add(key)
@@ -316,7 +330,8 @@ def place(intent: dict, sz: float, dry: bool,
     TP1 觸發→只平那腿、其餘腿的 SL 續存＝與紙上 40/30/30 階梯同語義。
     每腿 clOrdId 加尾碼 a/b/c 冪等；部分失敗→回 False 由外層重試（已成腿撞
     51016 重複視為成功，不會重複開倉）。單一 TP 時維持原單筆路徑。"""
-    ensure_leverage(intent["inst_id"], intent["pos_side"], dry)
+    lev = leverage_for_trade(intent.get("entry"), intent.get("stop"))
+    ensure_leverage(intent["inst_id"], intent["pos_side"], dry, lev=lev)
     tps = [intent.get("tp1"), intent.get("tp2"), intent.get("tp3")]
     legs = (split_tp_levels(sz, spec["lotSz"], spec["minSz"], tps)
             if spec else [])
