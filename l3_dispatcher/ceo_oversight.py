@@ -89,6 +89,13 @@ ORG_ROLE_CADENCE_DAYS = {
 # 連缺幾期才算斷檔（SKILL.md 原文：「連缺 2 期以上」）。取 2 是為了容忍單次跳過
 # （機器沒開／jitter 跨日），只在「真的連續沒產出」時才叫——寧可晚一期，不可狼來了。
 ORG_DIGEST_MISS_PERIODS = int(os.getenv("OVERSIGHT_ORG_DIGEST_MISS_PERIODS", "2") or 2)
+# 監督員代補產的報告，檔名與該席自產的長得一模一樣（都是 pm-2026-07-30.md）。
+# 若拿「該席最新檔」當新鮮度代理，缺報會被監督員自己的代補產蓋成「痊癒」——
+# 排程仍然壞著卻沒人知道。故靠檔頭出處聲明分流：只有**自產**檔算新鮮度。
+# 只掃前 ORG_HEADER_LINES 行（出處聲明都在檔頭橫幅），正文裡提到「代補」不算——
+# 例如 CEO 日報會在表格裡描述別席的代補產狀態，那不代表 CEO 日報自己是代補的。
+ORG_BACKFILL_MARKER = "代補"
+ORG_HEADER_LINES = 12
 
 
 # ===========================================================================
@@ -168,39 +175,58 @@ def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
 
 def org_digest_verdict(latest_by_role: dict | None, *, today,
                        cadence: dict | None = None,
-                       miss_periods: int = ORG_DIGEST_MISS_PERIODS) -> dict | None:
-    """把「各席最新 digest 日期」翻成「有沒有斷檔」（純函式，可離線測）。
+                       miss_periods: int = ORG_DIGEST_MISS_PERIODS,
+                       backfilled: dict | None = None) -> dict | None:
+    """把「各席最新**自產** digest 日期」翻成「有沒有斷檔」（純函式，可離線測）。
 
-    latest_by_role: {role: datetime.date}；today: datetime.date。
-    回 None＝無斷檔；否則回 {roles, text, worst_age_days}。
+    latest_by_role: {role: date}——**只放該席自產的報告**，代補產的不可混進來。
+    backfilled:     {role: date}——監督員代補產的日期。**只影響措辭，不影響是否觸發**：
+                    代補產補的是內容，不是排程；排程有沒有修好，只有該席自產檔落地
+                    才算證明。混用會把缺報蓋成痊癒（見 ORG_BACKFILL_MARKER 註解）。
+    回 None＝無斷檔；否則回 {roles, text, worst_age_days, all_covered_by_backfill}。
 
     兩個不誤報的守則：
       • latest_by_role 為空（目錄不存在／零檔）＝環境問題（換機器、淺 clone），
         不是斷檔——回 None，交由人工，不製造假故障。
-      • 某席「從未產出過」＝沒有基準可算「遲了幾期」，跳過該席（同理不誤報）。
+      • 某席「從未自產過」＝沒有基準可算「遲了幾期」，跳過該席（同理不誤報）。
     """
     if not latest_by_role:
         return None
     cadence = cadence or ORG_ROLE_CADENCE_DAYS
+    backfilled = backfilled or {}
     late = []
     for role, (label, cad_days) in cadence.items():
         d = latest_by_role.get(role)
         if d is None:
             continue
         age_days = (today - d).days
-        if age_days > cad_days * miss_periods:
-            late.append({
-                "role": role, "label": label, "age_days": age_days,
-                "cadence_days": cad_days, "missed_periods": age_days // cad_days,
-            })
+        if age_days <= cad_days * miss_periods:
+            continue
+        bf = backfilled.get(role)
+        bf_age = (today - bf).days if bf is not None else None
+        late.append({
+            "role": role, "label": label, "age_days": age_days,
+            "cadence_days": cad_days, "missed_periods": age_days // cad_days,
+            "backfill_age_days": bf_age,
+            "covered_by_backfill": bf_age is not None and bf_age <= cad_days * miss_periods,
+        })
     if not late:
         return None
     late.sort(key=lambda x: -x["age_days"])
-    parts = [f"{x['label']}最新為 {x['age_days']} 天前（節奏每 {x['cadence_days']} 天，"
-             f"已缺約 {x['missed_periods']} 期）" for x in late]
-    text = ("組織產出斷檔：" + "；".join(parts)
-            + "——排程 lastRunAt 只記『觸發』不記『成功』，須查該席排程是否無聲失敗（並代補產）")
-    return {"roles": late, "text": text, "worst_age_days": late[0]["age_days"]}
+    parts = []
+    for x in late:
+        s = (f"{x['label']}自產最新為 {x['age_days']} 天前"
+             f"（節奏每 {x['cadence_days']} 天，已缺約 {x['missed_periods']} 期）")
+        if x["covered_by_backfill"]:
+            s += f"［內容已由監督員 {x['backfill_age_days']} 天前代補產，但該席排程仍未自產＝未驗收］"
+        parts.append(s)
+    all_covered = all(x["covered_by_backfill"] for x in late)
+    head = "組織排程未驗收：" if all_covered else "組織產出斷檔："
+    text = (head + "；".join(parts)
+            + "——排程 lastRunAt 只記『觸發』不記『成功』；代補產只補內容、不證明排程已修，"
+              "要等該席**自產**檔落地才算痊癒")
+    return {"roles": late, "text": text, "worst_age_days": late[0]["age_days"],
+            "all_covered_by_backfill": all_covered}
 
 
 def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
@@ -348,19 +374,22 @@ def _read_live_exec_health() -> dict:
         return {}
 
 
-def _read_org_digest_latest() -> dict:
-    """掃 docs/org/digests/，回 {role: 最新日期(date)}（純讀，永不拋）。
+def _read_org_digest_latest() -> tuple:
+    """掃 docs/org/digests/，回 (自產最新, 代補產最新) 兩份 {role: date}（純讀，永不拋）。
 
     取檔名裡的日期而非 mtime——mtime 會被 clone / 同步 / 編輯洗掉，檔名日期才是
     「那一期報告」的真身（README.md 等非 digest 檔自然不match，直接略過）。
+
+    為什麼要拆兩份：見 ORG_BACKFILL_MARKER。監督員代補產的檔名與自產完全同形，
+    拿「最新檔」當代理會讓監督員自己的代補產把缺報洗成痊癒。
     """
-    latest: dict = {}
+    self_latest: dict = {}
+    bf_latest: dict = {}
     try:
         if not ORG_DIGEST_DIR.is_dir():
-            return {}
+            return {}, {}
         for p in ORG_DIGEST_DIR.glob("*.md"):
-            stem = p.stem
-            role, _, datestr = stem.rpartition("-20")
+            role, _, datestr = p.stem.rpartition("-20")
             if not role or "-" not in datestr:
                 continue
             try:
@@ -369,11 +398,17 @@ def _read_org_digest_latest() -> dict:
                 continue
             if role not in ORG_ROLE_CADENCE_DAYS:
                 continue
-            if role not in latest or d > latest[role]:
-                latest[role] = d
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    head = "".join(f.readline() for _ in range(ORG_HEADER_LINES))
+            except Exception:
+                head = ""      # 讀不到檔頭就當自產——寧可晚一期叫，不可誤報斷檔
+            tgt = bf_latest if ORG_BACKFILL_MARKER in head else self_latest
+            if role not in tgt or d > tgt[role]:
+                tgt[role] = d
     except Exception:
-        return {}
-    return latest
+        return {}, {}
+    return self_latest, bf_latest
 
 
 def _write_ledger(snap: dict) -> None:
@@ -461,11 +496,14 @@ def build_snapshot(now_ms: int | None = None) -> dict:
 
     # r30：組織產出斷檔（各席 digest 檔齡 vs 節奏）。「今天」用**本地日期**，因為
     #   digest 檔名與排程 cron 都是台北時間的日期，拿 UTC 日期比會在 08:00 前差一天。
+    #   r31：只用**自產**檔算新鮮度，代補產另外傳（否則監督員代補產會把缺報洗成痊癒）。
     org_digest = None
     try:
+        _self_digests, _bf_digests = _read_org_digest_latest()
         org_digest = org_digest_verdict(
-            _read_org_digest_latest(),
+            _self_digests,
             today=_datetime.fromtimestamp(now_ms / 1000).date(),
+            backfilled=_bf_digests,
         )
     except Exception:
         pass
@@ -661,7 +699,8 @@ def _selftest():
 
     # --- r30：組織產出斷檔接進判定 ---------------------------------------
     TODAY = _date(2026, 7, 31)
-    # 現況（本輪實測）：各席都在期 → 不可誤報
+    # 基準情境：各席**自產**都在期 → 不可誤報（注意這是構造值；真目錄 pm/coinglass/eng
+    # 的最新檔其實是監督員代補產，自產早已停擺——見下方 r31 段）
     ok_now = {"ceo": _date(2026, 7, 30), "pm": _date(2026, 7, 30),
               "coinglass": _date(2026, 7, 28), "design": _date(2026, 7, 29),
               "eng": _date(2026, 7, 29)}
@@ -700,11 +739,46 @@ def _selftest():
                  live_n=0, live_min=30, demo_n=0, demo_live=0, demo_active=False,
                  open_decisions=0, pending_outbox=0, last_nudge_ms=0, org_digest=None)
     check("組織產出正常 → 維持 ADVANCING(不誤報)", a11["state"] == "ADVANCING")
-    # 檔名解析（真目錄，唯讀）
-    real = _read_org_digest_latest()
-    check("真目錄可解析出各席最新日期", isinstance(real, dict) and "ceo" in real)
+
+    # --- r31：代補產不得把缺報洗成痊癒 ------------------------------------
+    # 真實情境：pm 自產停在 7/06，監督員 7/30 代補產。拿「最新檔」當代理＝假痊癒。
+    self_only = {**ok_now, "pm": _date(2026, 7, 6)}
+    v_bf = org_digest_verdict(self_only, today=TODAY,
+                              backfilled={"pm": _date(2026, 7, 30)})
+    check("自產停擺但有代補產 → 仍然要叫(不被洗成痊癒)", v_bf is not None)
+    check("代補產不影響逾期天數(以自產為準)", v_bf["roles"][0]["age_days"] == 25)
+    check("代補產只改措辭：標成未驗收非斷檔", v_bf["text"].startswith("組織排程未驗收："))
+    check("措辭點明代補產只補內容不證明排程已修",
+          "代補產" in v_bf["text"] and "自產" in v_bf["text"])
+    check("all_covered_by_backfill 正確", v_bf["all_covered_by_backfill"] is True)
+    # 混合：一席有代補產、一席完全靜默 → 措辭必須退回「斷檔」（較嚴重者為準）
+    v_mix = org_digest_verdict({**self_only, "eng": _date(2026, 6, 19)}, today=TODAY,
+                               backfilled={"pm": _date(2026, 7, 30)})
+    check("有席完全靜默 → 措辭退回『組織產出斷檔』", v_mix["text"].startswith("組織產出斷檔："))
+    check("完全靜默席 covered_by_backfill=False",
+          v_mix["roles"][0]["role"] == "eng"
+          and v_mix["roles"][0]["covered_by_backfill"] is False)
+    # 陳年代補產（超過門檻）不算覆蓋
+    v_old = org_digest_verdict(self_only, today=TODAY,
+                               backfilled={"pm": _date(2026, 6, 1)})
+    check("陳年代補產不算覆蓋", v_old["roles"][0]["covered_by_backfill"] is False)
+    check("代補產表不影響原本在期的席次",
+          org_digest_verdict(ok_now, today=TODAY,
+                             backfilled={"pm": _date(2026, 7, 30)}) is None)
+
+    # 檔名＋出處解析（真目錄，唯讀）
+    real_self, real_bf = _read_org_digest_latest()
+    check("真目錄可解析出各席最新自產日期",
+          isinstance(real_self, dict) and "ceo" in real_self)
     check("解析結果不含 README 等非 digest 檔",
-          all(k in ORG_ROLE_CADENCE_DAYS for k in real))
+          all(k in ORG_ROLE_CADENCE_DAYS for k in real_self)
+          and all(k in ORG_ROLE_CADENCE_DAYS for k in real_bf))
+    # 真實出處分流（本輪實測：pm/coinglass/eng 最新檔皆為監督員代補產）
+    check("代補產有被辨識出來(非空)", len(real_bf) > 0)
+    check("代補產不混進自產表",
+          all(real_self.get(k) != v for k, v in real_bf.items()))
+    # CEO 7/30 日報正文裡提到別席的「代補產」，不可因此被誤判成代補
+    check("正文提及代補不誤判(只看檔頭)", real_self.get("ceo") == _date(2026, 7, 30))
 
     # render 不爆
     r = render_nudge({**a3, "phase0": {"paper_n": 38, "paper_min": 100, "live_n": 0, "live_min": 30},
