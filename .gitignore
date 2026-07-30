@@ -34,3 +34,14 @@ run_okx_demo_reminder.cmd
 # 一次性本機診斷探針（debug_* / scout_*）：永不進開源 repo（紅線②防呆）
 debug_*.py
 scout_*.py
+
+# 真錢執行器的本機側檔案：永不進開源 repo（紅線①/②防呆）
+#   * consume_intents_live.py 是 make_live_copy.ps1（已追蹤）由 consume_intents.py（已追蹤）
+#     生成的衍生檔——生成器公開可稽核，生成物不入 repo，開源側零資訊損失。
+#   * install_live_key.py / run_live_once.ps1 / verify_live.ps1 為硬編本機絕對路徑的包裝，
+#     對外無重用價值。三者皆不含任何金鑰「值」（只讀 .env 再寫入 ~/.okx/config.toml），
+#     此處列入是為了讓「誤 git add 真錢側檔案」在機制上不可能發生，而非事後靠人記得。
+tools/atk_consumer/consume_intents_live.py
+tools/atk_consumer/install_live_key.py
+tools/atk_consumer/run_live_once.ps1
+tools/atk_consumer/verify_live.ps1
