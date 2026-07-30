@@ -48,6 +48,25 @@ NUDGE_COOLDOWN_SEC = int(os.getenv("OVERSIGHT_NUDGE_COOLDOWN_HOURS", "6") or 6) 
 # Phase 0 demo 實倉樣本目標（與 ceo_session PHASE0_LIVE_MIN 同義，但 demo 僅供判讀）。
 DEMO_SAMPLE_TARGET = 30
 
+# --- 真錢執行器健康（監督員 r26 交棒）-------------------------------------
+# v143 已讓消費器把「連續 fail-closed」寫進健康檔並自行 telegram 告警，但本帳本
+# **沒有任何消費者**：真錢執行器連續 113 輪全被交易所 401 擋掉時，Layer 1 仍回報
+# state=ADVANCING / blockers=[]（因為 git 有 commit）——與「宇宙留痕零消費者」同物種
+# （有訊號、無消費者）。這裡把該訊號接進判定：連續故障 ≥ 門檻即進 blockers/system_faults。
+LIVE_HEALTH_PATH = data_dir() / "atk_consumer_live_health.json"
+# 健康檔太舊＝真錢消費器現在根本沒在跑（例如未啟用），舊 streak 不可當「現在的故障」。
+LIVE_HEALTH_MAX_AGE_SEC = int(os.getenv("OVERSIGHT_LIVE_HEALTH_MAX_AGE_SEC", "900") or 900)
+# 連續幾輪 fail-closed 才算故障（單輪可能只是網路抖動；消費器每分鐘一輪）。
+LIVE_FAIL_BLOCK_ROUNDS = int(os.getenv("OVERSIGHT_LIVE_FAIL_ROUNDS", "3") or 3)
+# 這些故障類別只有本人能解（金鑰／白名單／權限／餘額）→ 球在使用者，歸 blockers。
+# 其餘（網路、程式例外…）＝系統故障，該 push CEO 修，歸 system_faults。
+USER_ACTIONABLE_FAIL_CLASSES = {
+    "auth_ip_whitelist": "OKX API 金鑰 IP 白名單未含目前出口 IP",
+    "auth_key_invalid": "OKX API 金鑰無效或已過期",
+    "auth_permission": "OKX API 金鑰缺少交易權限",
+    "insufficient_balance": "帳戶餘額不足",
+}
+
 
 # ===========================================================================
 # 純決策層（可離線測試，不碰 IO）
@@ -88,9 +107,46 @@ def next_step(*, paper_n, paper_min, live_n, live_min,
     return "樣本接近 Phase 0 門檻，準備由人判讀是否對外宣告（系統不自我宣告，紅線③）"
 
 
+def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
+                      max_age_sec: int = LIVE_HEALTH_MAX_AGE_SEC,
+                      min_rounds: int = LIVE_FAIL_BLOCK_ROUNDS) -> dict | None:
+    """把真錢消費器健康檔翻成「要不要當成阻塞」（純函式，可離線測）。
+
+    回 None＝沒有現行故障（檔不存在／太舊／streak 未達門檻）；
+    否則回 {rounds, cls, user_actionable, text}。
+    """
+    if not health:
+        return None
+    now_s = now_s if now_s is not None else time.time()
+    try:
+        rounds = int(health.get("consecutive_fail_rounds", 0) or 0)
+        updated_at = float(health.get("updated_at", 0) or 0)
+    except Exception:
+        return None
+    if rounds < min_rounds:
+        return None
+    # 新鮮度閘：舊檔＝消費器沒在跑，不可拿昨天的 streak 當今天的阻塞（舊快照陷阱）。
+    age = now_s - updated_at
+    if updated_at <= 0 or age > max_age_sec:
+        return None
+
+    cls = str(health.get("last_fail_class") or "unknown")
+    known = USER_ACTIONABLE_FAIL_CLASSES.get(cls)
+    first_fail = float(health.get("first_fail_ts", 0) or 0)
+    dur = f"、已持續 {_fmt_age(now_s - first_fail)}" if first_fail > 0 else ""
+    if known:
+        text = (f"真錢執行器連續 {rounds} 輪被擋（{known}）{dur}——"
+                f"每輪皆 fail-closed 未下單（零損失），但在你修好前一筆都送不出去")
+    else:
+        text = (f"真錢執行器連續 {rounds} 輪 fail-closed（故障類別：{cls}）{dur}——"
+                f"未下單（零損失），但管線實質停擺，須查明修復")
+    return {"rounds": rounds, "cls": cls, "user_actionable": bool(known), "text": text}
+
+
 def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
            demo_n, demo_live, demo_active, open_decisions, pending_outbox,
            demo_rejected=0, demo_reject_hint=None, real_output_age_sec=None,
+           live_exec=None,
            last_nudge_ms=0, stall_sec=STALL_SEC, nudge_cooldown_sec=NUDGE_COOLDOWN_SEC) -> dict:
     """核心判定（純函式）。回 state / next_step / blockers / should_nudge。
 
@@ -101,10 +157,18 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
       commit 時效未知（無 git）→ IDLE
     """
     blockers: list[str] = []
+    system_faults: list[str] = []
     if open_decisions:
         blockers.append(f"{open_decisions} 項決策待你拍板")
     if pending_outbox:
         blockers.append(f"{pending_outbox} 則對外內容待你核准（/approve）")
+    # r26：真錢執行器持續 fail-closed＝管線實質停擺，不可再回報「一切推進中」。
+    #   只有本人能解的（白名單/金鑰/餘額）歸 blockers（球在你）；其餘歸 system_faults（該 push CEO）。
+    if live_exec:
+        if live_exec.get("user_actionable"):
+            blockers.append(live_exec["text"])
+        else:
+            system_faults.append(live_exec["text"])
 
     ns = next_step(paper_n=paper_n, paper_min=paper_min, live_n=live_n,
                    live_min=live_min, demo_n=demo_n, demo_active=demo_active,
@@ -124,6 +188,11 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
     else:
         state = "STALLED"
 
+    # 系統故障蓋過 ADVANCING：commit 照常不代表管線活著（r26 實例＝真錢側連續 113 輪全滅
+    #   卻回報 ADVANCING）。STALLED 語意＝「該 push CEO 修」，正是這種情況。
+    if system_faults and state == "ADVANCING":
+        state = "STALLED"
+
     cooldown_ok = (now_ms - last_nudge_ms) >= nudge_cooldown_sec * 1000
     # 只在「STALLED（該 push CEO）」或「BLOCKED_ON_USER（提醒你有待辦）」且過冷卻才提醒。
     should_nudge = state in ("STALLED", "BLOCKED_ON_USER") and cooldown_ok
@@ -132,6 +201,8 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
         "state": state,
         "next_step": ns,
         "blockers": blockers,
+        "system_faults": system_faults,
+        "live_exec": live_exec,
         "should_nudge": should_nudge,
         "commit_age_sec": commit_age_sec,
         "real_output_age_sec": real_output_age_sec,
@@ -159,6 +230,8 @@ def render_nudge(snap: dict) -> str:
                      f"｜模擬已平倉 {snap.get('demo_n', 0)}/{DEMO_SAMPLE_TARGET}"
                      f"（在場 {snap.get('demo_live', 0)} 筆）"
                      f"｜真實 {p.get('live_n', 0)}/{p.get('live_min', 0)}")
+    if snap.get("system_faults"):
+        lines.append("🛑 系統故障：" + "；".join(snap["system_faults"]))
     if snap.get("blockers"):
         lines.append("🙋 待你處理：" + "；".join(snap["blockers"]))
     lines.append(f"➡️ 建議下一步：{snap['next_step']}")
@@ -197,6 +270,15 @@ def _git_last_commit_age_sec() -> int | None:
 def _read_ledger() -> dict:
     try:
         with open(LEDGER_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _read_live_exec_health() -> dict:
+    """真錢消費器（v143）寫的健康檔；不存在／壞檔 → {}（純讀，永不拋）。"""
+    try:
+        with open(LIVE_HEALTH_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -278,6 +360,13 @@ def build_snapshot(now_ms: int | None = None) -> dict:
     except Exception:
         pass
 
+    # r26：真錢執行器健康（v143 健康檔）。純讀＋新鮮度閘，讀不到就當「無故障」。
+    live_exec = None
+    try:
+        live_exec = live_exec_verdict(_read_live_exec_health(), now_s=now_ms / 1000)
+    except Exception:
+        pass
+
     verdict = assess(
         now_ms=now_ms, commit_age_sec=commit_age_sec,
         paper_n=paper_n, paper_min=paper_min, live_n=live_n, live_min=live_min,
@@ -285,6 +374,7 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         open_decisions=open_decisions, pending_outbox=pending_outbox,
         demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint,
         real_output_age_sec=real_output_age_sec,
+        live_exec=live_exec,
         last_nudge_ms=last_nudge_ms,
     )
 
@@ -433,10 +523,45 @@ def _selftest():
     check("久無commit+有待辦 → BLOCKED_ON_USER(非STALLED)", a6["state"] == "BLOCKED_ON_USER")
     check("blockers 含決策+對外兩項", len(a6["blockers"]) == 2)
 
+    # --- r26：真錢執行器健康接進判定 ---------------------------------------
+    NOW_S = now / 1000
+    h_live = {"consecutive_fail_rounds": 113, "updated_at": NOW_S - 30,
+              "first_fail_ts": NOW_S - 6700, "last_fail_class": "auth_ip_whitelist"}
+    v_live = live_exec_verdict(h_live, now_s=NOW_S)
+    check("連續故障達門檻 → 判為阻塞", v_live is not None and v_live["rounds"] == 113)
+    check("白名單類 → 標記為本人可解", v_live["user_actionable"] is True)
+    check("無健康檔 → 無故障", live_exec_verdict({}, now_s=NOW_S) is None)
+    check("單輪失敗(未達門檻) → 不算故障",
+          live_exec_verdict({**h_live, "consecutive_fail_rounds": 1}, now_s=NOW_S) is None)
+    # 新鮮度閘：舊檔＝消費器沒在跑，不可拿舊 streak 當現在的阻塞
+    check("健康檔過舊 → 不當現行故障",
+          live_exec_verdict({**h_live, "updated_at": NOW_S - 99999}, now_s=NOW_S) is None)
+    v_sys = live_exec_verdict({**h_live, "last_fail_class": "network"}, now_s=NOW_S)
+    check("未知類別 → 歸系統故障(非本人可解)", v_sys is not None and v_sys["user_actionable"] is False)
+
+    # 核心迴歸：有 commit（原本 ADVANCING）但真錢側全滅 → 不可再回報一切正常
+    a7 = assess(now_ms=now, commit_age_sec=600, paper_n=38, paper_min=100,
+                live_n=0, live_min=30, demo_n=0, demo_live=0, demo_active=False,
+                open_decisions=0, pending_outbox=0, last_nudge_ms=0, live_exec=v_live)
+    check("有commit+真錢401全滅 → BLOCKED_ON_USER(非ADVANCING)", a7["state"] == "BLOCKED_ON_USER")
+    check("真錢阻塞進 blockers", any("真錢執行器" in b for b in a7["blockers"]))
+    check("真錢阻塞 → 解除提醒抑制", a7["should_nudge"] is True)
+    a8 = assess(now_ms=now, commit_age_sec=600, paper_n=38, paper_min=100,
+                live_n=0, live_min=30, demo_n=0, demo_live=0, demo_active=False,
+                open_decisions=0, pending_outbox=0, last_nudge_ms=0, live_exec=v_sys)
+    check("有commit+系統類故障 → STALLED(該push CEO)", a8["state"] == "STALLED")
+    check("系統故障不誤標成『待你處理』", a8["blockers"] == [] and len(a8["system_faults"]) == 1)
+    a9 = assess(now_ms=now, commit_age_sec=600, paper_n=38, paper_min=100,
+                live_n=0, live_min=30, demo_n=0, demo_live=0, demo_active=False,
+                open_decisions=0, pending_outbox=0, last_nudge_ms=0, live_exec=None)
+    check("真錢側健康 → 維持 ADVANCING(不誤報)", a9["state"] == "ADVANCING")
+
     # render 不爆
     r = render_nudge({**a3, "phase0": {"paper_n": 38, "paper_min": 100, "live_n": 0, "live_min": 30},
                       "demo_n": 0})
     check("render_nudge 產出非空 HTML", "<b>" in r and len(r) > 20)
+    r2 = render_nudge({**a8, "phase0": {}, "demo_n": 0})
+    check("render_nudge 揭露系統故障", "🛑 系統故障" in r2)
 
     print(f"\nceo_oversight 自測：{ok}/{ok + fail} 通過")
     return fail == 0
@@ -449,6 +574,7 @@ def _print_status():
     print(f"  commit_age   : {_fmt_age(snap['commit_age_sec']) if snap['commit_age_sec'] is not None else '—'}")
     print(f"  demo_active  : {snap['demo_active']}（樣本 {snap['demo_n']}/{DEMO_SAMPLE_TARGET}，在場 {snap['demo_live']}）")
     print(f"  blockers     : {snap['blockers'] or '（無）'}")
+    print(f"  system_faults: {snap.get('system_faults') or '（無）'}")
     print(f"  should_nudge : {snap['should_nudge']}")
     print(f"  next_step    : {snap['next_step']}")
     print(f"\n--- 提醒預覽（不發送）---")
