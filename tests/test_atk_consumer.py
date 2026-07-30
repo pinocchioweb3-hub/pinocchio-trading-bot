@@ -120,7 +120,7 @@ def test_alert_only_after_threshold_consecutive_rounds():
 def test_single_bad_round_then_clean_never_alerts():
     now = 1_000_000.0
     h = ci.update_health({}, {"timeout": "x"}, now)
-    h = ci.update_health(h, {}, now + 60)
+    h = ci.update_health(h, {}, now + 60, oks=1)
     assert h["consecutive_fail_rounds"] == 0
     assert not ci.should_alert(h, now + 60)
     assert not h.get("recovered_from")      # 沒告警過就不該發恢復通知
@@ -147,9 +147,50 @@ def test_recovery_notice_after_alerted_streak():
     for i in range(ci.FAIL_ALERT_AFTER):
         h = ci.update_health(h, {"auth": "bad key"}, now + i * 60)
     h["last_alert_ts"], h["last_alert_class"] = now + 120, "auth"
-    h = ci.update_health(h, {}, now + 600)
+    h = ci.update_health(h, {}, now + 600, oks=1)
     assert h["recovered_from"]["fail_rounds"] == ci.FAIL_ALERT_AFTER
     assert not h.get("last_alert_ts")       # 冷卻重置：下次故障立刻能再報
+
+
+def test_idle_round_never_counts_as_recovery():
+    """v151 假痊癒治本：零呼叫的空轉輪不得歸零、不得送恢復通知。
+
+    重現 2026-07-31：401 斷流中，佇列裡的 intent 剛好全部過期→那一輪一次呼叫
+    都沒發生→fails 是空的→舊版判乾淨輪→送「✅已恢復」→下一輪立刻又 401。"""
+    now = 1_000_000.0
+    h = {}
+    for i in range(ci.FAIL_ALERT_AFTER):
+        h = ci.update_health(h, {"auth_ip_whitelist": _FAKE_401}, now + i * 60)
+    h["last_alert_ts"], h["last_alert_class"] = now + 120, "auth_ip_whitelist"
+    streak = h["consecutive_fail_rounds"]
+    # 空轉輪（無故障、無成功呼叫）：判定完全維持原狀
+    h = ci.update_health(h, {}, now + 600, oks=0)
+    assert h["consecutive_fail_rounds"] == streak   # 不歸零
+    assert not h.get("recovered_from")              # 不假報恢復
+    assert h["last_alert_ts"] == now + 120          # 冷卻不被空轉輪洗掉
+    assert h["idle_rounds"] == 1 and h["last_idle_ts"] == now + 600
+    # 之後真的通了才算恢復
+    h = ci.update_health(h, {}, now + 660, oks=1)
+    assert h["consecutive_fail_rounds"] == 0
+    assert h["recovered_from"]["fail_rounds"] == streak
+
+
+def test_oks_defaults_to_zero_so_callers_must_prove_reachability():
+    # fail-closed 方向：呼叫端沒證明「通了」就不算通，寧可晚報恢復不可假報
+    h = ci.update_health({}, {"auth": "x"}, 1.0)
+    assert ci.update_health(h, {}, 2.0)["consecutive_fail_rounds"] == 1
+
+
+def test_benign_response_counts_as_reachable_not_idle(monkeypatch):
+    # 「查無此單」是良性回應：不算故障，但確實通到 OKX＝要算成功呼叫
+    class _R:
+        returncode, stdout, stderr = 1, "51603 order does not exist", ""
+    monkeypatch.setattr(ci, "_OKX_BIN", "okx")
+    monkeypatch.setattr(ci.subprocess, "run", lambda *a, **k: _R())
+    ci._ROUND_FAILS.clear()
+    ci._ROUND_OKS["ok"] = 0
+    ci._okx(["order", "get"])
+    assert ci._ROUND_FAILS == {} and ci._ROUND_OKS["ok"] == 1
 
 
 def test_worst_class_priority_and_counts_per_round():

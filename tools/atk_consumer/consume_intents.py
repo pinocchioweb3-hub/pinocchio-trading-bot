@@ -63,6 +63,9 @@ _BENIGN_MARKERS = ("51603", "doesn't exist", "does not exist")
 _CLASS_PRIORITY = ("cli_missing", "auth_ip_whitelist", "auth", "rate_limit",
                    "timeout", "query_fail", "other")
 _ROUND_FAILS: dict[str, str] = {}   # 本輪故障 {類別: 樣本}；每輪開頭清空
+# v151：本輪「成功呼叫數」；每輪開頭歸零。沒有它就無法分辨「全部呼叫都成功」
+# 與「這輪根本沒呼叫」——後者被當成乾淨輪會蓋出假痊癒（見 update_health）。
+_ROUND_OKS: dict[str, int] = {"ok": 0}
 
 
 # Windows 陷阱：npm 全域裝的 okx 是 okx.cmd shim，subprocess 不走 shell 找不到裸名
@@ -111,8 +114,8 @@ def _note_fail(cls: str | None, sample: str) -> None:
 def _okx(args: list[str], timeout: int = 30) -> tuple[int, str]:
     """呼叫 okx CLI（--json 輸出）。回 (exit_code, stdout)。
 
-    失敗一律登記到 _ROUND_FAILS（單一掛鉤攔到槓桿/查單/下單/對帳全部路徑）——
-    只加副作用，回傳值與交易邏輯完全不變。"""
+    失敗一律登記到 _ROUND_FAILS、成功一律計入 _ROUND_OKS（單一掛鉤攔到槓桿/查單/
+    下單/對帳全部路徑）——只加副作用，回傳值與交易邏輯完全不變。"""
     if not _OKX_BIN:
         out = "okx CLI 未安裝（npm install -g @okx_ai/okx-trade-cli）"
         _note_fail("cli_missing", out)
@@ -123,7 +126,13 @@ def _okx(args: list[str], timeout: int = 30) -> tuple[int, str]:
                            encoding="utf-8", errors="replace", timeout=timeout)
         out = (r.stdout or r.stderr or "")
         if r.returncode != 0:
-            _note_fail(classify_failure(r.returncode, out), out)
+            cls = classify_failure(r.returncode, out)
+            _note_fail(cls, out)
+            # 良性回應（查無此單）代表呼叫確實通到 OKX 並拿到可理解的答覆＝算通
+            if cls is None:
+                _ROUND_OKS["ok"] += 1
+        else:
+            _ROUND_OKS["ok"] += 1        # v151：成功也要記，否則無從證明「真的通了」
         return r.returncode, out
     except subprocess.TimeoutExpired:
         _note_fail("timeout", "okx CLI timeout")
@@ -171,11 +180,19 @@ def worst_class(classes) -> str | None:
     return next(iter(sorted(classes)), None)
 
 
-def update_health(h: dict, fails: dict, now_s: float) -> dict:
+def update_health(h: dict, fails: dict, now_s: float, oks: int = 0) -> dict:
     """把本輪結果併進健康狀態（純函式，不做 I/O）。
 
     connsecutive_fail_rounds 只在「有故障的輪」累加；乾淨輪歸零並在曾告警過時
-    留下 recovered_from＝讓恢復也有出口（無聲恢復同樣會讓人誤判）。"""
+    留下 recovered_from＝讓恢復也有出口（無聲恢復同樣會讓人誤判）。
+
+    v151【假痊癒治本】「沒故障」不等於「通了」——本輪一次呼叫都沒發生（intent 全
+    過期／無倉可管）時 fails 也是空的。舊版把這種**空轉輪**當乾淨輪：連續故障歸零、
+    送出「✅已恢復」，但故障其實一步都沒好。2026-07-31 就是這樣：401 白名單斷流
+    291 輪 → 兩個 intent 剛好過期 → 空轉一輪 → 假恢復通知 → 下一輪立刻又 401。
+    因此改成三態：有故障→累加；無故障但 oks==0→**空轉，維持原狀**（不歸零、不報
+    恢復）；無故障且 oks>0→真的通了才算乾淨輪。oks 預設 0＝呼叫端沒證明就不算通
+    （fail-closed 方向：寧可晚報恢復，不可假報恢復）。"""
     h = dict(h)
     h["rounds_seen"] = int(h.get("rounds_seen", 0)) + 1
     h["updated_at"] = now_s
@@ -183,6 +200,11 @@ def update_health(h: dict, fails: dict, now_s: float) -> dict:
                                           time.localtime(now_s))
     h["profile"] = PROFILE
     h.pop("recovered_from", None)
+    if not fails and int(oks or 0) <= 0:
+        # 空轉輪：沒故障也沒成功呼叫＝本輪對「是否已恢復」零資訊，維持原判
+        h["idle_rounds"] = int(h.get("idle_rounds", 0)) + 1
+        h["last_idle_ts"] = now_s
+        return h
     if not fails:
         streak = int(h.get("consecutive_fail_rounds", 0))
         if streak >= FAIL_ALERT_AFTER and h.get("last_alert_ts"):
@@ -301,12 +323,14 @@ def send_alert(text: str, dry: bool = False) -> tuple[str, str | None]:
 
 
 def finish_round(fails: dict, now_s: float | None = None,
-                 dry: bool = False) -> dict:
+                 dry: bool = False, oks: int = 0) -> dict:
     """每輪收尾：更新健康檔、必要時告警。永不對外拋例外——
-    告警層絕不可以把交易執行器弄掛（它的職責只是「讓失敗有出口」）。"""
+    告警層絕不可以把交易執行器弄掛（它的職責只是「讓失敗有出口」）。
+
+    oks＝本輪成功呼叫數；沒有它就分不出「空轉輪」與「乾淨輪」（見 update_health）。"""
     now_s = now_s or time.time()
     try:
-        h = update_health(_load_health(), fails, now_s)
+        h = update_health(_load_health(), fails, now_s, oks)
         if h.get("recovered_from"):
             ch, err = send_alert(recovery_text(h), dry=dry)
             h["last_alert_channel"], h["last_alert_error"] = ch, err
@@ -319,6 +343,12 @@ def finish_round(fails: dict, now_s: float | None = None,
             print(f"🚨 連續 {h['consecutive_fail_rounds']} 輪 fail-closed"
                   f"（{h.get('last_fail_class')}）——已告警，管道={ch}"
                   + (f"，管道錯誤={err}" if err else ""))
+        elif not fails and int(oks or 0) <= 0 \
+                and int(h.get("consecutive_fail_rounds", 0)) > 0:
+            # v151：斷流中的空轉輪要留痕，否則日誌看起來像「不吵了＝好了」
+            print(f"⏸ 本輪零呼叫（空轉，無 intent 可執行／無倉可管）——"
+                  f"不當作恢復，維持連續故障第 "
+                  f"{h.get('consecutive_fail_rounds')} 輪判定")
         elif fails:
             streak = int(h.get("consecutive_fail_rounds", 0))
             tail = (f"（已告警過，冷卻中：同類故障每 {FAIL_ALERT_REPEAT_SEC / 60:.0f} "
@@ -638,8 +668,13 @@ def selftest_fail(rounds: int) -> int:
             print(f"[假第 {i + 1} 輪]", end=" ")
             finish_round(dict(_ROUND_FAILS), now + i * 60, dry=True)
         _ROUND_FAILS.clear()
+        # v151：先驗「空轉輪不得假痊癒」——零呼叫的一輪不可歸零、不可送恢復通知
+        print("[假空轉輪]", end=" ")
+        hi = finish_round({}, now + rounds * 60, dry=True, oks=0)
+        print(f"— 空轉輪檢查：連續故障維持={hi.get('consecutive_fail_rounds')} 輪"
+              f"（應仍為 {rounds}），未誤送恢復通知={not hi.get('recovered_from')} —")
         print("[假恢復輪]", end=" ")
-        h = finish_round({}, now + rounds * 60, dry=True)
+        h = finish_round({}, now + (rounds + 1) * 60, dry=True, oks=1)
         print(f"— 實證結束：連續故障歸零={h.get('consecutive_fail_rounds') == 0}，"
               f"恢復通知已送={bool(h.get('recovered_from'))}，"
               f"告警冷卻已重置={not h.get('last_alert_ts')} —")
@@ -672,6 +707,7 @@ def main() -> int:
     while True:
         now_ms = time.time() * 1000
         _ROUND_FAILS.clear()             # v143：本輪故障帳從零開始
+        _ROUND_OKS["ok"] = 0             # v151：成功帳同步歸零（分辨空轉輪用）
         # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
         manage_positions(a.dry_run)
         halted_today = breaker_tripped(_load_positions().get("day_pnl", {}))
@@ -719,7 +755,7 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             pass
         # v143：本輪收尾——把 fail-closed 記帳並在連續失敗時告警（dry-run 不真送）
-        finish_round(dict(_ROUND_FAILS), dry=a.dry_run)
+        finish_round(dict(_ROUND_FAILS), dry=a.dry_run, oks=_ROUND_OKS["ok"])
         if a.once or a.dry_run:
             return 0
         time.sleep(60)
