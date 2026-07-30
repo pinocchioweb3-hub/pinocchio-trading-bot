@@ -29,6 +29,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import date as _date, datetime as _datetime
 
 from botpaths import PROJECT_ROOT, data_dir
 
@@ -66,6 +67,28 @@ USER_ACTIONABLE_FAIL_CLASSES = {
     "auth_permission": "OKX API 金鑰缺少交易權限",
     "insufficient_balance": "帳戶餘額不足",
 }
+
+# --- 組織產出斷檔（監督員 r30）---------------------------------------------
+# 同物種第四例（有訊號、無消費者）：2026-07-12～07-28 各席週報無聲斷檔 16.4 天，
+# 無人發現。根因＝排程層的 lastRunAt **只記「觸發」不記「成功」**，所以排程看起來
+# 一切正常，實際上那一輪什麼都沒產出；唯一的檢查是監督員 SKILL.md 的散文指示
+# （靠 LLM 每輪肉眼比對檔齡）——LLM 漏看就沒有第二道防線。這裡把它變成程式：
+# 直接量「各席最新 digest 檔的日期 vs 該席節奏」，連缺 ≥2 期即進 system_faults。
+#
+# 節奏表（機器可讀單一來源）。目前同一份節奏散落在三處：本表、排程 MCP 的 cron、
+# docs/org/00-團隊章程總覽.md 的表格；其中章程表格**漏列** CoinGlass 稽核官（週二），
+# 已於本輪一併補上。日後改節奏三處都要動——這是已知技術債，非本輪範圍。
+ORG_DIGEST_DIR = PROJECT_ROOT / "docs" / "org" / "digests"
+ORG_ROLE_CADENCE_DAYS = {
+    "ceo": ("CEO 日報", 1),           # cron 0 9 * * *
+    "pm": ("產品總監週報", 7),         # cron 30 9 * * 1（週一）
+    "coinglass": ("CoinGlass 稽核官週報", 7),  # cron 25 9 * * 2（週二）
+    "design": ("創意總監週報", 7),      # cron 30 9 * * 3（週三）
+    "eng": ("高級程式設計師週報", 7),    # cron 30 9 * * 5（週五）
+}
+# 連缺幾期才算斷檔（SKILL.md 原文：「連缺 2 期以上」）。取 2 是為了容忍單次跳過
+# （機器沒開／jitter 跨日），只在「真的連續沒產出」時才叫——寧可晚一期，不可狼來了。
+ORG_DIGEST_MISS_PERIODS = int(os.getenv("OVERSIGHT_ORG_DIGEST_MISS_PERIODS", "2") or 2)
 
 
 # ===========================================================================
@@ -143,10 +166,47 @@ def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
     return {"rounds": rounds, "cls": cls, "user_actionable": bool(known), "text": text}
 
 
+def org_digest_verdict(latest_by_role: dict | None, *, today,
+                       cadence: dict | None = None,
+                       miss_periods: int = ORG_DIGEST_MISS_PERIODS) -> dict | None:
+    """把「各席最新 digest 日期」翻成「有沒有斷檔」（純函式，可離線測）。
+
+    latest_by_role: {role: datetime.date}；today: datetime.date。
+    回 None＝無斷檔；否則回 {roles, text, worst_age_days}。
+
+    兩個不誤報的守則：
+      • latest_by_role 為空（目錄不存在／零檔）＝環境問題（換機器、淺 clone），
+        不是斷檔——回 None，交由人工，不製造假故障。
+      • 某席「從未產出過」＝沒有基準可算「遲了幾期」，跳過該席（同理不誤報）。
+    """
+    if not latest_by_role:
+        return None
+    cadence = cadence or ORG_ROLE_CADENCE_DAYS
+    late = []
+    for role, (label, cad_days) in cadence.items():
+        d = latest_by_role.get(role)
+        if d is None:
+            continue
+        age_days = (today - d).days
+        if age_days > cad_days * miss_periods:
+            late.append({
+                "role": role, "label": label, "age_days": age_days,
+                "cadence_days": cad_days, "missed_periods": age_days // cad_days,
+            })
+    if not late:
+        return None
+    late.sort(key=lambda x: -x["age_days"])
+    parts = [f"{x['label']}最新為 {x['age_days']} 天前（節奏每 {x['cadence_days']} 天，"
+             f"已缺約 {x['missed_periods']} 期）" for x in late]
+    text = ("組織產出斷檔：" + "；".join(parts)
+            + "——排程 lastRunAt 只記『觸發』不記『成功』，須查該席排程是否無聲失敗（並代補產）")
+    return {"roles": late, "text": text, "worst_age_days": late[0]["age_days"]}
+
+
 def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
            demo_n, demo_live, demo_active, open_decisions, pending_outbox,
            demo_rejected=0, demo_reject_hint=None, real_output_age_sec=None,
-           live_exec=None,
+           live_exec=None, org_digest=None,
            last_nudge_ms=0, stall_sec=STALL_SEC, nudge_cooldown_sec=NUDGE_COOLDOWN_SEC) -> dict:
     """核心判定（純函式）。回 state / next_step / blockers / should_nudge。
 
@@ -169,6 +229,9 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
             blockers.append(live_exec["text"])
         else:
             system_faults.append(live_exec["text"])
+    # r30：組織產出斷檔＝系統故障（該 push CEO／監督員代補產），球不在使用者。
+    if org_digest:
+        system_faults.append(org_digest["text"])
 
     ns = next_step(paper_n=paper_n, paper_min=paper_min, live_n=live_n,
                    live_min=live_min, demo_n=demo_n, demo_active=demo_active,
@@ -203,6 +266,7 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
         "blockers": blockers,
         "system_faults": system_faults,
         "live_exec": live_exec,
+        "org_digest": org_digest,
         "should_nudge": should_nudge,
         "commit_age_sec": commit_age_sec,
         "real_output_age_sec": real_output_age_sec,
@@ -282,6 +346,34 @@ def _read_live_exec_health() -> dict:
             return json.load(f)
     except Exception:
         return {}
+
+
+def _read_org_digest_latest() -> dict:
+    """掃 docs/org/digests/，回 {role: 最新日期(date)}（純讀，永不拋）。
+
+    取檔名裡的日期而非 mtime——mtime 會被 clone / 同步 / 編輯洗掉，檔名日期才是
+    「那一期報告」的真身（README.md 等非 digest 檔自然不match，直接略過）。
+    """
+    latest: dict = {}
+    try:
+        if not ORG_DIGEST_DIR.is_dir():
+            return {}
+        for p in ORG_DIGEST_DIR.glob("*.md"):
+            stem = p.stem
+            role, _, datestr = stem.rpartition("-20")
+            if not role or "-" not in datestr:
+                continue
+            try:
+                d = _date.fromisoformat("20" + datestr)
+            except Exception:
+                continue
+            if role not in ORG_ROLE_CADENCE_DAYS:
+                continue
+            if role not in latest or d > latest[role]:
+                latest[role] = d
+    except Exception:
+        return {}
+    return latest
 
 
 def _write_ledger(snap: dict) -> None:
@@ -367,6 +459,17 @@ def build_snapshot(now_ms: int | None = None) -> dict:
     except Exception:
         pass
 
+    # r30：組織產出斷檔（各席 digest 檔齡 vs 節奏）。「今天」用**本地日期**，因為
+    #   digest 檔名與排程 cron 都是台北時間的日期，拿 UTC 日期比會在 08:00 前差一天。
+    org_digest = None
+    try:
+        org_digest = org_digest_verdict(
+            _read_org_digest_latest(),
+            today=_datetime.fromtimestamp(now_ms / 1000).date(),
+        )
+    except Exception:
+        pass
+
     verdict = assess(
         now_ms=now_ms, commit_age_sec=commit_age_sec,
         paper_n=paper_n, paper_min=paper_min, live_n=live_n, live_min=live_min,
@@ -374,7 +477,7 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         open_decisions=open_decisions, pending_outbox=pending_outbox,
         demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint,
         real_output_age_sec=real_output_age_sec,
-        live_exec=live_exec,
+        live_exec=live_exec, org_digest=org_digest,
         last_nudge_ms=last_nudge_ms,
     )
 
@@ -555,6 +658,53 @@ def _selftest():
                 live_n=0, live_min=30, demo_n=0, demo_live=0, demo_active=False,
                 open_decisions=0, pending_outbox=0, last_nudge_ms=0, live_exec=None)
     check("真錢側健康 → 維持 ADVANCING(不誤報)", a9["state"] == "ADVANCING")
+
+    # --- r30：組織產出斷檔接進判定 ---------------------------------------
+    TODAY = _date(2026, 7, 31)
+    # 現況（本輪實測）：各席都在期 → 不可誤報
+    ok_now = {"ceo": _date(2026, 7, 30), "pm": _date(2026, 7, 30),
+              "coinglass": _date(2026, 7, 28), "design": _date(2026, 7, 29),
+              "eng": _date(2026, 7, 29)}
+    check("各席在期 → 無斷檔(不誤報)", org_digest_verdict(ok_now, today=TODAY) is None)
+    # 真實迴歸：7/12–7/28 那次 16.4 天無聲斷檔，若當時有本消費者是否會叫？
+    outage = {"ceo": _date(2026, 7, 11), "pm": _date(2026, 6, 22),
+              "coinglass": _date(2026, 6, 23), "design": _date(2026, 7, 8),
+              "eng": _date(2026, 6, 19)}
+    v_gap = org_digest_verdict(outage, today=_date(2026, 7, 28))
+    check("7/12–7/28 真實斷檔 → 會被抓到", v_gap is not None)
+    check("斷檔列出全部逾期席次", v_gap is not None and len(v_gap["roles"]) == 5)
+    check("最嚴重者排最前(eng 39天)", v_gap["roles"][0]["role"] == "eng"
+          and v_gap["roles"][0]["age_days"] == 39)
+    check("斷檔文字點出 lastRunAt 根因", "lastRunAt" in v_gap["text"])
+    # 邊界：CEO 日報缺 1 天不叫（容忍單次跳過），缺 3 天才叫
+    check("CEO 缺1天 → 不叫(容忍跳過)",
+          org_digest_verdict({**ok_now, "ceo": _date(2026, 7, 30)}, today=TODAY) is None)
+    check("CEO 缺2天 → 仍不叫(剛好門檻)",
+          org_digest_verdict({**ok_now, "ceo": _date(2026, 7, 29)}, today=TODAY) is None)
+    v_ceo = org_digest_verdict({**ok_now, "ceo": _date(2026, 7, 28)}, today=TODAY)
+    check("CEO 缺3天 → 叫(超過2期)", v_ceo is not None and v_ceo["roles"][0]["role"] == "ceo")
+    # 不誤報守則
+    check("目錄空/不存在 → 不當斷檔", org_digest_verdict({}, today=TODAY) is None)
+    check("None → 不當斷檔", org_digest_verdict(None, today=TODAY) is None)
+    check("某席從未產出 → 跳過該席(不誤報)",
+          org_digest_verdict({k: v for k, v in ok_now.items() if k != "eng"},
+                             today=TODAY) is None)
+    # 接進 assess：有 commit 但組織產出斷檔 → 不可再回報 ADVANCING
+    a10 = assess(now_ms=now, commit_age_sec=600, paper_n=38, paper_min=100,
+                 live_n=0, live_min=30, demo_n=0, demo_live=0, demo_active=False,
+                 open_decisions=0, pending_outbox=0, last_nudge_ms=0, org_digest=v_gap)
+    check("有commit+組織斷檔 → STALLED(該push CEO)", a10["state"] == "STALLED")
+    check("組織斷檔歸系統故障非待你處理",
+          a10["blockers"] == [] and any("組織產出斷檔" in s for s in a10["system_faults"]))
+    a11 = assess(now_ms=now, commit_age_sec=600, paper_n=38, paper_min=100,
+                 live_n=0, live_min=30, demo_n=0, demo_live=0, demo_active=False,
+                 open_decisions=0, pending_outbox=0, last_nudge_ms=0, org_digest=None)
+    check("組織產出正常 → 維持 ADVANCING(不誤報)", a11["state"] == "ADVANCING")
+    # 檔名解析（真目錄，唯讀）
+    real = _read_org_digest_latest()
+    check("真目錄可解析出各席最新日期", isinstance(real, dict) and "ceo" in real)
+    check("解析結果不含 README 等非 digest 檔",
+          all(k in ORG_ROLE_CADENCE_DAYS for k in real))
 
     # render 不爆
     r = render_nudge({**a3, "phase0": {"paper_n": 38, "paper_min": 100, "live_n": 0, "live_min": 30},
