@@ -79,6 +79,40 @@ def _load_closed_paper(days: int = 120, db=None) -> list[dict]:
     return out
 
 
+# ── 宇宙世代同代化（v144，監督員 r29 治本） ──────────────────────────
+def _same_generation_only(rows: list[dict]) -> tuple[list[dict], dict]:
+    """只留「與現行生產宇宙同一代」的樣本，回 (rows, cohort 摘要)。
+
+    為什麼（與 v114 排除 us_breakout 同一條理）：CoinGlass 訂閱 2026-07-08 到期後
+    宇宙降級到免費 OKX 源，活線 topN_agreement=0.0＝選出來的標的實質換掉。120 天
+    窗把兩代混在一桶算晉升，等於拿上一代的成交行為替這一代的參數背書；一旦樣本
+    跨過 n≥30 就會餵出錯誤晉升。這裡在**進統計之前**切乾淨，不動 L2 任何門檻。
+
+    分寸：只做同代化，不降也不加門檻；同代樣本不足時由既有 minTRL(30) 自然
+    fail-closed（＝0 晉升、覆寫表恆空），這是誠實答案而非退化。世代標籤取不到時
+    （全庫皆無留痕）active_generation 回 "unknown"＝維持既有行為，不製造新阻斷。
+    """
+    from l3_dispatcher import universe_provenance as up
+    rows = list(rows or [])
+    mix = up.cohort_mix(rows)
+    gen = up.active_generation(rows)
+    kept = [r for r in rows if up.generation_of_row(r) == gen]
+    return kept, {"active_generation": gen, "mix": mix,
+                  "n_in": len(rows), "n_kept": len(kept),
+                  "n_excluded_other_generation": len(rows) - len(kept)}
+
+
+def _render_cohort_line(result: dict) -> str:
+    """報告用一行：這批統計樣本是哪一代宇宙、排除了幾筆別代（誠實揭露樣本被縮小）。"""
+    c = (result or {}).get("cohort") or {}
+    if not c:
+        return ""
+    mix = "、".join(f"{k}={v}" for k, v in sorted(c.get("mix", {}).items()))
+    return (f"🌐 宇宙世代：只採 <b>{c.get('active_generation')}</b> 代樣本 "
+            f"{c.get('n_kept')} 筆（排除別代 {c.get('n_excluded_other_generation')} 筆；"
+            f"全窗分佈 {mix or '—'}）")
+
+
 def _quadrant_of(row: dict) -> str:
     """與 lessons_store.distill 同規則：plan_snapshot.regime_at_entry.oi_price_quadrant。"""
     import json
@@ -139,11 +173,12 @@ def optimize_bucket(symbol: str, quadrant: str, trades: list[dict], *,
 def run_optimization(*, days: int = 120, at_ms: int | None = None,
                      rows: list[dict] | None = None, ledger=None,
                      active_path=None, audit_path=None, db=None) -> dict:
-    """載入→分桶(symbol×quadrant)→逐桶優化。rows 可注入（測試用，繞過 DB）。"""
+    """載入→（v144 宇宙世代同代化）→分桶(symbol×quadrant)→逐桶優化。rows 可注入（測試）。"""
     if at_ms is None:
         at_ms = int(time.time() * 1000)
     if rows is None:
         rows = _load_closed_paper(days=days, db=db)
+    rows, cohort = _same_generation_only(rows)
     if ledger is None:
         from backtest.l2_stat_gates import TrialLedger, default_ledger_path
         ledger = TrialLedger(default_ledger_path())
@@ -172,7 +207,8 @@ def run_optimization(*, days: int = 120, at_ms: int | None = None,
                      if b["applied"] and b["applied"]["action"] == "promote")
     n_pooled = sum(1 for b in buckets if b["symbol"] == aps.POOL)
     return {"at_ms": at_ms, "n_buckets": len(buckets), "n_trades": len(rows),
-            "n_pooled": n_pooled, "n_promoted": n_promoted, "buckets": buckets}
+            "n_pooled": n_pooled, "n_promoted": n_promoted, "buckets": buckets,
+            "cohort": cohort}
 
 
 # ── 繁中報告（CEO/調參 Session 透明化） ──────────────────────────────
@@ -195,12 +231,14 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
         return ("🤖 <b>自動優化器</b>（TP 分配，過 L2 才寫模擬盤）\n"
                 f"掃 {result['n_trades']} 筆／{result['n_buckets']} 桶｜"
                 f"本輪晉升 <b>0</b> 桶（皆未過 L2{prog}）\n"
+                + _render_cohort_line(result) + "\n"
                 + aps.render_active(active_path) + "\n"
                 "<i>只驅動模擬盤（紅線①）；覆寫表恆空＝零行為變更，可事後 rollback。</i>")
     lines = ["🤖 <b>自動優化器</b>（step8：過 L2 後直接寫模擬盤 TP 分配，即時生效）",
              "━━━━━━━━━━━━━━━━",
              f"掃 {result['n_trades']} 筆已平倉紙上單，分 {result['n_buckets']} 桶"
-             f"（symbol×regime）｜本輪晉升 {result['n_promoted']} 桶"]
+             f"（symbol×regime）｜本輪晉升 {result['n_promoted']} 桶",
+             _render_cohort_line(result)]
     for b in result["buckets"]:
         champ = "/".join(f"{x*100:.0f}%" for x in b["champion_alloc"])
         head = f"<b>[{b['bucket']}]</b> {b['n_trades']} 筆｜champion {champ}"

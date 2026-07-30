@@ -324,6 +324,13 @@ async def run_entry_optimization(*, days: int = 120, at_ms: int | None = None,
         at_ms = int(time.time() * 1000)
     if rows is None:
         rows = _load_paper_for_entry(days=days, db=db)
+    # v144(監督員r29)：與 auto_optimizer 同一條——晉升證據只採現行生產宇宙那一代
+    #   的樣本（CG 代 vs 免費源代 topN_agreement=0.0＝選股實質換掉，混代＝拿上一代
+    #   的成交行為替這一代背書）。同代不足由既有 minTRL(30) 自然 fail-closed。
+    from l3_dispatcher import universe_provenance as up
+    _cohort_mix, _cohort_gen = up.cohort_mix(rows), up.active_generation(rows)
+    _n_in = len(rows)
+    rows = [r for r in rows if up.generation_of_row(r) == _cohort_gen]
     if ledger is None:
         from backtest.l2_stat_gates import TrialLedger, default_ledger_path
         ledger = TrialLedger(default_ledger_path())
@@ -337,12 +344,26 @@ async def run_entry_optimization(*, days: int = 120, at_ms: int | None = None,
         active_path=active_path, audit_path=audit_path)
     res["n_rows"] = len(rows)
     res["n_eligible"] = len(plans)
+    res["cohort"] = {"active_generation": _cohort_gen, "mix": _cohort_mix,
+                     "n_in": _n_in, "n_kept": len(rows),
+                     "n_excluded_other_generation": _n_in - len(rows)}
     return res
 
 
 # ════════════════════════════════════════════════════════════════════════
 #  繁中報告（CEO/復盤 Session 透明化）
 # ════════════════════════════════════════════════════════════════════════
+def _render_cohort_line(result: dict) -> str:
+    """報告用一行：本批統計樣本屬哪一代宇宙、排除幾筆別代（誠實揭露樣本被縮小）。"""
+    c = (result or {}).get("cohort") or {}
+    if not c:
+        return ""
+    mix = "、".join(f"{k}={v}" for k, v in sorted(c.get("mix", {}).items()))
+    return (f"🌐 宇宙世代：只採 <b>{c.get('active_generation')}</b> 代樣本 "
+            f"{c.get('n_kept')} 筆（排除別代 {c.get('n_excluded_other_generation')} 筆；"
+            f"全窗分佈 {mix or '—'}）")
+
+
 def render_report(result: dict | None = None, *, active_path=None) -> str | None:
     if result is None:
         result = asyncio.run(run_entry_optimization(active_path=active_path))
@@ -360,6 +381,7 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
         return ("🎚️ <b>入場積極度自動優化器</b>\n"
                 f"掃 {result.get('n_rows', '?')} 筆／{result['n_buckets']} 桶｜"
                 f"本輪晉升 <b>0</b> 桶（最佳挑戰者皆未過 L2{prog}）\n"
+                + _render_cohort_line(result) + "\n"
                 + eps.render_active(active_path) + "\n"
                 "<i>純驅動模擬盤 paper／demo，真錢執行層永不讀（紅線①）；"
                 "覆寫表恆空＝零行為變更，透明可事後 rollback。</i>")
@@ -368,7 +390,8 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
              f"掃 {result.get('n_rows', '?')} 筆已平倉/逾時紙上單"
              f"（含 entry_expired 缺料樣本），符合完整重放窗 {result.get('n_eligible', '?')} 筆，"
              f"分 {result['n_buckets']} 桶（per-symbol×regime + 象限池 + 全域池，"
-             f"其中池化桶 {result.get('n_pooled', '?')}）｜本輪晉升 {result['n_promoted']} 桶"]
+             f"其中池化桶 {result.get('n_pooled', '?')}）｜本輪晉升 {result['n_promoted']} 桶",
+             _render_cohort_line(result)]
     for b in result["buckets"]:
         ck = eps._KIND_ZH.get(b["champion_kind"], b["champion_kind"])
         head = f"<b>[{eps._bucket_label(b['bucket'])}]</b> {b['n_plans']} 筆｜champion {ck}"
