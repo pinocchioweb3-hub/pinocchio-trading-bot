@@ -76,3 +76,115 @@ def test_split_tp_levels_conservation():
 def test_profile_hardcoded_demo():
     # 紅線①防退化：原檔的 PROFILE 永遠是 demo，真盤=使用者自建副本
     assert ci.PROFILE == "demo"
+
+
+# ── v143：連續 fail-closed 告警（2026-07-30 401 靜默斷流的治本） ──────────
+_FAKE_401 = ("Error: HTTP 401 from OKX: Your IP 203.0.113.7 is not included "
+             "in your API key's 00000000-0000-4000-8000-000000000000 whitelist")
+
+
+def test_classify_ip_whitelist_vs_plain_auth():
+    # 401＋"not included in" → 要人去補白名單，與一般認證失敗必須分流
+    assert ci.classify_failure(1, _FAKE_401) == "auth_ip_whitelist"
+    assert ci.classify_failure(1, "HTTP 401: Invalid Sign") == "auth"
+
+
+def test_classify_benign_order_not_found_is_not_a_failure():
+    # 查無此單＝冪等查詢的正常答案；誤記成故障會讓告警天天誤鳴
+    assert ci.classify_failure(1, '{"code":"51603","msg":"order does not exist"}') is None
+    assert ci.classify_failure(1, "Order doesn't exist") is None
+
+
+def test_classify_transport_classes():
+    assert ci.classify_failure(127, "okx CLI 未安裝") == "cli_missing"
+    assert ci.classify_failure(124, "okx CLI timeout") == "timeout"
+    assert ci.classify_failure(1, '{"code":"50011","msg":"Too Many Requests"}') == "rate_limit"
+    assert ci.classify_failure(1, "some weird breakage") == "other"
+
+
+def test_redact_keeps_ip_but_masks_key_id():
+    out = ci.redact_secrets(_FAKE_401)
+    assert "00000000-0000-4000-8000-000000000000" not in out
+    assert "203.0.113.7" in out          # IP 是使用者補白名單唯一有用的資訊，不遮
+
+
+def test_alert_only_after_threshold_consecutive_rounds():
+    now, h = 1_000_000.0, {}
+    for i in range(ci.FAIL_ALERT_AFTER - 1):
+        h = ci.update_health(h, {"auth_ip_whitelist": _FAKE_401}, now + i * 60)
+        assert not ci.should_alert(h, now + i * 60), i    # 單輪抖動不吵
+    h = ci.update_health(h, {"auth_ip_whitelist": _FAKE_401}, now + 300)
+    assert ci.should_alert(h, now + 300)                  # 達門檻→告警
+
+
+def test_single_bad_round_then_clean_never_alerts():
+    now = 1_000_000.0
+    h = ci.update_health({}, {"timeout": "x"}, now)
+    h = ci.update_health(h, {}, now + 60)
+    assert h["consecutive_fail_rounds"] == 0
+    assert not ci.should_alert(h, now + 60)
+    assert not h.get("recovered_from")      # 沒告警過就不該發恢復通知
+
+
+def test_cooldown_then_repeat_and_class_change_bypasses_cooldown():
+    now = 1_000_000.0
+    h = {}
+    for i in range(ci.FAIL_ALERT_AFTER):
+        h = ci.update_health(h, {"auth_ip_whitelist": _FAKE_401}, now + i * 60)
+    h["last_alert_ts"], h["last_alert_class"] = now + 120, "auth_ip_whitelist"
+    # 冷卻內同類不重複吵
+    assert not ci.should_alert(h, now + 180)
+    # 超過重複間隔→再提醒（故障還在，不可轉安靜）
+    assert ci.should_alert(h, now + 120 + ci.FAIL_ALERT_REPEAT_SEC)
+    # 換了故障類別→立刻再報，不被舊冷卻蓋掉
+    h2 = ci.update_health(h, {"cli_missing": "gone"}, now + 200)
+    assert ci.should_alert(h2, now + 200)
+
+
+def test_recovery_notice_after_alerted_streak():
+    now = 1_000_000.0
+    h = {}
+    for i in range(ci.FAIL_ALERT_AFTER):
+        h = ci.update_health(h, {"auth": "bad key"}, now + i * 60)
+    h["last_alert_ts"], h["last_alert_class"] = now + 120, "auth"
+    h = ci.update_health(h, {}, now + 600)
+    assert h["recovered_from"]["fail_rounds"] == ci.FAIL_ALERT_AFTER
+    assert not h.get("last_alert_ts")       # 冷卻重置：下次故障立刻能再報
+
+
+def test_worst_class_priority_and_counts_per_round():
+    # 同輪多類取最嚴重者當代表（401 白名單優先於它造成的下游查單失敗）
+    assert ci.worst_class({"query_fail", "auth_ip_whitelist"}) == "auth_ip_whitelist"
+    h = ci.update_health({}, {"auth_ip_whitelist": "a", "query_fail": "b"}, 1.0)
+    assert h["last_fail_class"] == "auth_ip_whitelist"
+    assert h["class_counts"] == {"auth_ip_whitelist": 1, "query_fail": 1}
+
+
+def test_alert_text_is_actionable_and_makes_no_perf_claim():
+    now = 1_000_000.0
+    h = {}
+    for i in range(ci.FAIL_ALERT_AFTER):
+        h = ci.update_health(h, {"auth_ip_whitelist": ci.redact_secrets(_FAKE_401)}, now + i * 60)
+    txt = ci.alert_text(h, now + 300)
+    assert "203.0.113.7" in txt and "白名單" in txt        # 看了就知道要做什麼
+    assert "00000000-0000-4000-8000-000000000000" not in txt
+    # 紅線③：告警只講連線狀態，不得夾帶勝率/報酬宣稱
+    for banned in ("勝率", "報酬", "年化", "獲利"):
+        assert banned not in txt
+
+
+def test_health_layer_never_raises_into_trading_path(monkeypatch):
+    # 告警層壞掉也絕不能弄掛執行器（它的職責只是讓失敗有出口）
+    monkeypatch.setattr(ci, "_load_health", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert ci.finish_round({"auth": "x"}, 1.0, dry=True) == {}
+
+
+def test_note_fail_records_first_sample_and_redacts():
+    ci._ROUND_FAILS.clear()
+    ci._note_fail(ci.classify_failure(1, _FAKE_401), _FAKE_401)
+    ci._note_fail("auth_ip_whitelist", "second sample")     # 同類只留第一個
+    assert list(ci._ROUND_FAILS) == ["auth_ip_whitelist"]
+    assert "<key-id-redacted>" in ci._ROUND_FAILS["auth_ip_whitelist"]
+    ci._note_fail(None, "benign")                            # 良性不入帳
+    assert list(ci._ROUND_FAILS) == ["auth_ip_whitelist"]
+    ci._ROUND_FAILS.clear()

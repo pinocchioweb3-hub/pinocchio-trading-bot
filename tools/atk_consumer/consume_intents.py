@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -46,6 +47,22 @@ DAILY_STOP_USD = 300.0           # 日虧熔斷（≈3R）：當日已實現虧�
 OUTBOX = Path(os.path.expandvars(r"%LOCALAPPDATA%\TradingBot\intent_outbox"))
 STATE = Path(os.path.expandvars(r"%LOCALAPPDATA%\TradingBot\atk_consumer_state.json"))
 POS_STATE = Path(os.path.expandvars(r"%LOCALAPPDATA%\TradingBot\atk_positions.json"))
+HEALTH = Path(os.path.expandvars(r"%LOCALAPPDATA%\TradingBot\atk_consumer_health.json"))
+
+# ── 連續 fail-closed 告警（v143；2026-07-30 教訓） ─────────────────────
+# fail-closed 本身是對的（認證失敗就不下單），錯的是「沒有出口」：
+# 那晚 OKX 因浮動 IP 換掉回 401 共 121 次、整盤零成交，卻只寫在 log 裡沒人知道，
+# 靠肉眼撞見才發現——與 halt 殘閂 19 天、週報斷檔 16.4 天同一物種（無聲失敗）。
+FAIL_ALERT_AFTER = 3            # 連續幾輪有故障才告警（單輪抖動不吵）
+FAIL_ALERT_REPEAT_SEC = 3600.0  # 同類故障持續時的重複提醒間隔
+ENV_FILE = Path(r"C:\Users\user\OneDrive\桌面\交易機器人\.env")  # 只讀 TG 憑證，永不列印值
+
+# 良性回應：查無此單是「冪等查詢」的正常答案，不是故障
+_BENIGN_MARKERS = ("51603", "doesn't exist", "does not exist")
+# 故障嚴重度排序（同輪多類時取最前者當代表）
+_CLASS_PRIORITY = ("cli_missing", "auth_ip_whitelist", "auth", "rate_limit",
+                   "timeout", "query_fail", "other")
+_ROUND_FAILS: dict[str, str] = {}   # 本輪故障 {類別: 樣本}；每輪開頭清空
 
 
 # Windows 陷阱：npm 全域裝的 okx 是 okx.cmd shim，subprocess 不走 shell 找不到裸名
@@ -54,16 +71,62 @@ import shutil
 _OKX_BIN = shutil.which("okx")
 
 
+def redact_secrets(text: str) -> str:
+    """遮蔽 API key 識別碼（UUID）。
+    ⚠️ IP 不遮——那正是使用者要拿去補白名單的唯一有用資訊；key id 對他無診斷價值。"""
+    return re.sub(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                  r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                  "<key-id-redacted>", text or "")
+
+
+def classify_failure(code: int, out: str) -> str | None:
+    """把 okx CLI 失敗分流成「可行動的類別」（純函式）。回 None＝良性非故障。
+
+    分流的意義：401 白名單要人去後台補、cli_missing 要重裝、rate_limit 會自癒、
+    query_fail 是下游症狀——混在一起就只剩「有錯」這種沒人會動作的資訊。"""
+    t = out or ""
+    low = t.lower()
+    if any(s in t for s in _BENIGN_MARKERS):
+        return None                      # 查無此單＝冪等查詢的正常答案
+    if code == 127 or "未安裝" in t:
+        return "cli_missing"
+    if "401" in t and "not included in" in low:
+        return "auth_ip_whitelist"       # 浮動 IP 換掉→白名單失效（會復發）
+    if ("401" in t or "invalid sign" in low or "50111" in t or "50113" in t
+            or "50102" in t):
+        return "auth"
+    if code == 124 or "timeout" in low:
+        return "timeout"
+    if "50011" in t or "429" in t or "too many requests" in low:
+        return "rate_limit"
+    return "other"
+
+
+def _note_fail(cls: str | None, sample: str) -> None:
+    """記一筆本輪故障（同類只留第一個樣本＝class_counts 以「輪」為單位不重複計）。"""
+    if cls and cls not in _ROUND_FAILS:
+        _ROUND_FAILS[cls] = redact_secrets(sample)[:300]
+
+
 def _okx(args: list[str], timeout: int = 30) -> tuple[int, str]:
-    """呼叫 okx CLI（--json 輸出）。回 (exit_code, stdout)。"""
+    """呼叫 okx CLI（--json 輸出）。回 (exit_code, stdout)。
+
+    失敗一律登記到 _ROUND_FAILS（單一掛鉤攔到槓桿/查單/下單/對帳全部路徑）——
+    只加副作用，回傳值與交易邏輯完全不變。"""
     if not _OKX_BIN:
-        return 127, "okx CLI 未安裝（npm install -g @okx_ai/okx-trade-cli）"
+        out = "okx CLI 未安裝（npm install -g @okx_ai/okx-trade-cli）"
+        _note_fail("cli_missing", out)
+        return 127, out
     cmd = [_OKX_BIN, "--profile", PROFILE, *args, "--json"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout)
-        return r.returncode, (r.stdout or r.stderr or "")
+        out = (r.stdout or r.stderr or "")
+        if r.returncode != 0:
+            _note_fail(classify_failure(r.returncode, out), out)
+        return r.returncode, out
     except subprocess.TimeoutExpired:
+        _note_fail("timeout", "okx CLI timeout")
         return 124, "okx CLI timeout"
 
 
@@ -82,6 +145,191 @@ def verify_demo_profile() -> bool:
     except Exception as e:  # noqa: BLE001
         print(f"⛔ 無法驗證 profile（{type(e).__name__}: {e}）——拒絕執行")
         return False
+
+
+# ── 健康狀態／告警（v143） ────────────────────────────────────────────
+def _load_health() -> dict:
+    try:
+        return json.loads(HEALTH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_health(h: dict) -> None:
+    try:
+        HEALTH.write_text(json.dumps(h, ensure_ascii=False, indent=1),
+                          encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def worst_class(classes) -> str | None:
+    """同輪多類故障時取代表（純函式）：依 _CLASS_PRIORITY 取最嚴重者。"""
+    for c in _CLASS_PRIORITY:
+        if c in classes:
+            return c
+    return next(iter(sorted(classes)), None)
+
+
+def update_health(h: dict, fails: dict, now_s: float) -> dict:
+    """把本輪結果併進健康狀態（純函式，不做 I/O）。
+
+    connsecutive_fail_rounds 只在「有故障的輪」累加；乾淨輪歸零並在曾告警過時
+    留下 recovered_from＝讓恢復也有出口（無聲恢復同樣會讓人誤判）。"""
+    h = dict(h)
+    h["rounds_seen"] = int(h.get("rounds_seen", 0)) + 1
+    h["updated_at"] = now_s
+    h["updated_at_local"] = time.strftime("%Y-%m-%d %H:%M:%S",
+                                          time.localtime(now_s))
+    h["profile"] = PROFILE
+    h.pop("recovered_from", None)
+    if not fails:
+        streak = int(h.get("consecutive_fail_rounds", 0))
+        if streak >= FAIL_ALERT_AFTER and h.get("last_alert_ts"):
+            h["recovered_from"] = {"class": h.get("last_fail_class"),
+                                   "fail_rounds": streak}
+            h.pop("last_alert_ts", None)
+            h.pop("last_alert_class", None)
+        h["consecutive_fail_rounds"] = 0
+        h["last_ok_ts"] = now_s
+        h.pop("first_fail_ts", None)
+        return h
+    cls = worst_class(fails.keys())
+    h["consecutive_fail_rounds"] = int(h.get("consecutive_fail_rounds", 0)) + 1
+    h.setdefault("first_fail_ts", now_s)
+    h["last_fail_ts"] = now_s
+    h["last_fail_class"] = cls
+    h["last_fail_sample"] = fails.get(cls, "")
+    counts = dict(h.get("class_counts") or {})
+    for c in fails:
+        counts[c] = int(counts.get(c, 0)) + 1
+    h["class_counts"] = counts
+    return h
+
+
+def should_alert(h: dict, now_s: float, threshold: int = FAIL_ALERT_AFTER,
+                 repeat_sec: float = FAIL_ALERT_REPEAT_SEC) -> bool:
+    """要不要現在告警（純函式）：連續故障達門檻，且（未告警過／換了故障類別／
+    距上次提醒超過 repeat_sec）。故障類別變了立刻再報＝新故障不被舊冷卻蓋掉。"""
+    if int(h.get("consecutive_fail_rounds", 0)) < threshold:
+        return False
+    last_ts = h.get("last_alert_ts")
+    if not last_ts:
+        return True
+    if h.get("last_alert_class") != h.get("last_fail_class"):
+        return True
+    return (now_s - float(last_ts)) >= repeat_sec
+
+
+_CLASS_HINT = {
+    "auth_ip_whitelist": "呼叫端 IP 不在 API key 白名單（住宅浮動 IP 換掉會復發）"
+                         "→ 到 OKX 後台把下方錯誤訊息中的 IP 加進白名單，"
+                         "消費器每分鐘自動重試、不需重啟",
+    "auth": "認證失敗（金鑰／簽章／權限）→ 檢查 ~/.okx/config.toml 與後台權限設定",
+    "cli_missing": "okx CLI 不存在 → npm install -g @okx_ai/okx-trade-cli",
+    "rate_limit": "被限流 → 通常自癒；持續出現才需降頻",
+    "timeout": "呼叫逾時 → 檢查網路；持續出現代表對外連線有問題",
+    "query_fail": "查單失敗導致 fail-closed（下游症狀，先看同時段的認證／網路類別）",
+    "other": "未分類錯誤 → 讀 atk_live.log 原文",
+}
+
+
+def alert_text(h: dict, now_s: float) -> str:
+    """組告警文字（純函式，繁中可行動）。⛔只講執行器連線狀態，不含任何績效宣稱。"""
+    cls = h.get("last_fail_class") or "other"
+    rounds = int(h.get("consecutive_fail_rounds", 0))
+    since = h.get("first_fail_ts") or now_s
+    mins = max(0, int((now_s - float(since)) / 60))
+    return (
+        f"🚨 真錢執行器連線異常（profile={h.get('profile')}）\n"
+        f"已連續 {rounds} 輪 fail-closed，持續約 {mins} 分鐘。\n"
+        f"故障類別：{cls}\n"
+        f"處置：{_CLASS_HINT.get(cls, _CLASS_HINT['other'])}\n"
+        f"錯誤原文：{(h.get('last_fail_sample') or '')[:200]}\n"
+        f"⚠️ 期間未下任何單（fail-closed 正確），也未平既有倉——"
+        f"這是「沒下單」不是「虧損」。"
+    )
+
+
+def recovery_text(h: dict) -> str:
+    rec = h.get("recovered_from") or {}
+    return (f"✅ 真錢執行器已恢復（profile={h.get('profile')}）"
+            f"——先前 {rec.get('fail_rounds')} 輪 {rec.get('class')} 故障已消失，"
+            f"本輪呼叫全部成功。")
+
+
+def _tg_creds() -> tuple[str | None, str | None]:
+    """取 TG 憑證：先環境變數，再讀 .env（排程器環境沒有這兩個變數）。
+    ⛔只回傳給送信函式使用，永不列印值。"""
+    tk, cid = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if tk and cid:
+        return tk, cid
+    try:
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k == "TELEGRAM_BOT_TOKEN" and not tk:
+                tk = v
+            elif k == "TELEGRAM_CHAT_ID" and not cid:
+                cid = v
+    except Exception:  # noqa: BLE001
+        pass
+    return (tk or None), (cid or None)
+
+
+def send_alert(text: str, dry: bool = False) -> tuple[str, str | None]:
+    """送告警到 Telegram（stdlib urllib，維持本腳本零依賴）。
+    回 (channel, error)：channel ∈ {telegram, dry, none}。
+    ⚠️ 告警管道自己失敗也要留痕——否則就變成「告警的無聲失敗」同一個坑。"""
+    if dry:
+        return "dry", None
+    tk, cid = _tg_creds()
+    if not tk or not cid:
+        return "none", "TG 憑證缺失（環境變數與 .env 都沒有）"
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{tk}/sendMessage",
+            data=json.dumps({"chat_id": cid, "text": text}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = r.read().decode("utf-8", "replace")
+        return ("telegram", None) if '"ok":true' in body.replace(" ", "") \
+            else ("none", redact_secrets(body)[:200])
+    except Exception as e:  # noqa: BLE001
+        return "none", f"{type(e).__name__}: {str(e)[:160]}"
+
+
+def finish_round(fails: dict, now_s: float | None = None,
+                 dry: bool = False) -> dict:
+    """每輪收尾：更新健康檔、必要時告警。永不對外拋例外——
+    告警層絕不可以把交易執行器弄掛（它的職責只是「讓失敗有出口」）。"""
+    now_s = now_s or time.time()
+    try:
+        h = update_health(_load_health(), fails, now_s)
+        if h.get("recovered_from"):
+            ch, err = send_alert(recovery_text(h), dry=dry)
+            h["last_alert_channel"], h["last_alert_error"] = ch, err
+            print(f"✅ 執行器已恢復（告警管道={ch}）")
+        elif should_alert(h, now_s):
+            ch, err = send_alert(alert_text(h, now_s), dry=dry)
+            h["last_alert_ts"] = now_s
+            h["last_alert_class"] = h.get("last_fail_class")
+            h["last_alert_channel"], h["last_alert_error"] = ch, err
+            print(f"🚨 連續 {h['consecutive_fail_rounds']} 輪 fail-closed"
+                  f"（{h.get('last_fail_class')}）——已告警，管道={ch}"
+                  + (f"，管道錯誤={err}" if err else ""))
+        elif fails:
+            streak = int(h.get("consecutive_fail_rounds", 0))
+            tail = (f"（已告警過，冷卻中：同類故障每 {FAIL_ALERT_REPEAT_SEC / 60:.0f} "
+                    f"分鐘才再提醒一次）" if h.get("last_alert_ts")
+                    else f"（達 {FAIL_ALERT_AFTER} 輪才告警）")
+            print(f"⚠️ 本輪故障 {sorted(fails)}；連續第 {streak} 輪{tail}")
+        _save_health(h)
+        return h
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 健康狀態更新失敗（不影響交易路徑）：{type(e).__name__}: {e}")
+        return {}
 
 
 def contracts_for(inst_id: str, entry: float, stop: float, ct_val_cache: dict) -> float | None:
@@ -353,6 +601,8 @@ def place(intent: dict, sz: float, dry: bool,
             continue
         if exists is None:
             print(f"⚠️ 腿{i + 1}/{len(legs)} 查單失敗——本輪不下這腿（fail-closed，下輪重試）")
+            # 這裡是真正「該下卻沒下」的那一刻——一定要進健康帳，否則整盤零成交無聲
+            _note_fail("query_fail", f"{intent['inst_id']} clOrdId={cl} 查單失敗")
             all_ok = False
             continue
         code, out = _okx(args)
@@ -364,12 +614,52 @@ def place(intent: dict, sz: float, dry: bool,
     return all_ok
 
 
+def selftest_fail(rounds: int) -> int:
+    """製造假故障實證告警路徑（零網路、零下單）。用臨時健康檔，絕不動真實狀態。
+
+    重現 2026-07-30 那晚：OKX 回 401「IP 不在白名單」→ 查單失敗 → 腿全不下。
+    預期：前 FAIL_ALERT_AFTER-1 輪只提示，第 FAIL_ALERT_AFTER 輪告警，
+    之後冷卻不重複吵，乾淨輪送恢復通知。"""
+    global HEALTH
+    real, HEALTH = HEALTH, HEALTH.with_name("atk_consumer_health_selftest.json")
+    try:
+        HEALTH.unlink(missing_ok=True)
+        fake_401 = ("Error: HTTP 401 from OKX: Your IP 203.0.113.7 is not "
+                    "included in your API key's "
+                    "00000000-0000-4000-8000-000000000000 whitelist")
+        print(f"— 假故障實證開始（門檻={FAIL_ALERT_AFTER} 輪，告警走 dry 不真的送出）—")
+        print(f"  分類結果：{classify_failure(1, fake_401)}"
+              f"｜遮蔽後樣本：{redact_secrets(fake_401)[:90]}…")
+        now = time.time()
+        for i in range(rounds):
+            _ROUND_FAILS.clear()
+            _note_fail(classify_failure(1, fake_401), fake_401)
+            _note_fail("query_fail", "SOXL-USDT-SWAP clOrdId=xxx 查單失敗")
+            print(f"[假第 {i + 1} 輪]", end=" ")
+            finish_round(dict(_ROUND_FAILS), now + i * 60, dry=True)
+        _ROUND_FAILS.clear()
+        print("[假恢復輪]", end=" ")
+        h = finish_round({}, now + rounds * 60, dry=True)
+        print(f"— 實證結束：連續故障歸零={h.get('consecutive_fail_rounds') == 0}，"
+              f"恢復通知已送={bool(h.get('recovered_from'))}，"
+              f"告警冷卻已重置={not h.get('last_alert_ts')} —")
+        print(f"  健康檔（臨時）：{HEALTH}")
+        return 0
+    finally:
+        HEALTH = real
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--selftest-fail", type=int, metavar="N",
+                    help="製造 N 輪假故障走完整告警路徑（零網路、零下單、不寫健康檔"
+                         "的真實 profile 欄位以外的任何交易狀態）——驗收告警是否真的有出口")
     a = ap.parse_args()
 
+    if a.selftest_fail:
+        return selftest_fail(a.selftest_fail)
     if not a.dry_run and not verify_demo_profile():
         return 1
     try:
@@ -381,6 +671,7 @@ def main() -> int:
 
     while True:
         now_ms = time.time() * 1000
+        _ROUND_FAILS.clear()             # v143：本輪故障帳從零開始
         # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
         manage_positions(a.dry_run)
         halted_today = breaker_tripped(_load_positions().get("day_pnl", {}))
@@ -427,6 +718,8 @@ def main() -> int:
             STATE.write_text(json.dumps(state), encoding="utf-8")
         except Exception:  # noqa: BLE001
             pass
+        # v143：本輪收尾——把 fail-closed 記帳並在連續失敗時告警（dry-run 不真送）
+        finish_round(dict(_ROUND_FAILS), dry=a.dry_run)
         if a.once or a.dry_run:
             return 0
         time.sleep(60)
