@@ -164,6 +164,41 @@ def _count_closed(table: str) -> tuple[int, float]:
         return 0, 0.0
 
 
+def _count_closed_net(table: str) -> tuple[int, float | None]:
+    """該表「已平倉且**有淨值口徑**」的配對子集：筆數 + 平均 net_r。
+
+    net_r ＝毛 R − 費用 R − 止損滑價 R（`paper_journal.compute_net_r`，v118 起落帳）。
+    目前只有 paper_trades 有這一欄；trades（真錢）**沒有** → 回 `(0, None)`＝「無淨值
+    證據」，而不是 `(0, 0.0)`——0.0 會被下游誤讀成「淨期望值恰為零」。
+
+    排除規則與 `_count_closed` 一致（entry_expired 不是一筆真實交易）。另外要求 realized_r
+    也非空，讓這個子集能與毛口徑**成對比較**（不同子集比較毛/淨等於比兩批不同的單）。
+
+    為什麼需要它：Phase 0 若用毛 R 判期望值，等於假設手續費與滑價為零。實測配對子集
+    （同一批 165 筆同時有毛與淨）毛 +0.116R、淨 +0.052R——費用吃掉 0.065R、超過一半；
+    拆引擎後加密毛 +0.005R、淨 −0.047R（點估計翻負，n=109、t=−0.52 兩者皆不顯著）。
+    真錢側費用更不可迴避，故 live 閘門改為「必須有淨值證據才可能成立」（見 phase0_status）。
+    """
+    try:
+        conn = sqlite3.connect(_TJ_DB, timeout=5)
+        try:
+            row = conn.execute(
+                f"SELECT COUNT(*), AVG(net_r) FROM {table} WHERE status='closed' "
+                f"AND IFNULL(exit_reason,'') != 'entry_expired' "
+                f"AND net_r IS NOT NULL AND realized_r IS NOT NULL"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return 0, None          # 表或 net_r 欄不存在＝無淨值證據
+    except Exception:
+        return 0, None
+    n = int(row[0] or 0)
+    if n == 0 or row[1] is None:
+        return 0, None
+    return n, round(float(row[1]), 3)
+
+
 def _paper_edge_tstat(table: str = "paper_trades",
                       setup: str | None = None) -> float | None:
     """紙上『真實已平倉』realized_r 的單樣本 t 值（檢定 EV 是否顯著異於 0）。
@@ -206,17 +241,45 @@ def phase0_status() -> dict:
 
     硬門檻（寫死）：模擬盤 ≥100 筆 且 真實小額 ≥30 筆且整體期望值為正。
     ready=True 也 **只代表「達標、可由人類考慮宣告」**，本系統永遠不會自動宣告解鎖。
+
+    v149 口徑修正（fail-closed）：`*_ev_r` 一律是**毛 R**（未扣費用與滑價）。真錢那 30 筆
+    的費用是不可迴避的真實成本，用毛 R 判「期望值為正」會系統性高估——實測紙上配對子集
+    費用吃掉 0.065R，加密引擎點估計因此由正翻負。故 live 閘門加上第三個條件：**必須有
+    淨值證據且淨期望值為正**。`trades` 表目前沒有 net_r 欄 → `live_ok` 恆為 False，且以
+    `live_gate_reason='live_net_missing'` **明說原因**，不讓這個缺口靜默通過。
     """
     paper_n, paper_ev = _count_closed("paper_trades")
     live_n, live_ev = _count_closed("trades")
+    paper_net_n, paper_net_ev = _count_closed_net("paper_trades")
+    live_net_n, live_net_ev = _count_closed_net("trades")
+
     paper_ok = paper_n >= PHASE0_PAPER_MIN
-    live_ok = live_n >= PHASE0_LIVE_MIN and live_ev > 0
+    live_net_ok = live_net_n >= PHASE0_LIVE_MIN and (live_net_ev or 0) > 0
+    live_ok = live_n >= PHASE0_LIVE_MIN and live_ev > 0 and live_net_ok
+
+    if live_n < PHASE0_LIVE_MIN:
+        reason = "live_sample_short"          # 真錢樣本未達 30 筆（目前 0＝紅線①人工閘）
+    elif live_net_n == 0:
+        reason = "live_net_missing"           # 有毛R無淨R＝淨值會計尚未落地，不得放行
+    elif live_net_n < PHASE0_LIVE_MIN:
+        reason = "live_net_coverage_short"    # 淨值只覆蓋一部分樣本
+    elif not live_net_ok:
+        reason = "live_net_ev_not_positive"   # 扣費後期望值不為正
+    elif live_ev <= 0:
+        reason = "live_gross_ev_not_positive"
+    else:
+        reason = None
     return {
         "ready": paper_ok and live_ok,
         "paper_n": paper_n, "paper_ev_r": paper_ev, "paper_min": PHASE0_PAPER_MIN,
         "paper_ok": paper_ok,
+        "paper_net_n": paper_net_n, "paper_ev_r_net": paper_net_ev,
         "live_n": live_n, "live_ev_r": live_ev, "live_min": PHASE0_LIVE_MIN,
         "live_ok": live_ok,
+        "live_net_n": live_net_n, "live_ev_r_net": live_net_ev,
+        "live_net_ok": live_net_ok,
+        "ev_basis": "gross",                  # *_ev_r 的口徑；*_ev_r_net 才是扣費後
+        "live_gate_reason": reason,
     }
 
 
@@ -328,6 +391,13 @@ def _section_normal() -> str:
     lines.append(
         f"🔬 驗證：模擬盤 {p['paper_n']}/{p['paper_min']} {_bar(p['paper_n'], p['paper_min'])}"
         f"｜真實 {p['live_n']}/{p['live_min']} {_bar(p['live_n'], p['live_min'])}")
+    # v149：毛/淨兩個口徑並列。只報數字不下結論——費用吃掉多少由你自己看（模擬盤樣本）
+    if p.get("paper_net_n"):
+        lines.append(
+            f"　　└ 模擬盤期望值：毛 {p['paper_ev_r']:+.3f}R"
+            f"｜淨（扣費用滑價）{p['paper_ev_r_net']:+.3f}R（n={p['paper_net_n']}）")
+    if p.get("live_gate_reason") == "live_net_missing":
+        lines.append("　　└ ⚠️ 真錢帳尚無淨值欄位 → Phase 0 真實閘 fail-closed（不以毛R放行）")
 
     # 4.5) OKX 模擬盤實單驗證（task #4/#39）—— 真實成交、零真錢。
     #      只做透明呈現：demo 樣本走 demo_trades 表，**不**計入上方 Phase 0「真實」門檻
