@@ -42,9 +42,72 @@ def test_ample_paper_but_unproven_edge_not_mislabeled_as_sample_short():
 
 
 def test_significant_edge_pending_realmoney_gate():
-    """紙上足且 edge 已顯著(t≥2)、真錢未開 → 歸因到真錢人工閘(紅線①)，非樣本/edge。"""
-    out = _synthesize_bottleneck(169, 100, 0, 30, 20, 0, paper_t=2.5)
+    """紙上足且**毛與淨都**已顯著(t≥2)、真錢未開 → 歸因到真錢人工閘(紅線①)。"""
+    out = _synthesize_bottleneck(169, 100, 0, 30, 20, 0,
+                                 paper_t=2.5, paper_t_net=2.2, net_n=120)
     assert "真錢" in out and "紅線①" in out and "樣本供給不足" not in out
+
+
+# --------------------------------------------------- v150 毛/淨雙口徑 fail-closed
+def test_gross_significant_but_no_net_evidence_is_not_ready():
+    """v150 治本：毛 t≥2 但沒有扣費後證據時，舊碼會歸因『只差真錢人工閘』＝假準備就緒。
+    新碼必須擋下來，說明真瓶頸是扣費後的 edge、且點名淨值證據不足。"""
+    out = _synthesize_bottleneck(169, 100, 0, 30, 20, 0, paper_t=2.5)   # 無淨口徑
+    assert "待真錢人工逐筆驗證" not in out          # 不得翻成『只差人工閘』
+    assert "扣費後" in out and "不得視為已證實" in out
+
+
+def test_gross_significant_but_net_coverage_short_is_not_ready():
+    """有淨 t 但配對覆蓋 <30 筆＝證據不足，同樣不得放行（覆蓋太少時 t 再漂亮也不算）。"""
+    out = _synthesize_bottleneck(169, 100, 0, 30, 20, 0,
+                                 paper_t=2.5, paper_t_net=3.0, net_n=12)
+    assert "待真錢人工逐筆驗證" not in out and "12<30" in out
+
+
+def test_gross_significant_but_net_below_threshold_named_honestly():
+    """美股當前真實形狀：毛 t≈2.64 過閘、扣費後淨 t≈1.70 跌破 → 誠實說費用吃掉 edge。"""
+    out = _synthesize_bottleneck(169, 100, 0, 30, 20, 0,
+                                 paper_t=2.64, paper_t_net=1.70, net_n=56)
+    assert "待真錢人工逐筆驗證" not in out
+    assert "1.70" in out and "費用" in out and "未證實" in out
+
+
+def test_gross_not_significant_still_reports_edge_bottleneck():
+    """毛就沒過時維持舊敘事（優先序不變）：瓶頸是 edge 大小、非樣本量。"""
+    out = _synthesize_bottleneck(169, 100, 0, 30, 20, 0,
+                                 paper_t=1.07, paper_t_net=-0.54, net_n=110)
+    assert "edge 未達統計顯著" in out and "1.07" in out and "非樣本量" in out
+
+
+def test_no_t_at_all_falls_back_to_legacy_attribution():
+    """兩個口徑都沒給（呼叫端未提供）→ 退回舊式描述，不臆測顯著與否。"""
+    out = _synthesize_bottleneck(120, 100, 35, 30, 35, 0)
+    assert "樣本達標" in out and "扣費後" not in out
+
+
+def test_net_tstat_uses_paired_subset(tmp_path, monkeypatch):
+    """basis='net' 必須是**配對子集**（毛淨同一批交易），否則毛/淨差異分不清是費用還是換樣本。"""
+    import sqlite3
+    from l3_dispatcher import ceo_session as cs
+    db = tmp_path / "tj.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE paper_trades (setup TEXT, status TEXT, "
+                 "exit_reason TEXT, realized_r REAL, net_r REAL)")
+    rows = [("deepdive", "closed", None, 1.0, 0.5), ("deepdive", "closed", None, 2.0, 1.5),
+            ("deepdive", "closed", None, 3.0, None),          # 只有毛→淨口徑須排除
+            ("deepdive", "closed", "entry_expired", 9.0, 9.0)]  # 餓死單→兩口徑都排除
+    conn.executemany("INSERT INTO paper_trades VALUES (?,?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(cs, "_TJ_DB", str(db))
+    assert cs._paper_edge_tstat_ex(setup="deepdive", basis="gross")[0] == 3
+    assert cs._paper_edge_tstat_ex(setup="deepdive", basis="net")[0] == 2
+
+
+def test_missing_net_column_is_fail_closed_not_zero():
+    """net_r 欄不存在（如真錢 trades 表）→ 回 (0, None)＝無證據，絕不能回 0.0 當『淨值為零』。"""
+    from l3_dispatcher.ceo_session import _paper_edge_tstat_ex
+    assert _paper_edge_tstat_ex(table="__no_such_table__", basis="net") == (0, None)
 
 
 def test_build_brief_runs_and_includes_synthesis():

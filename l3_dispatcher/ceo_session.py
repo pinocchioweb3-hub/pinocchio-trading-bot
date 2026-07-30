@@ -31,6 +31,9 @@ _TJ_DB = _db_path("trade_journal.db")
 # === Phase 0 解鎖硬門檻（與 VISION.md / PROJECT_CHARTER.md 對齊；寫死，AI 不能改） ===
 PHASE0_PAPER_MIN = 100   # 模擬盤累積 ≥100 筆已平倉
 PHASE0_LIVE_MIN = 30     # 真實小額 ≥30 筆已平倉且整體期望值為正
+# v150：自評敘事要宣稱「edge 已證實」時，扣費後（net_r）配對樣本至少要這麼多筆才算證據。
+#   沿用本專案既有的 n≥30 慣例（task#27 加密 EV 顯著性定案：n_eff≈20<30＝未證實）。
+PAPER_NET_MIN_N = 30
 
 
 # ===========================================================================
@@ -199,22 +202,33 @@ def _count_closed_net(table: str) -> tuple[int, float | None]:
     return n, round(float(row[1]), 3)
 
 
-def _paper_edge_tstat(table: str = "paper_trades",
-                      setup: str | None = None) -> float | None:
-    """紙上『真實已平倉』realized_r 的單樣本 t 值（檢定 EV 是否顯著異於 0）。
+def _paper_edge_tstat_ex(table: str = "paper_trades",
+                         setup: str | None = None,
+                         basis: str = "gross") -> tuple[int, float | None]:
+    """紙上『真實已平倉』單樣本 t 值 + 樣本數（檢定 EV 是否顯著異於 0）。
 
-    t = mean / (sd/√n)。n<2 或 sd=0 → None（無法檢定，誠實不報）。與 _count_closed 同
+    t = mean / (sd/√n)。n<2 或 sd=0 → t=None（無法檢定，誠實不報）。與 _count_closed 同
     口徑（排除 entry_expired）。供 CEO 自評誠實區分『樣本不足』與『樣本足但 edge 未顯著
     (t<2)』——治本 _synthesize_bottleneck 把『真錢 0/30 人工閘恆成立』誤報成『樣本供給不足』。
-    註：此為名目 t，未做 n_eff 叢聚校正（叢聚會讓真 t 更低），故為樂觀上界；t<2 即未證實。"""
+    註：此為名目 t，未做 n_eff 叢聚校正（叢聚會讓真 t 更低），故為樂觀上界；t<2 即未證實。
+
+    v150 新增 basis：
+      - "gross"：realized_r（毛 R，未扣費用/滑價）——與歷史口徑相同。
+      - "net"  ：net_r（扣費後，`paper_journal.compute_net_r`，v118 起落帳）。額外要求
+        realized_r 也非空＝**配對子集**，讓毛/淨兩個 t 建立在同一批交易上、可直接對照
+        （不配對的話會拿 348 筆的毛去比 166 筆的淨，差異分不清是費用還是換了樣本）。
+    回傳 n 是為了讓呼叫端能判「淨值覆蓋是否足夠」——覆蓋太少時 t 再漂亮也不算證據。"""
+    col = "net_r" if basis == "net" else "realized_r"
     try:
         conn = sqlite3.connect(_TJ_DB, timeout=5)
         try:
             # v131：支援分引擎口徑——混引擎單一 t（曾測得 2.93）會把「美股已過閘、
             #   加密未過」兩個相反真相攪成一個誤導數字（獵捕workflow口徑稽核發現）。
-            _sql = (f"SELECT realized_r FROM {table} WHERE status='closed' "
+            _sql = (f"SELECT {col} FROM {table} WHERE status='closed' "
                     f"AND IFNULL(exit_reason,'') != 'entry_expired' "
-                    f"AND realized_r IS NOT NULL")
+                    f"AND {col} IS NOT NULL")
+            if basis == "net":
+                _sql += " AND realized_r IS NOT NULL"      # 配對子集
             _args: tuple = ()
             if setup:
                 _sql += " AND setup=?"
@@ -223,17 +237,24 @@ def _paper_edge_tstat(table: str = "paper_trades",
         finally:
             conn.close()
     except Exception:
-        return None
+        return 0, None                     # 表或 net_r 欄不存在＝無此口徑的證據
     rs = [float(r[0]) for r in rows if r[0] is not None]
     n = len(rs)
     if n < 2:
-        return None
+        return n, None
     mean = sum(rs) / n
     var = sum((x - mean) ** 2 for x in rs) / (n - 1)
     sd = var ** 0.5
     if sd <= 0:
-        return None
-    return mean / (sd / (n ** 0.5))
+        return n, None
+    return n, mean / (sd / (n ** 0.5))
+
+
+def _paper_edge_tstat(table: str = "paper_trades",
+                      setup: str | None = None,
+                      basis: str = "gross") -> float | None:
+    """`_paper_edge_tstat_ex` 的 t-only 薄包裝（保留既有呼叫端）。"""
+    return _paper_edge_tstat_ex(table, setup, basis)[1]
 
 
 def phase0_status() -> dict:
@@ -465,7 +486,8 @@ def _section_decisions() -> str:
 
 
 def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
-                           demo_n, demo_rejected, paper_t=None) -> str:
+                           demo_n, demo_rejected, paper_t=None,
+                           paper_t_net=None, net_n=0) -> str:
     """task#7 CEO 深度綜合：純函式、確定性跨 session 關聯推理（可離線測試）。
     把『樣本供給 × 模擬盤下單健康 × 復盤優化器晉升狀態』綜合成單一瓶頸歸因——這才是
     真綜合分析，非欄位回音。資料不足就誠實說無法綜合（紅線③不臆測）。
@@ -473,17 +495,42 @@ def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
     治本 v101（止損復盤稽核發現的自評誤報）：舊版 sample_short = paper<min OR live<min，
     因真錢 live 永遠 0/30（紅線①人工閘恆成立）→ 不論紙上累積多少都謊報『樣本供給不足』，
     掩蓋真瓶頸（樣本其實已足、是 edge 未達統計顯著 t<2）。改成把三條獨立的軸分開歸因。
-    paper_t：紙上 EV 的名目 t 值（_paper_edge_tstat），None=未提供則退回舊式描述。"""
+    paper_t：紙上 EV 的名目 t 值（_paper_edge_tstat），None=未提供則退回舊式描述。
+
+    v150 口徑修正（與 v149 phase0 閘同一species、第二道門）：舊版只看**毛 R** 的 t，
+    但費用是不可迴避的真實成本——實測紙上配對子集費用吃掉 0.065R，美股毛 t≈2.64 扣費後
+    淨 t≈1.70（跌破 2）、加密毛 +0.004 扣費後翻負。若哪天毛 t 先過 2 而淨 t 沒過，舊版會
+    把瓶頸敘事從『edge 未證實』翻成『只差真錢人工閘』＝對本人謊報一個假的準備就緒。
+    故『已顯著』改成**毛與淨都要過**，且淨值覆蓋須 ≥`PAPER_NET_MIN_N`；沒有淨值證據時
+    一律當作**未證實**（fail-closed），並明說是哪一邊沒過，不讓缺口靜默通過。
+    paper_t_net/net_n：淨口徑 t 與其配對樣本數（_paper_edge_tstat_ex(basis="net")）。"""
     if paper_n < 8:
         return (f"  本輪樣本過少（紙上 {paper_n}/{paper_min}），尚無足夠基礎做跨 session "
                 "綜合分析——誠實不臆測。")
-    # 優先序：①紙上樣本真不足 ②紙上足但 edge 未顯著(t<2)＝真瓶頸 ③紙上足待真錢人工閘 ④全達標
+    # 毛/淨兩道顯著性（任一沒過就不算已證實；無證據＝沒過，fail-closed）
+    sig_gross = paper_t is not None and abs(paper_t) >= 2.0
+    net_cov_ok = net_n >= PAPER_NET_MIN_N
+    sig_net = paper_t_net is not None and net_cov_ok and abs(paper_t_net) >= 2.0
+    # 兩個口徑都沒給＝退回舊式描述（不臆測顯著與否），直接落到人工閘/達標分支
+    _has_t = not (paper_t is None and paper_t_net is None)
+    # 優先序：①紙上樣本真不足 ②紙上足但 edge 未證實(毛或淨沒過)＝真瓶頸 ③待真錢人工閘 ④全達標
     if paper_n < paper_min:
         bottleneck = "樣本供給不足（非策略失效）"
-    elif paper_t is not None and abs(paper_t) < 2.0:
+    elif _has_t and not sig_gross:
+        _t_txt = f"名目 t≈{paper_t:.2f}<2" if paper_t is not None else "毛口徑 t 無法檢定"
         bottleneck = (f"紙上樣本已足（{paper_n}≥{paper_min}）但 edge 未達統計顯著"
-                      f"（名目 t≈{paper_t:.2f}<2，未證實）——真瓶頸是 edge 大小、非樣本量；"
+                      f"（{_t_txt}，未證實）——真瓶頸是 edge 大小、非樣本量；"
                       "衝量無用，需把 edge 做大")
+    elif _has_t and not sig_net:
+        # 毛口徑過了、淨口徑沒過或沒證據——這是 v150 要擋住的假準備就緒
+        if paper_t_net is None or not net_cov_ok:
+            _why = (f"但**扣費後口徑的證據不足**（配對淨值樣本 {net_n}<{PAPER_NET_MIN_N} 筆）"
+                    "——費用是否吃掉這個 edge 未知，不得視為已證實")
+        else:
+            _why = (f"但扣費後跌破門檻（淨 t≈{paper_t_net:.2f}<2，n={net_n}）"
+                    "——毛利上的 edge 被費用與滑價吃掉，未證實")
+        bottleneck = (f"紙上毛口徑已顯著（名目 t≈{paper_t:.2f}≥2）{_why}；"
+                      "真瓶頸是**扣費後**的 edge，非樣本量")
     elif live_n < live_min:
         bottleneck = f"紙上樣本足、待真錢人工逐筆驗證（{live_n}/{live_min}，紅線①）"
     else:
@@ -517,15 +564,22 @@ def _section_self_assessment() -> str:
         demo_rejected, _ = demo_journal.count_rejected()
     except Exception:
         pass
+    _net_n, _net_t = _paper_edge_tstat_ex("paper_trades", setup="deepdive", basis="net")
     body = _synthesize_bottleneck(
         p.get("paper_n", 0), p.get("paper_min", 100),
         p.get("live_n", 0), p.get("live_min", 30), demo_n, demo_rejected,
-        paper_t=_paper_edge_tstat("paper_trades", setup="deepdive"))
+        paper_t=_paper_edge_tstat("paper_trades", setup="deepdive"),
+        paper_t_net=_net_t, net_n=_net_n)
     # v131：分引擎附註（瓶頸敘事以加密 deepdive 為主體＝OKX 路徑的鑰匙；美股另列）
+    # v150：毛/淨並列。美股毛 t 過 2 但扣費後跌破——只報毛會讓人以為這條線已經成立。
     _us_t = _paper_edge_tstat("paper_trades", setup="us_breakout")
+    _us_net_n, _us_net_t = _paper_edge_tstat_ex(
+        "paper_trades", setup="us_breakout", basis="net")
     if _us_t is not None:
-        body += (f"\n（分引擎：美股 t≈{_us_t:.2f}，已過預註冊統計閘 PSRc≥0.95"
-                 f"——紙上毛利口徑、真錢 0 筆，不作對外宣稱）")
+        _net_txt = (f"扣費後淨 t≈{_us_net_t:.2f}（配對 n={_us_net_n}）"
+                    if _us_net_t is not None else f"扣費後淨值證據不足（n={_us_net_n}）")
+        body += (f"\n（分引擎：美股毛 t≈{_us_t:.2f}（預註冊統計閘 PSRc≥0.95 是在**毛利口徑**"
+                 f"上通過的）、{_net_txt}——真錢 0 筆，兩個口徑都不作對外宣稱）")
     return "🧠 <b>系統自評</b>（跨 session 綜合·確定性推理非欄位回音）：\n" + body
 
 
