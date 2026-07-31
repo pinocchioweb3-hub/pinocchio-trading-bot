@@ -68,6 +68,22 @@ USER_ACTIONABLE_FAIL_CLASSES = {
     "insufficient_balance": "帳戶餘額不足",
 }
 
+# 曝險型故障類別（監督員 r77 / v179）。與上面那批同樣是**球在使用者**（只有人能到
+# OKX 確認那筆倉、也只有人能決定平不平），但代價語意完全相反，⛔ 不可共用同一句模板：
+#   上面那批＝一筆都送不出去、交易所上沒有倉 ⇒「未下單（無金錢虧損）」是誠實的；
+#   orphan_position＝交易所上**真的有一筆在場的真錢倉**脫離本地帳 ⇒ 同一句話會把最該
+#   看的風險講反，而且管線其餘部分照常運作（只擋同幣同向），「管線實質停擺」也是錯的。
+# 首次線上發作：2026-08-01 02:32，401 白名單通了之後的第一輪成功查詢就撞到。
+EXPOSURE_FAIL_CLASSES = {
+    "orphan_position": (
+        "孤兒部位（交易所上有、本地部位帳沒有的真錢倉）",
+        "⛔ 這**不是**「沒下單所以沒風險」：那是一筆在場的真實**曝險**，"
+        "不受自動管理（不會逾時平倉、了結損益不進日/週熔斷口徑），"
+        "但它的交易所端止損仍掛著；管線其餘部分照常運作，只有**同幣同向**的新單被擋。"
+        "請人工到 OKX 確認後決定是否平倉——在它消失前這條阻塞不會自己解除",
+    ),
+}
+
 # --- 組織產出斷檔（監督員 r30）---------------------------------------------
 # 同物種第四例（有訊號、無消費者）：2026-07-12～07-28 各席週報無聲斷檔 16.4 天，
 # 無人發現。根因＝排程層的 lastRunAt **只記「觸發」不記「成功」**，所以排程看起來
@@ -245,8 +261,33 @@ def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
 
     cls = str(health.get("last_fail_class") or "unknown")
     known = USER_ACTIONABLE_FAIL_CLASSES.get(cls)
+    exposure = EXPOSURE_FAIL_CLASSES.get(cls)
     first_fail = float(health.get("first_fail_ts", 0) or 0)
     dur = f"、已持續 {_fmt_age(now_s - first_fail)}" if first_fail > 0 else ""
+    # v179（r77）：consecutive_fail_rounds 與 first_fail_ts 是**跨類別**的單一計數器。
+    #   類別一換（2026-08-01 02:32：401 白名單通了、當輪立刻改判孤兒部位），舊類別的
+    #   輪數與起始時間會被原封不動繼承 ⇒ 帳本寫成「連續 1263 輪孤兒部位、已持續 22
+    #   小時」，而它其實三分鐘前才出現；順帶把「上一個擋點剛剛解除」整個藏起來。
+    #   class_counts 是歷來累計 ⇒ min(class_counts[cls], rounds) 是本類別當前連續輪數
+    #   可證的**上界**；上界 < rounds ⇒ 這段 streak 必然混了別的類別。
+    #   ⛔ 沒有 class_counts＝無從證明，維持現況敘述（勿為了保守把 401 的真實時長也抹掉）。
+    counts = health.get("class_counts")
+    cls_cap = None
+    if isinstance(counts, dict):
+        try:
+            cls_cap = int(counts.get(cls))
+        except (TypeError, ValueError):
+            cls_cap = None
+    mixed = cls_cap is not None and cls_cap < rounds
+    if mixed:
+        dur = ""
+        mix_note = (f"；⛔ 健康檔的「連續 {rounds} 輪／起始時間」是**跨故障類別**的累計值"
+                    f"（本類別歷來累計最多 {cls_cap} 輪）——不可讀成本類別已持續這麼久；"
+                    f"類別會換代表**上一個**擋點已不再是現在的擋點")
+        streak = ""
+    else:
+        mix_note = ""
+        streak = f"連續 {rounds} 輪"
     # v169（r67）：斷流期被 expires_at 吃掉的訊號＝這場故障唯一的實質代價。
     #   「零損失」只對「沒有下錯單」成立，讀起來卻像「不急」；訊號過期不補送，
     #   拖越久丟越多。⛔ 壞值只讓代價從缺，不可害死阻塞判定本身（fail-closed）。
@@ -256,14 +297,23 @@ def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
         dropped = 0
     cost = (f"；斷流期間已有 {dropped} 筆訊號逾時被**永久**丟棄（過期不補送，"
             f"修好也追不回來）" if dropped > 0 else "")
-    if known:
-        text = (f"真錢執行器連續 {rounds} 輪被擋（{known}）{dur}——"
+    if exposure:
+        label, detail = exposure
+        # 哪一筆倉：人要拿著它去 OKX 找，帳本不講等於沒講。取樣本冒號前那段即為
+        # 「孤兒部位 <instId> <side> <張數> 張」，⛔ 不重排格式（原文才是可比對的）。
+        sample = str(health.get("last_fail_sample") or "").split("：")[0].strip()
+        which = f"（最近一筆：{sample}）" if sample else ""
+        text = (f"真錢執行器{streak}偵測到{label}{which}{dur}——{detail}{mix_note}{cost}")
+    elif known:
+        text = (f"真錢執行器{streak}被擋（{known}）{dur}——"
                 f"每輪皆 fail-closed 未下單（無金錢虧損），"
-                f"但在你修好前一筆都送不出去{cost}")
+                f"但在你修好前一筆都送不出去{mix_note}{cost}")
     else:
-        text = (f"真錢執行器連續 {rounds} 輪 fail-closed（故障類別：{cls}）{dur}——"
-                f"未下單（無金錢虧損），但管線實質停擺，須查明修復{cost}")
-    out = {"rounds": rounds, "cls": cls, "user_actionable": bool(known), "text": text}
+        text = (f"真錢執行器{streak} fail-closed（故障類別：{cls}）{dur}——"
+                f"未下單（無金錢虧損），但管線實質停擺，須查明修復{mix_note}{cost}")
+    out = {"rounds": rounds, "cls": cls,
+           "user_actionable": bool(known or exposure), "text": text,
+           "mixed_class_streak": mixed, "cls_rounds_max": cls_cap}
     if dropped > 0:
         out["expired_dropped"] = dropped
     return out
