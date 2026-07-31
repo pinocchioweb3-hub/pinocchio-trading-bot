@@ -36,8 +36,12 @@ rcParams["font.sans-serif"] = ["Microsoft JhengHei", "Microsoft YaHei",
 rcParams["axes.unicode_minus"] = False
 
 MUTED = "#787f8c"
-CRYPTO_COL = "#4c9be8"   # 加密 deepdive（藍實線）
-US_COL = "#ffa726"       # 美股 us_breakout（橘虛線，實驗）
+# v177 重設計：色階經 dataviz 六檢驗證（暗面 OKLCH L 帶 0.48-0.67、CVD ΔE>24、對比>3:1）
+CRYPTO_COL = "#4292dd"   # 加密 deepdive（藍實線）
+US_COL = "#cc7f16"       # 美股 us_breakout（琥珀實線）
+# 加密資料源停權窗（2026-07-08 CoinGlass 到期 → 2026-07-29 v141 OKX 源上線）
+_OUTAGE_START_MS = 1783468800000   # 2026-07-08 00:00 UTC
+_OUTAGE_END_MS = 1785265313000     # 2026-07-29 03:01 台北（v141 上線）
 WIN_GREEN = "#26a69a"
 
 
@@ -118,75 +122,96 @@ def render_equity_curve() -> Path | None:
         ss = _stats(series["us"], raw["us"])
         net = _net_stats()
 
-        fig, ax = plt.subplots(figsize=(10.0, 5.4), facecolor=BG)
+        # v177 重設計（dataviz 六檢）：真日曆軸/停權帶誠實標註/圖例出圖外/
+        # 去點狀噪點/去色塊/僅水平網格。兩引擎共用同一條時間軸＝可直接對照。
+        import datetime as _dt
+
+        fig, ax = plt.subplots(figsize=(11.6, 5.8), facecolor=BG)
         ax.set_facecolor(BG)
 
-        # 時間軸：用「天數序列」而非原始 epoch（兩引擎時間範圍不同，對齊到各自第一筆）
         def _xy(points):
-            if not points:
-                return [], []
-            t0 = points[0][0]
-            xs = [(p[0] - t0) / 86400000.0 for p in points]  # 距首筆天數
+            xs = [_dt.datetime.fromtimestamp(p[0] / 1000.0) for p in points]
             ys = [p[1] for p in points]
             return xs, ys
 
+        # 停權窗（誠實脈絡：那段加密平線不是沒行情，是資料源死了）
+        _os = _dt.datetime.fromtimestamp(_OUTAGE_START_MS / 1000.0)
+        _oe = _dt.datetime.fromtimestamp(_OUTAGE_END_MS / 1000.0)
+        ax.axvspan(_os, _oe, color=MUTED, alpha=0.07, zorder=0)
+        ax.axvline(_oe, color=MUTED, alpha=0.45, linewidth=0.8,
+                   linestyle=(0, (2, 3)), zorder=1)
+
+        end_pts = []   # (x, y, 名稱, 值文字, 色)
         if series["crypto"]:
             xs, ys = _xy(series["crypto"])
-            ax.plot(xs, ys, color=CRYPTO_COL, linewidth=2.2, marker="o",
-                    markersize=3.5, label=(
-                        f"加密 deepdive　n={cs['n']}　"
-                        f"累積 {cs['cum_r']:+.2f}R　勝率 {cs['win_rate']:.0f}%"
-                        + (f"\n淨帳(扣費·近{net['crypto']['n']}筆有費用資料) "
-                           f"{net['crypto']['sum']:+.2f}R"
-                           if net['crypto']['n'] else "")))
-            ax.fill_between(xs, ys, 0, color=CRYPTO_COL, alpha=0.07)
-            ax.annotate(f"{cs['cum_r']:+.2f}R", (xs[-1], ys[-1]),
-                        color=CRYPTO_COL, fontsize=11, fontweight="bold",
-                        xytext=(6, 0), textcoords="offset points", va="center")
-
+            ax.plot(xs, ys, color=CRYPTO_COL, linewidth=2.0,
+                    solid_capstyle="round", zorder=3)
+            end_pts.append((xs[-1], ys[-1], "加密", cs["cum_r"], CRYPTO_COL))
         if series["us"]:
             xs, ys = _xy(series["us"])
-            ax.plot(xs, ys, color=US_COL, linewidth=1.8, linestyle="--",
-                    marker="s", markersize=3.0, alpha=0.85, label=(
-                        # v131：舊標籤凍結在 n≈21 時代；2026-07-28 起 n=109/n_eff=96、
-                        # PSRc=0.99 已過預註冊統計閘（crypto_ev_significance 切口④）。
-                        # 誠實雙面：過閘照登、真錢 0 筆與紙上毛利口徑照標（紅線③雙向誠實）。
-                        # 「>=」非「≥」：JhengHei 缺 U+2265 字型，≥ 會噴 UserWarning 汙染 err.log
-                        f"美股 us_breakout（紙上·已過統計閘 PSRc>=0.95·真錢未驗）　n={ss['n']}　"
-                        f"累積 {ss['cum_r']:+.2f}R"
-                        + (f"\n淨帳(扣費·近{net['us']['n']}筆有費用資料) "
-                           f"{net['us']['sum']:+.2f}R"
-                           if net['us']['n'] else "")))
-            ax.annotate(f"{ss['cum_r']:+.2f}R", (xs[-1], ys[-1]),
-                        color=US_COL, fontsize=10, xytext=(6, 0),
-                        textcoords="offset points", va="center", alpha=0.9)
+            ax.plot(xs, ys, color=US_COL, linewidth=2.0,
+                    solid_capstyle="round", zorder=3)
+            end_pts.append((xs[-1], ys[-1], "美股", ss["cum_r"], US_COL))
 
-        ax.axhline(0, color=GRID, linewidth=1.0, zorder=0)
-        ax.grid(True, color=GRID, linewidth=0.5, alpha=0.5)
-        ax.tick_params(colors=MUTED, labelsize=9)
-        for spine in ax.spines.values():
-            spine.set_color(GRID)
-        ax.set_xlabel("距首筆交易天數", color=MUTED, fontsize=10)
-        ax.set_ylabel("累積 R（每筆風險倍數，非報酬%）", color=MUTED, fontsize=10)
+        # 線端直接標註：彩色圓點載識別、文字用墨色（dataviz：文字穿文字色）
+        for x, y, name, val, col in end_pts:
+            ax.plot([x], [y], marker="o", markersize=6, color=col, zorder=4)
+            ax.annotate(f"{name} {val:+.2f}R", (x, y), color=FG, fontsize=10.5,
+                        fontweight="bold", xytext=(9, 0),
+                        textcoords="offset points", va="center", zorder=4)
 
-        leg = ax.legend(loc="upper left", facecolor=BG, edgecolor=GRID,
-                        labelcolor=FG, fontsize=9.5)
-        leg.get_frame().set_alpha(0.85)
+        ax.axhline(0, color=MUTED, linewidth=0.9, alpha=0.55, zorder=1)
+        ax.grid(True, axis="y", color=GRID, linewidth=0.5, alpha=0.35)
+        ax.tick_params(colors=MUTED, labelsize=9, length=0)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("bottom", "left"):
+            ax.spines[side].set_color(GRID)
+        from matplotlib import dates as _mdates
+        ax.xaxis.set_major_locator(_mdates.AutoDateLocator(minticks=5, maxticks=9))
+        ax.xaxis.set_major_formatter(_mdates.DateFormatter("%m/%d"))
+        ax.set_ylabel("累積 R（每筆風險倍數，非報酬%）", color=MUTED, fontsize=9.5)
 
-        fig.text(0.07, 0.965, "皮諾丘紙上驗證帳　·　累積 R 走勢",
+        # 停權帶標籤（放圖內頂部、貼帶置中）
+        ax.text(_os + (_oe - _os) / 2, 0.985, "加密資料源停權",
+                transform=ax.get_xaxis_transform(), ha="center", va="top",
+                color=MUTED, fontsize=8.5)
+        ax.text(_oe, 0.02, " 換源(OKX)", transform=ax.get_xaxis_transform(),
+                ha="left", va="bottom", color=MUTED, fontsize=8.5)
+
+        # 標題區＋圖外圖例（彩色bullet載識別、統計文字用墨色，不再壓在數據上）
+        fig.text(0.055, 0.97, "皮諾丘紙上驗證帳　·　累積 R 走勢",
                  color=FG, fontsize=15, fontweight="bold", va="top")
-        fig.text(0.07, 0.915,
-                 "紙上模擬驗證　·　非實盤績效（實倉 0 筆）　·　已排除限價未成交",
-                 color=MUTED, fontsize=10, va="top")
+        fig.text(0.055, 0.923,
+                 "紙上模擬驗證 · 非實盤績效（實倉 0 筆）· 已排除限價未成交 · 日曆時間軸",
+                 color=MUTED, fontsize=9.5, va="top")
+        _rows = []
+        if series["crypto"]:
+            _rows.append((CRYPTO_COL,
+                          f"加密 deepdive　n={cs['n']}　累積 {cs['cum_r']:+.2f}R"
+                          f"　勝率 {cs['win_rate']:.0f}%"
+                          + (f"　·　淨帳(扣費,近{net['crypto']['n']}筆) "
+                             f"{net['crypto']['sum']:+.2f}R"
+                             if net['crypto']['n'] else "")))
+        if series["us"]:
+            # 紅線③雙向誠實：過閘照登、紙上毛利口徑與真錢未驗照標
+            _rows.append((US_COL,
+                          f"美股 us_breakout（已過統計閘 PSRc>=0.95·真錢未驗）"
+                          f"　n={ss['n']}　累積 {ss['cum_r']:+.2f}R"
+                          + (f"　·　淨帳(扣費,近{net['us']['n']}筆) "
+                             f"{net['us']['sum']:+.2f}R"
+                             if net['us']['n'] else "")))
+        for i, (col, txt) in enumerate(_rows):
+            y = 0.878 - i * 0.042
+            fig.text(0.058, y, "●", color=col, fontsize=10, va="top")
+            fig.text(0.075, y, txt, color=FG, fontsize=9.5, va="top")
 
-        fig.text(0.07, 0.02,
-                 # v136-3：美股 2026-07-28 已過預註冊統計閘——舊「樣本量不足」措辭過時；
-                 # 換上里程碑鐵則措辭（紙上毛利口徑·真錢未驗·不作對外宣稱）
+        fig.text(0.055, 0.018,
                  "Y 軸為 R（風險倍數），非報酬率　|　兩引擎數學不同故分線　|　"
                  "美股已過統計閘·紙上毛利口徑·真錢未驗·不作對外宣稱　|　輸贏全記，不挑單",
                  color=MUTED, fontsize=8.5, va="bottom")
 
-        plt.subplots_adjust(top=0.86, bottom=0.13, left=0.085, right=0.96)
+        plt.subplots_adjust(top=0.775, bottom=0.115, left=0.075, right=0.90)
 
         CHART_DIR.mkdir(parents=True, exist_ok=True)
         out = CHART_DIR / f"equity_{int(time.time())}.png"
