@@ -67,7 +67,12 @@ _BENIGN_MARKERS = ("51603", "doesn't exist", "does not exist")
 # v163（r54）：pos_state_* 兩類排在傳輸類之前——本地帳壞掉會同時讓熔斷口徑與同幣同向
 # 閘失去資料（不是「這輪送不出去」，是「風險上限暫時不存在」），且與網路無關、
 # 不可能被斷流洗掉；修法也完全不同（要人去看那個檔案，不是等網路好）。
+#
+# v165（r56）：done_state_* 兩類緊接在 pos_state_* 之後——同樣是本地檔壞掉、與網路無關、
+# 不可能被斷流洗掉，且後果同樣是「風險閘暫時不存在」（分不出哪些單下過 ⇒ 全面停接新單）；
+# 排在 pos_state_* 之後是因為部位帳壞掉會直接讓熔斷消失，比冪等清單壞掉更前面一步。
 _CLASS_PRIORITY = ("orphan_position", "pos_state_unreadable", "pos_state_write_fail",
+                   "done_state_unreadable", "done_state_write_fail",
                    "cli_missing", "auth_ip_whitelist", "auth",
                    "rate_limit", "timeout", "leverage_fail", "query_fail",
                    # v164：健康檔壞掉排在最後——它是告警層自己的內傷，永遠不該蓋掉
@@ -304,6 +309,15 @@ _CLASS_HINT = {
                             "刪掉等於把在場倉與近 14 天熔斷損益一起清零",
     "pos_state_write_fail": "本地部位帳寫不進去 → 剛送出的單可能沒記進帳本（下一輪會"
                             "被當孤兒部位偵測到）。請確認磁碟空間／檔案沒被鎖住",
+    "done_state_unreadable": "已處理 intent 清單讀不到或內容壞掉（多半是寫到一半被中斷"
+                             "留下半截 JSON）→ 分不出哪些 intent 已經下過單，執行器已"
+                             "自動停接新單（既有倉照常管理、止損仍掛在交易所）。"
+                             "請人工檢查 atk_consumer_*state.json；⛔ 不要直接刪掉、"
+                             "也不要清成空清單——那會讓 6 小時內的舊 intent 全部重跑，"
+                             "把早已平掉的倉又記成在場（假倉會擋掉之後真正該下的單）",
+    "done_state_write_fail": "已處理 intent 清單寫不進去 → 本輪處理過的 intent 沒有落地，"
+                             "行程重啟後會重跑（clOrdId 冪等擋重複成交，但仍應修）。"
+                             "請確認磁碟空間／檔案沒被鎖住",
     "auth_ip_whitelist": "呼叫端 IP 不在 API key 白名單（住宅浮動 IP 換掉會復發）"
                          "→ 到 OKX 後台把下方錯誤訊息中的 IP 加進白名單，"
                          "消費器每分鐘自動重試、不需重啟",
@@ -902,6 +916,57 @@ def selftest_fail(rounds: int) -> int:
         HEALTH = real
 
 
+# ── 已處理清單（v165：未知 vs 確認沒處理過） ────────────────────────────
+def _load_state() -> dict | None:
+    """讀已處理 intent 清單。回 None＝讀不到／讀壞了（**未知**）；
+    ⛔ 不可再當成「確認一筆都沒處理過」。
+
+    v165（監督員 r56）：舊版 `except: state = {"done": []}` 是 v162/v163/v164 同一物種
+    在真錢路徑上的最後一處——把「不知道」壓成「確認沒有」。這一處的下游有兩條：
+
+    ①**永久抹掉（唯一不可逆）**：done 被清成空集合後，輪尾照樣把它寫回檔案 ⇒ 壞檔被
+      一本乾淨的空清單覆蓋，最多 500 筆已處理紀錄就此消失，而且無聲。
+    ②**假倉入帳**：清單歸零後，還沒過期（6h 窗）的舊 intent 會被重跑。重複成交本身有
+      clOrdId 冪等擋著（_order_exists 查到已成交那腿回 True ⇒ 跳過）——但每腿都跳過會
+      讓 place() 回 True，main() 便把這筆當成「本輪剛開的新倉」寫進 ps["open"]。若那筆
+      倉早已平掉，本地帳就憑空多一個**交易所上不存在的部位**：同幣同向閘從此擋掉之後
+      真正該下的單，對帳邏輯也會去管一個不存在的倉。冪等鎖擋得住重複成交，擋不住這個。
+
+    「檔案還不存在」＝首跑，是真的空清單（合法）；JSON 壞掉／IO 錯／型別不對一律未知。
+    半截 JSON 不是理論風險：舊寫法 write_text 是「先截斷再寫」的非原子寫，行程在中途被殺
+    （排程逾時／休眠／當機）就會留下壞檔——與 v163 修的是同一個成因。"""
+    try:
+        raw = json.loads(STATE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"done": []}              # 首跑：還沒處理過任何 intent＝合法空清單
+    except Exception as e:  # noqa: BLE001
+        _note_fail("done_state_unreadable",
+                   f"{STATE.name} 讀取失敗：{type(e).__name__}: {e}")
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("done", []), list):
+        _note_fail("done_state_unreadable", f"{STATE.name} 內容結構不對")
+        return None
+    raw.setdefault("done", [])
+    return raw
+
+
+def _save_state(state: dict) -> bool:
+    """原子寫回已處理清單。回 False＝沒寫成（呼叫端必須出聲）。
+
+    v165（監督員 r56）：①改「暫存檔＋os.replace」——非原子寫留下的半截 JSON 會讓
+    _load_state 從此永遠讀壞（見上，正是本輪要斷的自我製造迴圈）。②失敗不再用
+    `except: pass` 無聲吞掉：寫不進去代表本輪處理過的 intent 沒落地。"""
+    tmp = STATE.with_name(STATE.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, STATE)
+        return True
+    except Exception as e:  # noqa: BLE001
+        _note_fail("done_state_write_fail",
+                   f"{STATE.name} 寫入失敗：{type(e).__name__}: {e}")
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
@@ -915,16 +980,22 @@ def main() -> int:
         return selftest_fail(a.selftest_fail)
     if not a.dry_run and not verify_demo_profile():
         return 1
-    try:
-        state = json.loads(STATE.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        state = {"done": []}
-    done = set(state.get("done", []))
+    # v165（r56）：三態——None＝讀壞了（未知），⛔ 勿再寫回 `or {"done": []}`
+    state = _load_state()
+    done = set(state.get("done", [])) if state is not None else set()
     ct_cache: dict = {}
 
     while True:
         now_ms = time.time() * 1000
         _ROUND_FAILS.clear()             # v143：本輪故障帳從零開始
+        # v165（r56）：清單未知就每輪重讀——檔案被人修好／還原後不必重啟就自然接上。
+        #   重讀也讓 done_state_unreadable 每輪重新記帳（_ROUND_FAILS 剛清空），
+        #   否則只有開機那一次會出聲，之後永遠靜音。
+        if state is None:
+            state = _load_state()
+            if state is not None:
+                done = set(state.get("done", []))
+        state_blind = state is None
         _ROUND_OKS["ok"] = 0             # v151：成功帳同步歸零（分辨空轉輪用）
         # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
         # v159（r47）：manage_positions 同時做反向對帳，回本輪的孤兒部位鍵
@@ -946,7 +1017,12 @@ def main() -> int:
         if halted_today:
             print(f"⛔ 日虧熔斷已觸發（≤ -{DAILY_STOP_USD:.0f} USDT）——今日不接新單，"
                   "既有倉位照常管理")
-        for p in sorted(OUTBOX.glob("*.json")):
+        if state_blind:
+            print("⛔ 已處理清單讀取失敗——分不出哪些 intent 已下過單，本輪一筆都不接"
+                  "（既有倉照常管理、交易所端止損仍在；⛔ 本輪不覆寫該檔）")
+        # v165（r56）：清單未知 ⇒ 冪等的第一道鎖失效，重跑舊 intent 會把早已平掉的倉
+        #   憑空記回帳本（見 _load_state）⇒ 本輪整批不碰。⛔ 勿改回無條件 glob。
+        for p in ([] if state_blind else sorted(OUTBOX.glob("*.json"))):
             try:
                 intent = json.loads(p.read_text(encoding="utf-8"))
             except Exception:  # noqa: BLE001
@@ -1027,11 +1103,11 @@ def main() -> int:
                         if not _save_positions(ps):
                             print(f"🚨 {iid} 已送出但帳本寫入失敗——"
                                   "該倉下輪會被當孤兒偵測到，請人工到 OKX 確認")
-        state["done"] = sorted(done)[-500:]
-        try:
-            STATE.write_text(json.dumps(state), encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            pass
+        # v165（r56）：⛔ 未知時絕不寫回——那會把壞檔換成一本乾淨的空清單＝永久抹掉
+        #   （本輪唯一不可逆的一條，比照 v163 對部位帳的處置）。
+        if not state_blind:
+            state["done"] = sorted(done)[-500:]
+            _save_state(state)
         # v143：本輪收尾——把 fail-closed 記帳並在連續失敗時告警（dry-run 不真送）
         finish_round(dict(_ROUND_FAILS), dry=a.dry_run, oks=_ROUND_OKS["ok"])
         if a.once or a.dry_run:

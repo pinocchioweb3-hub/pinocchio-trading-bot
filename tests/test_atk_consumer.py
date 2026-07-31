@@ -245,10 +245,12 @@ def test_dup_gate_pure_blocks_same_side_allows_opposite():
 
 
 def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True, orphans=(),
-              scan_failed=False, ledger_raw=None, day_pnl=None):
+              scan_failed=False, ledger_raw=None, day_pnl=None, state_raw=None):
     """把主迴圈接到臨時目錄上跑一輪 --once（零網路、零下單）。回 (下單清單, done)。
 
-    ledger_raw＝直接寫進本地帳檔的原文（給 v163 的壞檔情境用；None＝正常 JSON）。"""
+    ledger_raw＝直接寫進本地帳檔的原文（給 v163 的壞檔情境用；None＝正常 JSON）。
+    state_raw＝直接寫進已處理清單檔的原文（給 v165 的壞檔情境用；None＝不預先建檔）。
+    done 讀不回來時回 None——v165 起「清單未知」的那一輪本來就不該寫回那個檔。"""
     outbox = tmp_path / "outbox"
     outbox.mkdir()
     intent = {"intent_id": "i-new", "symbol": "BTC", "inst_id": "BTC-USDT-SWAP",
@@ -260,6 +262,8 @@ def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True, orphans=
         ledger_raw if ledger_raw is not None
         else json.dumps({"open": open_map, "day_pnl": day_pnl or {}}),
         encoding="utf-8")
+    if state_raw is not None:
+        (tmp_path / "state.json").write_text(state_raw, encoding="utf-8")
     placed: list = []
     monkeypatch.setattr(ci, "OUTBOX", outbox)
     monkeypatch.setattr(ci, "STATE", tmp_path / "state.json")
@@ -278,7 +282,10 @@ def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True, orphans=
                         (placed.append(intent["intent_id"]), place_ok)[1])
     monkeypatch.setattr(sys, "argv", ["consume_intents.py", "--once"])
     assert ci.main() == 0
-    done = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))["done"]
+    try:
+        done = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))["done"]
+    except Exception:  # noqa: BLE001
+        done = None                        # v165：清單未知的那輪不該有寫回
     return placed, done
 
 
@@ -818,3 +825,81 @@ def test_corrupt_health_never_fabricates_a_recovery_notice(tmp_path, monkeypatch
     _arm_health(tmp_path, monkeypatch, primary="}}not json{{")
     h = ci.finish_round({}, 1000.0, dry=True, oks=1)
     assert not h.get("recovered_from")
+
+
+# ── v165（監督員 r56）：已處理清單的「未知 vs 確認沒處理過」 ──────────────
+_STATE_CORRUPT = '{"done": ["0965ba0c26c12842", "0ee01a27b41'   # 被截斷的半截檔
+
+
+def test_done_state_read_failure_is_unknown_but_missing_file_is_empty(tmp_path, monkeypatch):
+    """型別要能表達『不知道』：壞檔回 None、檔案不存在（首跑）才是合法空清單。"""
+    ci._ROUND_FAILS.clear()
+    monkeypatch.setattr(ci, "STATE", tmp_path / "state.json")
+    assert ci._load_state() == {"done": []}                  # 首跑：真的還沒處理過
+    assert not ci._ROUND_FAILS, "首跑不是故障，不可誤報"
+    (tmp_path / "state.json").write_text(_STATE_CORRUPT, encoding="utf-8")
+    assert ci._load_state() is None, "讀壞了不可與『確認一筆都沒處理過』同型"
+    assert "done_state_unreadable" in ci._ROUND_FAILS, "無聲失敗＝沒有出口"
+    (tmp_path / "state.json").write_text('{"done": "not-a-list"}', encoding="utf-8")
+    assert ci._load_state() is None, "結構不對也是未知，不可當空清單"
+    ci._ROUND_FAILS.clear()
+
+
+def test_loop_never_places_when_done_state_is_unreadable(tmp_path, monkeypatch):
+    """迴圈級（本輪主修）：分不出哪些 intent 下過單 ⇒ 冪等第一道鎖失效 ⇒ 本輪不接新單。
+
+    舊碼把讀失敗壓成 {"done": []}，未過期的舊 intent 會整批重跑。"""
+    ci._ROUND_FAILS.clear()
+    placed, done = _arm_loop(tmp_path, monkeypatch, {}, "long",
+                             state_raw=_STATE_CORRUPT)
+    assert placed == [], "分不出下過沒下過還照下＝重跑舊 intent"
+    assert "done_state_unreadable" in ci._ROUND_FAILS
+    ci._ROUND_FAILS.clear()
+
+
+def test_corrupt_done_state_is_never_overwritten_by_an_empty_one(tmp_path, monkeypatch):
+    """⛔ 唯一不可逆的一條：壞檔絕不可被一本乾淨的空清單覆蓋掉——
+    那會把最多 500 筆已處理紀錄無聲清零（比照 v163 對部位帳的處置）。"""
+    ci._ROUND_FAILS.clear()
+    _arm_loop(tmp_path, monkeypatch, {}, "long", state_raw=_STATE_CORRUPT)
+    assert (tmp_path / "state.json").read_text(encoding="utf-8") == _STATE_CORRUPT
+    ci._ROUND_FAILS.clear()
+
+
+def test_already_done_intent_is_not_reprocessed_into_a_phantom_position(tmp_path, monkeypatch):
+    """迴圈級·這才是「重跑舊 intent」真正的傷口：clOrdId 冪等擋得住重複成交，
+    擋不住「每腿都已存在 ⇒ place() 回 True ⇒ 把早已平掉的倉又寫進本地帳」。
+    正常（清單讀得到）時該 intent 必須被 done 濾掉、連 place 都不該進去。"""
+    ci._ROUND_FAILS.clear()
+    good = json.dumps({"done": ["i-new"]})
+    placed, done = _arm_loop(tmp_path, monkeypatch, {}, "long", state_raw=good)
+    assert placed == [], "已處理過的 intent 不可再進下單路徑"
+    assert done == ["i-new"], "清單本身要原樣留著"
+    ci._ROUND_FAILS.clear()
+
+
+def test_done_state_write_is_atomic_so_a_failed_write_keeps_the_old_file(tmp_path, monkeypatch):
+    """寫入失敗要留下**完整的舊檔**（而不是半截新檔），並回 False 讓呼叫端出聲。
+    半截新檔正是下一輪 _load_state 讀壞的成因＝舊碼自己製造再自己誤讀。"""
+    ci._ROUND_FAILS.clear()
+    good = json.dumps({"done": ["aaa", "bbb"]})
+    (tmp_path / "state.json").write_text(good, encoding="utf-8")
+    monkeypatch.setattr(ci, "STATE", tmp_path / "state.json")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+    monkeypatch.setattr(ci.os, "replace", boom)
+    assert ci._save_state({"done": ["ccc"]}) is False
+    assert (tmp_path / "state.json").read_text(encoding="utf-8") == good
+    assert "done_state_write_fail" in ci._ROUND_FAILS, "無聲吞掉＝沒有出口"
+    ci._ROUND_FAILS.clear()
+
+
+def test_done_state_write_success_returns_true_and_round_trips(tmp_path, monkeypatch):
+    """別擋過頭：正常寫入回 True、讀得回來、不留暫存檔。"""
+    ci._ROUND_FAILS.clear()
+    monkeypatch.setattr(ci, "STATE", tmp_path / "state.json")
+    assert ci._save_state({"done": ["aaa"]}) is True
+    assert ci._load_state()["done"] == ["aaa"]
+    assert not (tmp_path / "state.json.tmp").exists(), "暫存檔不可留下"
+    assert not ci._ROUND_FAILS
