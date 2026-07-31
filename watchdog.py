@@ -160,11 +160,34 @@ def _memguard_notify(state: dict, pct: float, text: str, now: float) -> None:
 
 
 def memory_guard() -> None:
-    """commit charge 到緊急線 → 由老到新清殭屍 runner，降到目標線即停。每次動作必留痕。"""
+    """兩段式：①常態清掃——殭屍 runner ≥4 個且皆老於 90 分鐘就清（不等記憶體告急，
+    治「離開一天越來越卡」）②緊急線——commit ≥88% 強制清到目標線。每次動作必留痕。"""
     if not MEMGUARD_ON:
         return
     pct = _commit_pct()
-    if pct is None or pct < MEM_EMERGENCY_PCT:
+    if pct is None:
+        return
+    if pct < MEM_EMERGENCY_PCT:
+        # ①常態清掃（2026-08-01 使用者反映效能日衰後加入）
+        stale = [v for v in _stale_claude_runners() if v[1] >= MEM_MIN_AGE_MIN * 60]
+        if len(stale) < 4:
+            return
+        state = read_json(STATE)
+        now = time.time()
+        if now - float(state.get("memguard_last_ts", 0) or 0) < MEM_COOLDOWN_SEC:
+            return
+        killed = []
+        for pid, _age in sorted(stale, key=lambda v: -v[1]):
+            try:
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                               capture_output=True, text=True, timeout=15)
+                killed.append(pid)
+            except Exception:
+                continue
+        log(f"[memguard] 常態清掃：清 {len(killed)} 個殭屍 runner"
+            f"（commit {pct:.0f}%,未達緊急線,純衛生）")
+        state["memguard_last_ts"] = now
+        write_state(state)
         return
     state = read_json(STATE)
     now = time.time()
