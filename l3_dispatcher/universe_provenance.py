@@ -63,6 +63,16 @@ DATA_PLANE = "dp2"          # dp2 = v178 起（CVD備援+BTC閘+備援上桌）
 _LEGACY_DATA_PLANE = "dp1"  # v178 前（數據面殘缺的兩桶版）
 
 
+def data_plane_filter(rows) -> list:
+    """dp 同代過濾——與 active_generation 同分寸：全部樣本皆無 dp 標記（=修復前
+    的存量庫或未標記 fixture）→ 原樣放行維持現況、不製造新阻斷；一旦出現任何
+    dp 標記樣本 → 只留與現行 DATA_PLANE 同版者。"""
+    rows = list(rows or [])
+    if not any(data_plane_of_row(r) != _LEGACY_DATA_PLANE for r in rows):
+        return rows
+    return [r for r in rows if data_plane_of_row(r) == DATA_PLANE]
+
+
 def data_plane_of_row(row: dict) -> str:
     """一筆樣本出自哪個數據面版本。缺鍵/壞資料一律回 dp1（誠實：舊版沒標記）。"""
     try:
