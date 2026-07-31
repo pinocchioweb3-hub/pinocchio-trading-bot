@@ -84,6 +84,10 @@ _ROUND_FAILS: dict[str, str] = {}   # 本輪故障 {類別: 樣本}；每輪開�
 # v151：本輪「成功呼叫數」；每輪開頭歸零。沒有它就無法分辨「全部呼叫都成功」
 # 與「這輪根本沒呼叫」——後者被當成乾淨輪會蓋出假痊癒（見 update_health）。
 _ROUND_OKS: dict[str, int] = {"ok": 0}
+# v169：本輪「因過期而永久丟棄」的 intent；每輪開頭清空。過了 expires_at 就不會
+# 再重送，這是斷流唯一會造成的實質損失，必須是數字而不是一行 log（見 _account_expiry）。
+_ROUND_EXPIRED: list[dict] = []
+EXPIRED_RECENT_MAX = 20             # 健康檔內保留的丟棄明細筆數上限
 
 
 # Windows 陷阱：npm 全域裝的 okx 是 okx.cmd shim，subprocess 不走 shell 找不到裸名
@@ -249,7 +253,36 @@ def worst_class(classes) -> str | None:
     return next(iter(sorted(classes)), None)
 
 
-def update_health(h: dict, fails: dict, now_s: float, oks: int = 0) -> dict:
+def _account_expiry(h: dict, expired, now_s: float, in_fault: bool,
+                    fault_class: str | None) -> None:
+    """把本輪「過期丟棄」的 intent 記進健康帳（就地改 h；呼叫端已複製過）。
+
+    v169（監督員 r67）：過期分支原本只有一行 print，intent 就此永久消失——
+    重送不會發生（過了 expires_at 就是過了）。於是一場斷流吃掉幾筆訊號，
+    只能靠 grep 837KB 的 log 才問得出來；健康檔、監督帳本、Telegram 全都不知道。
+    與 v164/v166/v167 同一物種：要用來下判斷的量只以 log 文字存在＝等於不存在。
+
+    分兩本帳：total＝含正常老化（訊號本來就有時效）；during_fault＝斷流期丟的，
+    才是「這場故障的代價」。混在一起會被日常噪音灌水，數字就沒有意義了。"""
+    drops = list(expired or [])
+    if not drops:
+        return                                  # 沒事不生欄位＝帳本不長出一排 0
+    h["expired_dropped_total"] = int(h.get("expired_dropped_total", 0)) + len(drops)
+    if not in_fault:
+        return                                  # 正常老化不算斷流代價
+    h["expired_dropped_during_fault"] = \
+        int(h.get("expired_dropped_during_fault", 0)) + len(drops)
+    h["expired_dropped_last_ts"] = now_s
+    recent = list(h.get("expired_dropped_recent") or [])
+    for d in drops:
+        recent.append({"intent_id": d.get("intent_id"), "symbol": d.get("symbol"),
+                       "side": d.get("side"), "ts": now_s, "fault_class": fault_class})
+    # 上限：健康檔每輪整份重寫，無界成長會養到寫不進去，反過來打死 v166 的告警計數
+    h["expired_dropped_recent"] = recent[-EXPIRED_RECENT_MAX:]
+
+
+def update_health(h: dict, fails: dict, now_s: float, oks: int = 0,
+                  expired=None) -> dict:
     """把本輪結果併進健康狀態（純函式，不做 I/O）。
 
     connsecutive_fail_rounds 只在「有故障的輪」累加；乾淨輪歸零並在曾告警過時
@@ -269,6 +302,13 @@ def update_health(h: dict, fails: dict, now_s: float, oks: int = 0) -> dict:
                                           time.localtime(now_s))
     h["profile"] = PROFILE
     h.pop("recovered_from", None)
+    # v169（r67）：⛔ 過期記帳必須在下面那個「空轉輪提早 return」之前。
+    #   斷流期的丟棄**恰好**發生在空轉輪：intent 全過期 ⇒ 一次呼叫都沒發出
+    #   ⇒ fails 空、oks==0。記在 return 之後，唯一要記的情境就一筆都記不到。
+    _account_expiry(h, expired, now_s,
+                    in_fault=bool(fails) or int(h.get("consecutive_fail_rounds", 0)) > 0,
+                    fault_class=(worst_class(fails.keys()) if fails
+                                 else h.get("last_fail_class")))
     if not fails and int(oks or 0) <= 0:
         # 空轉輪：沒故障也沒成功呼叫＝本輪對「是否已恢復」零資訊，維持原判
         h["idle_rounds"] = int(h.get("idle_rounds", 0)) + 1
@@ -465,7 +505,7 @@ def send_alert(text: str, dry: bool = False) -> tuple[str, str | None]:
 
 
 def finish_round(fails: dict, now_s: float | None = None,
-                 dry: bool = False, oks: int = 0) -> dict:
+                 dry: bool = False, oks: int = 0, expired=None) -> dict:
     """每輪收尾：更新健康檔、必要時告警。永不對外拋例外——
     告警層絕不可以把交易執行器弄掛（它的職責只是「讓失敗有出口」）。
 
@@ -483,7 +523,7 @@ def finish_round(fails: dict, now_s: float | None = None,
                     "health_unknown_at": now_s}
             print(f"⚠️ 健康檔讀取失敗（{HEALTH.name}）——連續故障計數視為未知，"
                   f"本輪若有故障即告警，不從零重數")
-        h = update_health(base, fails, now_s, oks)
+        h = update_health(base, fails, now_s, oks, expired=expired)
         if h.get("recovered_from"):
             ch, err = send_alert(recovery_text(h), dry=dry)
             h["last_alert_channel"], h["last_alert_error"] = ch, err
@@ -1072,6 +1112,7 @@ def main() -> int:
                 done = set(state.get("done", []))
         state_blind = state is None
         _ROUND_OKS["ok"] = 0             # v151：成功帳同步歸零（分辨空轉輪用）
+        _ROUND_EXPIRED.clear()           # v169：本輪丟棄帳從零開始
         # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
         # v159（r47）：manage_positions 同時做反向對帳，回本輪的孤兒部位鍵
         # v162（r53）：None＝本輪掃描沒跑成（查不到交易所部位）⇒ 擋單閘等於瞎掉，
@@ -1110,7 +1151,13 @@ def main() -> int:
                 done.add(iid)
                 continue
             if now_ms > intent.get("expires_at", 0):
+                # v169（r67）：過了 expires_at 就永不重送＝這筆訊號永久消失。
+                #   ⛔ 不可只 print：斷流期丟了幾筆是判斷「這場故障值不值得急著修」
+                #   的唯一實質代價，只存在 log 文字裡等於問不出來（見 _account_expiry）。
                 print(f"⏭ {iid} {intent.get('symbol')} 已過期——跳過")
+                _ROUND_EXPIRED.append({"intent_id": iid,
+                                       "symbol": intent.get("symbol"),
+                                       "side": intent.get("pos_side")})
                 done.add(iid)
                 continue
             if halted_today:
@@ -1184,7 +1231,8 @@ def main() -> int:
             state["done"] = sorted(done)[-500:]
             _save_state(state)
         # v143：本輪收尾——把 fail-closed 記帳並在連續失敗時告警（dry-run 不真送）
-        finish_round(dict(_ROUND_FAILS), dry=a.dry_run, oks=_ROUND_OKS["ok"])
+        finish_round(dict(_ROUND_FAILS), dry=a.dry_run, oks=_ROUND_OKS["ok"],
+                     expired=list(_ROUND_EXPIRED))
         if a.once or a.dry_run:
             return 0
         time.sleep(60)

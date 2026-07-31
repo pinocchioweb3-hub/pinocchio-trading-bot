@@ -214,13 +214,26 @@ def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
     known = USER_ACTIONABLE_FAIL_CLASSES.get(cls)
     first_fail = float(health.get("first_fail_ts", 0) or 0)
     dur = f"、已持續 {_fmt_age(now_s - first_fail)}" if first_fail > 0 else ""
+    # v169（r67）：斷流期被 expires_at 吃掉的訊號＝這場故障唯一的實質代價。
+    #   「零損失」只對「沒有下錯單」成立，讀起來卻像「不急」；訊號過期不補送，
+    #   拖越久丟越多。⛔ 壞值只讓代價從缺，不可害死阻塞判定本身（fail-closed）。
+    try:
+        dropped = int(health.get("expired_dropped_during_fault", 0) or 0)
+    except (TypeError, ValueError):
+        dropped = 0
+    cost = (f"；斷流期間已有 {dropped} 筆訊號逾時被**永久**丟棄（過期不補送，"
+            f"修好也追不回來）" if dropped > 0 else "")
     if known:
         text = (f"真錢執行器連續 {rounds} 輪被擋（{known}）{dur}——"
-                f"每輪皆 fail-closed 未下單（零損失），但在你修好前一筆都送不出去")
+                f"每輪皆 fail-closed 未下單（無金錢虧損），"
+                f"但在你修好前一筆都送不出去{cost}")
     else:
         text = (f"真錢執行器連續 {rounds} 輪 fail-closed（故障類別：{cls}）{dur}——"
-                f"未下單（零損失），但管線實質停擺，須查明修復")
-    return {"rounds": rounds, "cls": cls, "user_actionable": bool(known), "text": text}
+                f"未下單（無金錢虧損），但管線實質停擺，須查明修復{cost}")
+    out = {"rounds": rounds, "cls": cls, "user_actionable": bool(known), "text": text}
+    if dropped > 0:
+        out["expired_dropped"] = dropped
+    return out
 
 
 def org_digest_verdict(latest_by_role: dict | None, *, today,
