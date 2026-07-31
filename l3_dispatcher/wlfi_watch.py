@@ -149,20 +149,28 @@ async def _top_holders(n: int = 20) -> dict[str, float]:
         return {}
 
 
-# v185：Uniswap V3 工廠自動發現 WLFI 資金池（USDT 對,三檔費率）——池子流出=DEX 買入
+# v185/v186-2：Uniswap V3 工廠自動發現 WLFI 資金池——池子流出=DEX 買入。
+# 報價幣涵蓋 USDT/USDC/USD1（使用者情報：機構多用 USDC 買;USD1=生態原生對）。
+# 三地址皆經雙源驗證（Ethplorer name/symbol + CoinGecko platforms）。
 _UNI_FACTORY = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
-_USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+_QUOTES = {
+    "USDT": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+    "USDC": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    "USD1": "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d",
+}
 
 
 async def _discover_pools() -> set[str]:
     pools: set[str] = set()
     sel = "0x1698ee82"  # getPool(address,address,uint24)
-    for fee in (500, 3000, 10000):
-        data = (sel + CONTRACT[2:].rjust(64, "0") + _USDT[2:].rjust(64, "0")
-                + hex(fee)[2:].rjust(64, "0"))
-        res = await _rpc("eth_call", [{"to": _UNI_FACTORY, "data": data}, "latest"])
-        if res and int(res, 16) != 0:
-            pools.add("0x" + res[-40:].lower())
+    for quote in _QUOTES.values():
+        for fee in (500, 3000, 10000):
+            data = (sel + CONTRACT[2:].rjust(64, "0") + quote[2:].rjust(64, "0")
+                    + hex(fee)[2:].rjust(64, "0"))
+            res = await _rpc("eth_call", [{"to": _UNI_FACTORY, "data": data},
+                                          "latest"])
+            if res and int(res, 16) != 0:
+                pools.add("0x" + res[-40:].lower())
     return pools
 
 
