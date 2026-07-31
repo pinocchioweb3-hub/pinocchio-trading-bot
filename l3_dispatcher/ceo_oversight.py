@@ -269,6 +269,102 @@ def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
     return out
 
 
+def ac_power_online() -> bool | None:
+    """目前是否接著外部電源（Windows GetSystemPowerStatus，純唯讀、零副作用）。
+
+    回 True／False；量不到回 **None＝未知**。⛔ 未知不可折成 True——「不知道有沒有
+    接電」跟「有接電」是兩件事，折過去就是拿代理值當事實（本專案第九次的同一物種）。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _SPS(ctypes.Structure):
+            _fields_ = [("ACLineStatus", wintypes.BYTE),
+                        ("BatteryFlag", wintypes.BYTE),
+                        ("BatteryLifePercent", wintypes.BYTE),
+                        ("SystemStatusFlag", wintypes.BYTE),
+                        ("BatteryLifeTime", wintypes.DWORD),
+                        ("BatteryFullLifeTime", wintypes.DWORD)]
+
+        st = _SPS()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st)):
+            return None
+        v = int(st.ACLineStatus) & 0xFF
+        return False if v == 0 else (True if v == 1 else None)   # 255＝unknown
+    except Exception:
+        return None                      # 非 Windows／無此 API＝未知，不是有電
+
+
+def live_stall_verdict(health: dict | None, *, now_s: float | None = None,
+                       max_age_sec: int = LIVE_HEALTH_MAX_AGE_SEC,
+                       ac_online: bool | None = None) -> dict | None:
+    """健康檔停止更新＝真錢消費器**沒在跑**（純函式，可離線測）。
+
+    v176（監督員 r74）：`live_exec_verdict` 對舊檔一律回 None，理由（「不可拿昨天的
+    streak 當今天的阻塞」）是對的，但**輸出**是錯的——它把「執行器整個停擺」渲染成
+    跟「一切正常」一模一樣的空白：帳本上唯一那條真錢阻塞會自己消失，而一筆訊號都
+    送不出去。⛔ 這正是 r33「假痊癒」的形狀換一個入口，也是「未知 vs 確認沒有」在
+    真錢路徑上的第七處。
+
+    2026-08-01 實測（本函式就是被這件事逼出來的）：ATKLiveConsumer 排程自 01:13 起
+    每分鐘被 Task Scheduler 略過（LastRunTime 凍結、NumberOfMissedRuns 持續累加），
+    健康檔隨之凍結在 consecutive_fail_rounds=1260；下一次帳本寫入就會跨過 900 秒的
+    新鮮度閘，401 阻塞從此無聲消失。根因是機器改吃電池、而該排程設了
+    DisallowStartIfOnBatteries=True。
+
+    判定口徑（⛔ 別放寬）：
+      * 健康檔**不存在／讀不到** → None。那是「未知」，不是「停擺」——可能根本還沒
+        部署過執行器，憑空報停擺會變成慢性假警報。
+      * `updated_at` 缺席或 ≤0 → 回報停擺，但明說「更新時間不明」：檔在、卻證明不了
+        它還在跑，方向取 fail-closed（未知不當在跑）。
+      * 夠新鮮 → None（該報的由 live_exec_verdict 報，兩者互斥不會雙重記帳）。
+
+    歸屬：量到**沒接外部電源** ⇒ user_actionable=True（接上電源即自行恢復，球在使用
+    者）；有接電或量不到 ⇒ False（原因不明，該查排程／腳本＝push CEO）。
+    """
+    if not health:
+        return None
+    now_s = now_s if now_s is not None else time.time()
+    try:
+        updated_at = float(health.get("updated_at", 0) or 0)
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    if updated_at > 0:
+        stale_sec = now_s - updated_at
+        if stale_sec <= max_age_sec:
+            return None
+        aged = f"已 {_fmt_age(stale_sec)} 沒有寫健康檔"
+    else:
+        stale_sec = None
+        aged = "健康檔沒有可信的更新時間戳（證明不了它還在跑）"
+
+    try:
+        rounds = int(health.get("consecutive_fail_rounds", 0) or 0)
+    except (TypeError, ValueError):
+        rounds = 0
+    cls = str(health.get("last_fail_class") or "unknown")
+    last = (f"，最後量到的是連續 {rounds} 輪 "
+            f"{USER_ACTIONABLE_FAIL_CLASSES.get(cls, cls)}" if rounds > 0 else "")
+
+    if ac_online is False:
+        hint = ("；已量到**目前未接外部電源**——ATKLiveConsumer 排程設為電池模式不啟動，"
+                "接上電源即會自行恢復每分鐘一輪")
+    elif ac_online is True:
+        hint = "；已量到目前有接外部電源 ⇒ 不是電池條件造成的，須查排程與腳本本身"
+    else:
+        hint = "；電源狀態量不到（未知，⛔ 不等於有接電）"
+
+    text = (f"真錢執行器{aged}＝消費器**沒在跑**（⛔ 這不是痊癒）{last}——"
+            f"停擺期間訊號一樣送不出去，且 trade-intent 一到 expires_at 就**永久**丟棄、"
+            f"修好也不補送{hint}")
+    return {"stale_sec": (int(stale_sec) if stale_sec is not None else None),
+            "last_rounds": rounds, "last_cls": cls,
+            "ac_online": ac_online,
+            "user_actionable": ac_online is False,
+            "text": text}
+
+
 def pnl_gap_verdict(health: dict | None, *, now_s: float | None = None,
                     max_age_sec: int = LIVE_HEALTH_MAX_AGE_SEC) -> dict | None:
     """把「已了結但損益查不到、已放棄」的累計筆數翻成阻塞（純函式，可離線測）。
@@ -425,7 +521,7 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
            demo_n, demo_live, demo_active, open_decisions, pending_outbox,
            demo_rejected=0, demo_reject_hint=None, real_output_age_sec=None,
            live_exec=None, org_digest=None, demo_stall_reason=None, pnl_gap=None,
-           org_coverage=None,
+           org_coverage=None, live_stall=None,
            last_nudge_ms=0, stall_sec=STALL_SEC, nudge_cooldown_sec=NUDGE_COOLDOWN_SEC) -> dict:
     """核心判定（純函式）。回 state / next_step / blockers / should_nudge。
 
@@ -448,6 +544,14 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
             blockers.append(live_exec["text"])
         else:
             system_faults.append(live_exec["text"])
+    # r74：消費器停擺（健康檔不再更新）。與 live_exec 互斥（一個要求夠新鮮、一個要求
+    #   太舊），永遠不會雙重記帳。⛔ 不可因為「反正 live_exec 那條也在講真錢」就省略：
+    #   live_exec 那條在停擺的當下正好會消失，這條就是補那個洞的。
+    if live_stall:
+        if live_stall.get("user_actionable"):
+            blockers.append(live_stall["text"])
+        else:
+            system_faults.append(live_stall["text"])
     # r68：熔斷口徑漏記。歸 blockers 而非 system_faults——CEO 改碼救不回那筆金額
     #   （查不到正是故障本身），只有人能到 OKX 查回來、也只有人能決定要不要在一個
     #   已知低估的熔斷下繼續跑真錢。⛔ 不可因為「已經有 401 在 blockers」就省略：
@@ -511,6 +615,9 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
         "blockers": blockers,
         "system_faults": system_faults,
         "live_exec": live_exec,
+        # r74：欄位恆存在（沒停擺時為 None）——Layer 2 才分得出「消費器在跑」與
+        #      「這版還沒有這個偵測」。⛔ 勿改成只在有值時才塞。
+        "live_stall": live_stall,
         "pnl_gap": pnl_gap,
         "org_digest": org_digest,
         # r71：欄位恆存在（無缺報時為 None）——Layer 2 才分得出「沒缺報」與「這版沒這功能」。
@@ -730,10 +837,15 @@ def build_snapshot(now_ms: int | None = None) -> dict:
 
     # r26：真錢執行器健康（v143 健康檔）。純讀＋新鮮度閘，讀不到就當「無故障」。
     live_exec = None
+    live_stall = None
     pnl_gap = None
     try:
         _live_health = _read_live_exec_health()
         live_exec = live_exec_verdict(_live_health, now_s=now_ms / 1000)
+        # r74：健康檔停止更新＝消費器沒在跑。live_exec 在這一刻正好會回 None，
+        #   帳本上唯一的真錢阻塞會無聲消失（r33 假痊癒的形狀換一個入口）。
+        live_stall = live_stall_verdict(_live_health, now_s=now_ms / 1000,
+                                        ac_online=ac_power_online())
         # r68：熔斷口徑漏記（累計既成事實，不套新鮮度閘——理由見 pnl_gap_verdict）
         pnl_gap = pnl_gap_verdict(_live_health, now_s=now_ms / 1000)
     except Exception:
@@ -776,7 +888,7 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint,
         real_output_age_sec=real_output_age_sec,
         live_exec=live_exec, org_digest=org_digest, pnl_gap=pnl_gap,
-        org_coverage=org_coverage,
+        org_coverage=org_coverage, live_stall=live_stall,
         demo_stall_reason=demo_stall_reason,
         last_nudge_ms=last_nudge_ms,
     )
