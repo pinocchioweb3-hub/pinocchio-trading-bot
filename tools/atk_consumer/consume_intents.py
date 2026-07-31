@@ -61,7 +61,7 @@ ENV_FILE = Path(r"C:\Users\user\OneDrive\桌面\交易機器人\.env")  # 只讀
 _BENIGN_MARKERS = ("51603", "doesn't exist", "does not exist")
 # 故障嚴重度排序（同輪多類時取最前者當代表）
 _CLASS_PRIORITY = ("cli_missing", "auth_ip_whitelist", "auth", "rate_limit",
-                   "timeout", "query_fail", "other")
+                   "timeout", "leverage_fail", "query_fail", "other")
 _ROUND_FAILS: dict[str, str] = {}   # 本輪故障 {類別: 樣本}；每輪開頭清空
 # v151：本輪「成功呼叫數」；每輪開頭歸零。沒有它就無法分辨「全部呼叫都成功」
 # 與「這輪根本沒呼叫」——後者被當成乾淨輪會蓋出假痊癒（見 update_health）。
@@ -251,6 +251,9 @@ _CLASS_HINT = {
     "cli_missing": "okx CLI 不存在 → npm install -g @okx_ai/okx-trade-cli",
     "rate_limit": "被限流 → 通常自癒；持續出現才需降頻",
     "timeout": "呼叫逾時 → 檢查網路；持續出現代表對外連線有問題",
+    "leverage_fail": "設槓桿失敗 → 若同時段有認證／網路類別，先修那個；若只有這一類，"
+                     "多半是該 instId／posSide 已有持倉導致交易所拒絕調整槓桿——"
+                     "此時算出的槓桿低於上限的單會 fail-closed 不送出（下輪重試）",
     "query_fail": "查單失敗導致 fail-closed（下游症狀，先看同時段的認證／網路類別）",
     "other": "未分類錯誤 → 讀 atk_live.log 原文",
 }
@@ -413,20 +416,27 @@ def leverage_for_trade(entry: float, stop: float, max_lev: int | None = None) ->
 
 
 def ensure_leverage(inst_id: str, pos_side: str, dry: bool,
-                    lev: int | None = None) -> None:
+                    lev: int | None = None) -> bool:
     """開單前設槓桿（v99 教訓：OKX 預設 3x，hedge 模式 isolated 必須帶 posSide 逐邊設，
-    否則靜默沿用預設）。失敗只警告不擋單——槓桿影響資金效率，風險由止損距離決定。"""
+    否則靜默沿用預設）。回 True＝交易所側確定是 lev（或 dry-run／本輪已設過）。
+
+    v155（監督員 r45）：失敗改回 False 並記一筆 leverage_fail。
+    ⚠️ 記帳這件事 _okx 本來就會做（傳輸層類別，r45 探針實證），r41 說的「完全不進
+    健康帳」是錯的；真正缺的是「從 class_counts 分不出是哪一支呼叫死的」，以及
+    回傳值——沒有它，呼叫端無從得知該不該擋單。擋不擋由呼叫端依風險帶決定。"""
     lev = lev or LEVERAGE
     key = (inst_id, pos_side, lev)
     if dry or key in _LEV_SET:
-        return
+        return True
     code, out = _okx(["swap", "leverage", "--instId", inst_id,
                       "--lever", str(lev), "--mgnMode", "isolated",
                       "--posSide", pos_side])
     if code == 0:
         _LEV_SET.add(key)
-    else:
-        print(f"⚠️ 設槓桿失敗 {inst_id}/{pos_side}（沿用現值繼續）：{out[:120]}")
+        return True
+    print(f"⚠️ 設槓桿失敗 {inst_id}/{pos_side}（應設 {lev}x）：{out[:120]}")
+    _note_fail("leverage_fail", f"{inst_id}/{pos_side} 應設 {lev}x 失敗：{out}")
+    return False
 
 
 # ── 倉位管理（v139：對帳／逾時平倉／日虧熔斷） ──────────────────────────
@@ -631,7 +641,15 @@ def place(intent: dict, sz: float, dry: bool,
     每腿 clOrdId 加尾碼 a/b/c 冪等；部分失敗→回 False 由外層重試（已成腿撞
     51016 重複視為成功，不會重複開倉）。單一 TP 時維持原單筆路徑。"""
     lev = leverage_for_trade(intent.get("entry"), intent.get("stop"))
-    ensure_leverage(intent["inst_id"], intent["pos_side"], dry, lev=lev)
+    # v155（監督員 r45）修C：設槓桿失敗只在「風險帶」擋單。
+    # 風險帶＝算出的 lev < LEVERAGE：此時交易所可能仍卡在更高的舊值，逐倉保證金
+    # 被壓小、清算距離縮到止損之內 ⇒ 單會在走到自己的止損前先被清算（v84 不變式破）。
+    # lev == LEVERAGE 時舊值不可能更高（本執行器只設 ≤ 上限）⇒ 擋單純屬白擋，維持照下。
+    if not ensure_leverage(intent["inst_id"], intent["pos_side"], dry, lev=lev) \
+            and lev < LEVERAGE:
+        print(f"⚠️ {intent['inst_id']}/{intent['pos_side']} 應設 {lev}x（低於上限 "
+              f"{LEVERAGE}x）但設槓桿失敗——本輪整筆不下（fail-closed，下輪重試）")
+        return False
     tps = [intent.get("tp1"), intent.get("tp2"), intent.get("tp3")]
     legs = (split_tp_levels(sz, spec["lotSz"], spec["minSz"], tps)
             if spec else [])

@@ -323,3 +323,74 @@ def test_old_fill_is_clamped_into_retention_window_not_silently_pruned(tmp_path,
     edge = ci._day_key(now - 14 * 86400)
     assert day_pnl == {edge: -5.5}         # 夾到窗邊界：仍計入熔斷口徑，不無聲蒸發
     assert sum(day_pnl.values()) == -5.5
+
+
+# ── v155（監督員 r45）修C：設槓桿失敗只在「風險帶」擋單，並記可辨識類別 ────
+# 風險帶＝算出的 lev < LEVERAGE。lev == LEVERAGE 時交易所舊值不可能更高⇒白擋，
+# 維持照下（見 docs/org/2026-07-31-真錢路徑設槓桿失敗-唯一不擋單也不記帳的呼叫.md §五）。
+_LEV_401 = ("Error: HTTP 401 from OKX: Your IP 203.0.113.7 is not included in "
+            "your API key's 00000000-0000-4000-8000-000000000000 IP whitelist.")
+
+
+def _arm_place(monkeypatch, entry, stop, max_lev, lev_err=_LEV_401):
+    """跑一次 place()，只讓 swap leverage 失敗，其餘呼叫成功。回 (place回傳, 已送出的腿)。"""
+    ci._LEV_SET.clear()
+    ci._ROUND_FAILS.clear()
+    monkeypatch.setattr(ci, "LEVERAGE", max_lev)
+    legs: list = []
+
+    def fake_okx(args, timeout=30):
+        if args[:2] == ["swap", "leverage"]:
+            ci._note_fail(ci.classify_failure(1, lev_err), lev_err)   # 比照 _okx 真實副作用
+            return 1, lev_err
+        legs.append(args)
+        return 0, '{"sCode": "0", "ordId": "1"}'
+
+    monkeypatch.setattr(ci, "_okx", fake_okx)
+    monkeypatch.setattr(ci, "_order_exists", lambda inst_id, cl: False)
+    intent = {"inst_id": "BTC-USDT-SWAP", "pos_side": "long", "side": "buy",
+              "entry": entry, "stop": stop, "tp1": entry * 1.1,
+              "cl_ord_id": "c1"}
+    return ci.place(intent, 1.0, dry=False), legs
+
+
+def test_leverage_fail_blocks_order_when_computed_lev_below_cap(monkeypatch):
+    # 止損 10%、上限 20x → 應設 7x。設失敗＝交易所可能仍卡在更高的舊值，
+    # 清算會先於止損（v84 不變式破了）→ 必須 fail-closed、零腿送出。
+    ok, legs = _arm_place(monkeypatch, entry=100.0, stop=90.0, max_lev=20)
+    assert ci.leverage_for_trade(100.0, 90.0, 20) == 7 < 20   # 確認確實落在風險帶
+    assert ok is False                     # 本輪不下，下輪重試
+    assert legs == []                      # 一腿都不准送出去
+    assert "leverage_fail" in ci._ROUND_FAILS   # 且類別要分得出是哪一支呼叫死的
+
+
+def test_leverage_fail_still_places_when_computed_lev_equals_cap(monkeypatch):
+    # 止損 2%、上限 20x → 算出來就是上限 20x。舊值不可能比上限更高⇒擋單純屬白擋，
+    # 維持現行「只警告、照下」，但故障仍要進帳（安靜≠健康）。
+    ok, legs = _arm_place(monkeypatch, entry=100.0, stop=98.0, max_lev=20)
+    assert ci.leverage_for_trade(100.0, 98.0, 20) == 20       # 確認不在風險帶
+    assert ok is True
+    assert len(legs) == 1                  # 照樣送出
+    assert "leverage_fail" in ci._ROUND_FAILS
+
+
+def test_leverage_fail_is_distinguishable_from_downstream_query_fail():
+    # 傳輸層類別（401）由 _okx 記，本身分不出是設槓桿還是查單死的（r45 探針實證）。
+    # leverage_fail 要排在 query_fail 之前：查單失敗是下游症狀，設槓桿失敗是根因。
+    assert "leverage_fail" in ci._CLASS_PRIORITY
+    assert (ci._CLASS_PRIORITY.index("leverage_fail")
+            < ci._CLASS_PRIORITY.index("query_fail"))
+    assert ci.worst_class({"leverage_fail", "query_fail"}) == "leverage_fail"
+    assert "leverage_fail" in ci._CLASS_HINT       # 告警要講得出怎麼處置
+
+
+def test_leverage_for_trade_risk_band_boundaries():
+    # 回歸鎖：擋單規則整條建立在這條純函式上，邊界動了規則就失準。
+    assert ci.leverage_for_trade(100.0, 96.6, 20) == 20       # 止損 3.4% → 上限
+    # ⚠️ 實測校正：止損「剛好 3.5%」算出的是 19 不是 20——int() 截斷（70/3.5 在
+    # 浮點下是 19.999…）。方向是保守側（槓桿更低＝保證金更多），不改；但這代表
+    # 3.5% 這一格仍落在會擋單的風險帶內，r41 文件寫的「≤3.5% ⇒ 20x」要往下修一格。
+    assert ci.leverage_for_trade(100.0, 96.5, 20) == 19
+    assert ci.leverage_for_trade(100.0, 90.0, 20) == 7        # 止損 10%
+    assert ci.leverage_for_trade(100.0, 70.0, 20) == 3        # 止損 30% → 下限 3
+    assert ci.leverage_for_trade(0.0, 0.0, 20) == 5           # 缺值 → min(上限,5)
