@@ -247,8 +247,13 @@ class BinancePerpSource:
         series = []
         for d in (body or []):
             try:
-                series.append({"ts": int(d["timestamp"]),
-                               "value": float(d["buySellRatio"])})
+                item = {"ts": int(d["timestamp"]),
+                        "value": float(d["buySellRatio"])}
+                # v178：帶出原始 taker 買賣量（CVD 備援計算用；v61 忠實閘驗證過的同源數據）
+                if d.get("buyVol") is not None and d.get("sellVol") is not None:
+                    item["buy_vol"] = float(d["buyVol"])
+                    item["sell_vol"] = float(d["sellVol"])
+                series.append(item)
             except (KeyError, TypeError, ValueError):
                 continue
         return {"symbol": symbol, "source": self.name, "series": series,

@@ -124,11 +124,37 @@ async def mi_get_cvd(
 
 
 @_tool
+async def _btc_gate_binance_fallback() -> dict | None:
+    """v178：CG 到期後的 BTC 大盤閘備援——BTC 對自己的 4h 200MA（Binance 免key 自算）。
+    失敗回 None（呼叫端維持原 error＝fail-closed 不造假）。"""
+    try:
+        from .sources.binance_perp import get_binance_perp
+        r = await get_binance_perp().get_candles("BTC", "4h", 200)
+        closes = [c["close"] for c in (r.get("candles") or [])
+                  if isinstance(c.get("close"), (int, float))]
+        if len(closes) < 200:
+            return None
+        gate_open = closes[-1] > (sum(closes[-200:]) / 200)
+        return {"btc_gate_open": gate_open,
+                "btc_regime": ("risk_on" if gate_open else "risk_off")
+                              + "(binance_200ma備援)",
+                "source": "binance_200ma_fallback"}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def mi_get_btc_gate() -> dict:
     """BTC 宏觀閘狀態：閘開規則 = 4h 收 > 4h 200MA AND regime ≠ trend_down。
     閘關 → L2 整包 HOLD（不論其他訊號）。
+    v178：主源(CG)失敗 → Binance 200MA 自算備援（帶 provenance；備援也失敗
+    才回原 error＝fail-closed。CG 到期 24 天間此閘恆 stale＝FIRE 引擎整包 HOLD 的根因）。
     """
-    return await SOURCE.get_btc_gate()
+    gate = await SOURCE.get_btc_gate()
+    if isinstance(gate, dict) and gate.get("error"):
+        fb = await _btc_gate_binance_fallback()
+        if fb is not None:
+            return fb
+    return gate
 
 
 @_tool
@@ -165,7 +191,10 @@ async def _fill_stale_from_binance(sym: str, tf: str, snap: dict,
     僅補 Binance 能提供的欄位；補到的從 stale_fields 移除。任何失敗靜默略過。"""
     fillable = {"price", "ts", "oi", "oi_delta_pct", "funding",
                 "funding_predicted", "top_trader_ratio", "ls_ratio",
-                "above_4h_200ma"}
+                "above_4h_200ma",
+                # v178：CG 到期後的數據面補齊——CVD 斜率(taker量差,v61忠實閘PASS)
+                # 與 BTC 大盤閘(BTC 自身 4h×200MA 自算,不需任何付費源)
+                "cvd_slope", "btc_gate_open", "btc_regime"}
     need = fillable & set(stale_fields)
     if not need:
         return
@@ -192,6 +221,12 @@ async def _fill_stale_from_binance(sym: str, tf: str, snap: dict,
         if "above_4h_200ma" in need:
             # 真 200MA：免key Binance 4h × 200 K線本地自算（取代 btc_gate 全域代理）
             tasks.append(_s(src.get_candles(sym, "4h", 200))); keys.append("ma")
+        if "cvd_slope" in need:
+            # v178：CVD 備援＝taker 買賣量差近 24h 淨流（6×4h），v61 忠實閘 PASS 同源
+            tasks.append(_s(src.get_taker_ratio(sym, "4h", 12))); keys.append("cvd")
+        if {"btc_gate_open", "btc_regime"} & need:
+            # v178：BTC 大盤閘自算（BTC 對自己的 4h 200MA，永不需付費源）
+            tasks.append(_s(src.get_candles("BTC", "4h", 200))); keys.append("btcma")
         res = dict(zip(keys, await asyncio.gather(*tasks)))
 
         def _good(r):
@@ -225,6 +260,27 @@ async def _fill_stale_from_binance(sym: str, tf: str, snap: dict,
                 ma200 = sum(closes[-200:]) / 200
                 snap["above_4h_200ma"] = closes[-1] > ma200
                 filled.append("above_4h_200ma")
+        if "cvd" in res and _good(res["cvd"]):
+            vols = [(s.get("buy_vol"), s.get("sell_vol"))
+                    for s in (res["cvd"].get("series") or [])
+                    if s.get("buy_vol") is not None and s.get("sell_vol") is not None]
+            if len(vols) >= 6:               # 至少 24h（6×4h）才算
+                net = sum(b - v for b, v in vols[-6:])
+                snap["cvd_slope"] = net
+                snap["cvd_backup_src"] = "binance_taker"   # provenance：備援口徑
+                filled.append("cvd_slope")
+        if "btcma" in res and _good(res["btcma"]) and res["btcma"].get("candles"):
+            bcloses = [c["close"] for c in res["btcma"]["candles"]
+                       if isinstance(c.get("close"), (int, float))]
+            if len(bcloses) >= 200:
+                _open = bcloses[-1] > (sum(bcloses[-200:]) / 200)
+                if "btc_gate_open" in need:
+                    snap["btc_gate_open"] = _open
+                    filled.append("btc_gate_open")
+                if "btc_regime" in need:
+                    snap["btc_regime"] = ("risk_on" if _open else "risk_off") + \
+                        "(binance_200ma備援)"
+                    filled.append("btc_regime")
         if filled:
             for fld in filled:
                 if fld in stale_fields:
