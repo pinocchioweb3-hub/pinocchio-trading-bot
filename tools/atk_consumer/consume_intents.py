@@ -80,6 +80,9 @@ _BENIGN_MARKERS = ("51603", "doesn't exist", "does not exist")
 # 與 orphan_position 同理：它只可能在 account positions 查詢成功的輪被記到，
 # 不可能發生在斷流輪 ⇒ 不會洗掉斷流主因。
 _CLASS_PRIORITY = ("orphan_position", "pnl_unaccounted",
+                   # v171（r69）：同上兩類的性質——只可能在 account positions 查詢
+                   # 成功的輪被記到 ⇒ 不會洗掉斷流主因；⛔ 但不得擠掉前兩位（r68 令）
+                   "lev_mismatch",
                    "pos_state_unreadable", "pos_state_write_fail",
                    "done_state_unreadable", "done_state_write_fail",
                    "cli_missing", "auth_ip_whitelist", "auth",
@@ -442,6 +445,12 @@ _CLASS_HINT = {
                      "多半是該 instId／posSide 已有持倉導致交易所拒絕調整槓桿——"
                      "此時算出的槓桿低於上限的單會 fail-closed 不送出（下輪重試）",
     "query_fail": "查單失敗導致 fail-closed（下游症狀，先看同時段的認證／網路類別）",
+    "lev_mismatch": "在場部位的交易所側槓桿與下單時算出的值對不上 → 逐倉保證金與當初"
+                    "算的不同，清算距離可能已縮到止損之內（v84 不變式：清算永不先於"
+                    "止損）。⛔ 本執行器只記錄與告警，不會自動調槓桿也不會自動平倉——"
+                    "請人工到 OKX 看該倉實際槓桿，決定是要調回、減倉還是平掉；"
+                    "instId 與兩邊的數值在 atk_live.log 的『交易所側槓桿讀回』行"
+                    "（倉平掉後部位檔那筆會消失，log 行才是留得住的證據）",
     "pnl_unaccounted": "有部位已了結、但連查幾輪都拿不到已實現損益 → 該筆損益**永遠**"
                        "不會進日/週熔斷口徑（熔斷會低估已實現虧損）。這是不可逆的，"
                        "修好連線也不會自己補回來。請到 OKX 用健康檔 "
@@ -673,6 +682,73 @@ def leverage_for_trade(entry: float, stop: float, max_lev: int | None = None) ->
     return max(3, min(int(max_lev), int(70.0 / stop_pct)))
 
 
+LEV_TOLERANCE = 0.01        # 交易所回字串（"10"）；只要不是真的差一級就算相符
+
+
+def _pos_float(v) -> float | None:
+    """轉正數，不行就 None（純函式，永不 raise）。0 與負值＝無意義的槓桿＝未知。"""
+    try:
+        f = float(str(v).strip())
+    except Exception:  # noqa: BLE001
+        return None
+    return f if f > 0 else None
+
+
+def leverage_verdict(intended, exchange_raw) -> str:
+    """交易所側槓桿讀回的三態判定：match／mismatch／unknown（純函式，永不 raise）。
+
+    v171（監督員 r69）：ensure_leverage 只憑「設定呼叫的 exit code == 0」就回 True，
+    從頭到尾沒有讀回過交易所實際的槓桿。而 v99 那個 bug 的形狀正是**設定呼叫成功
+    回應、交易所卻靜默沿用預設 3x**（hedge 模式沒帶 posSide）⇒ 用來判斷「這倉的
+    槓桿是對的」的量，一直只以代理值存在。同物種第七次（v164 讀失敗／v166 寫失敗／
+    v167 旗標當事實／v169 過期丟棄／v170 損益查不到／r64 demo 停擺原因）。
+
+    ⛔ 未知不可壓成 match：v171 之前開的倉沒有 lev 欄位、交易所也可能不回 lever，
+    這兩種情況一律 unknown——把它們算成「相符」等於用沉默偽造證據（v162-v166 紀律）。
+    """
+    want, got = _pos_float(intended), _pos_float(exchange_raw)
+    if want is None or got is None:
+        return "unknown"
+    return "match" if abs(want - got) <= LEV_TOLERANCE else "mismatch"
+
+
+def _record_leverage_readback(rec: dict, exchange_raw, now_s: float) -> None:
+    """把交易所側讀回的槓桿記進部位紀錄（就地改 rec；呼叫端負責存檔）。
+
+    ⛔ 只記錄與告警：不自動調槓桿、不自動平倉、不擋新單（比照 orphan_position 的
+    處置）。理由＝斷流期間已累積 13 版從未在真錢路徑跑過的程式碼（r65 量測），
+    此刻再加一道沒跑過的閘，等於讓「第一筆單」同時承擔更多首航風險；而讀回本身
+    是純粹加法，寫壞也不會擋掉任何一筆該送的單。
+
+    log 行只在「第一次看到」或「判定/數值變了」時印一次——每分鐘一輪，每輪每倉都印
+    會把 atk_live.log 灌成噪音（r66 才剛處理過噪音稀釋訊號的問題）。但一定要印：
+    倉一平掉，部位檔那筆就消失，log 行才是留得住的證據（r65 首筆真錢驗收清單第一項
+    就是「交易所側讀回的槓桿值」，在此之前那個數字任何地方都產不出來）。
+    """
+    verdict = leverage_verdict(rec.get("lev"), exchange_raw)
+    got = _pos_float(exchange_raw)
+    changed = (rec.get("lev_verdict") != verdict
+               or rec.get("lev_exchange") != got)
+    rec["lev_verdict"] = verdict
+    rec["lev_exchange"] = got
+    rec["lev_checked_ts"] = now_s
+    want = _pos_float(rec.get("lev"))
+    shown = f"{got:g}x" if got is not None else "讀不到"
+    if verdict == "mismatch":
+        msg = (f"{rec.get('inst_id')} {rec.get('pos_side')} 交易所側槓桿為 {got:g}x，"
+               f"與下單時算出的 {want:g}x 對不上：逐倉保證金與當初算的不同，清算距離"
+               f"可能已縮到止損之內（v84 不變式：清算永不先於止損）。⛔ 未自動調整、"
+               f"未自動平倉，請人工到 OKX 確認該倉。")
+        if changed:
+            print(f"🚨 {msg}")
+        _note_fail("lev_mismatch", msg)          # 每輪都記＝連續輪告警機制自然接手
+    elif changed:
+        basis = (f"下單時算出 {want:g}x" if want is not None
+                 else "下單時的值未記錄＝無從比對")
+        print(f"🔎 {rec.get('inst_id')} {rec.get('pos_side')} 交易所側槓桿讀回 "
+              f"{shown}（{basis}，判定 {verdict}）")
+
+
 def ensure_leverage(inst_id: str, pos_side: str, dry: bool,
                     lev: int | None = None) -> bool:
     """開單前設槓桿（v99 教訓：OKX 預設 3x，hedge 模式 isolated 必須帶 posSide 逐邊設，
@@ -885,9 +961,16 @@ def manage_positions(dry: bool) -> list | None:
         return orphan_keys
     live = {(p.get("instId"), p.get("posSide")): float(p.get("pos") or 0)
             for p in plist}
+    # v171（r69）：同一份回應裡本來就有交易所側的槓桿，之前整個丟掉——撿起來當讀回用，
+    #   零額外呼叫、零新故障面。
+    live_lever = {(p.get("instId"), p.get("posSide")): p.get("lever")
+                  for p in plist}
     now_s = time.time()
     for iid, rec in list(ps["open"].items()):
         key = (rec["inst_id"], rec["pos_side"])
+        if live.get(key, 0.0) != 0.0:
+            # 在場才讀回（已了結的倉交易所不會再回它的槓桿）
+            _record_leverage_readback(rec, live_lever.get(key), now_s)
         if live.get(key, 0.0) == 0.0:
             # 已了結（TP/SL/手動）→ 記日損益後移出
             res = _realized_pnl_since(rec["inst_id"], rec["placed_at"])
@@ -1299,6 +1382,12 @@ def main() -> int:
                                            "pos_side": intent["pos_side"],
                                            "symbol": intent.get("symbol"),
                                            "contracts": sz,
+                                           # v171（r69）：留下「打算用的槓桿」，
+                                           # 否則下輪讀回交易所的值沒有比較基準
+                                           # ⇒ 只能永遠判 unknown。
+                                           "lev": leverage_for_trade(
+                                               intent.get("entry"),
+                                               intent.get("stop")),
                                            "placed_at": time.time()}
                         if not _save_positions(ps):
                             print(f"🚨 {iid} 已送出但帳本寫入失敗——"
