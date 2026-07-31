@@ -136,6 +136,36 @@ async def _holders() -> int | None:
         return None
 
 
+async def _top_holders(n: int = 20) -> dict[str, float]:
+    """v185：Top N 持倉地址→餘額(枚)。失敗回空 dict。Ethplorer freekey。"""
+    try:
+        async with httpx.AsyncClient(timeout=25) as c:
+            r = await c.get("https://api.ethplorer.io/getTopTokenHolders/"
+                            f"{CONTRACT}?apiKey=freekey&limit={n}")
+        # balance 為 wei 原始值（2026-08-01 活測實證）→ /1e18 轉枚
+        return {(h.get("address") or "").lower(): float(h.get("balance") or 0) / 1e18
+                for h in (r.json().get("holders") or [])}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+# v185：Uniswap V3 工廠自動發現 WLFI 資金池（USDT 對,三檔費率）——池子流出=DEX 買入
+_UNI_FACTORY = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
+_USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+
+
+async def _discover_pools() -> set[str]:
+    pools: set[str] = set()
+    sel = "0x1698ee82"  # getPool(address,address,uint24)
+    for fee in (500, 3000, 10000):
+        data = (sel + CONTRACT[2:].rjust(64, "0") + _USDT[2:].rjust(64, "0")
+                + hex(fee)[2:].rjust(64, "0"))
+        res = await _rpc("eth_call", [{"to": _UNI_FACTORY, "data": data}, "latest"])
+        if res and int(res, 16) != 0:
+            pools.add("0x" + res[-40:].lower())
+    return pools
+
+
 _DISCLAIMER = ("<i>⚠️ 固定誠實聲明：top10 地址持 87% 供給｜專案方具凍結任意錢包能力"
                "（Justin Sun 訴訟在案）｜2028-05 起 543 億枚解鎖（流通量 171%）｜"
                "政治連結=題材與打擊面一體兩面。以上為觀察數據，非投資建議、"
@@ -187,15 +217,46 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                         "address": CONTRACT, "topics": [_TRANSFER],
                         "fromBlock": hex(frm), "toBlock": hex(head)}])
                     whales_24h = st.get("whales_24h", [])
+                    top_set = set((st.get("top_holders") or {}).keys())
+                    tracked = set(st.get("tracked_wallets") or [])
+                    pools = set(st.get("dex_pools") or [])
                     for lg in (logs or []):
                         tr = decode_transfer(lg)
                         if not tr or not price:
                             continue
                         usd = tr["amount"] * price
-                        if usd >= WHALE_USD and tr["tx"] not in st.get("seen_tx", []):
+                        # v185：DEX 池流出=買入（≥$100K 即推,獨立門檻）
+                        if (tr["from"] in pools and usd >= 100_000
+                                and tr["tx"] not in st.get("seen_tx", [])):
                             if tg:
                                 try:
-                                    await tg.send_message(render_whale_card(tr, price),
+                                    await tg.send_message(
+                                        f"🦅💱 <b>DEX 大額買入</b> {tr['amount']:,.0f} 枚"
+                                        f"≈${usd / 1e3:,.0f}K 自資金池流出 → "
+                                        f"<code>{label_of(tr['to'])}</code>\n"
+                                        "<i>鏈上觀察·非訊號</i>", parse_mode="HTML")
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            st.setdefault("seen_tx", []).append(tr["tx"])
+                        # v185：交易所提幣收件戶→自動入追蹤名冊（空投提幣近似追蹤）
+                        if tr["from"] in _EXCHANGES and usd >= 50_000:
+                            tw = st.setdefault("tracked_wallets", [])
+                            if tr["to"] not in tw and tr["to"] not in _EXCHANGES:
+                                tw.append(tr["to"])
+                                st["tracked_wallets"] = tw[-100:]
+                        # v185：Top20/追蹤名冊地址動作用低門檻（$50K）
+                        eff_thresh = (50_000 if (tr["from"] in top_set | tracked
+                                                 or tr["to"] in top_set | tracked)
+                                      else WHALE_USD)
+                        if usd >= eff_thresh and tr["tx"] not in st.get("seen_tx", []):
+                            card = render_whale_card(tr, price)
+                            if tr["from"] in top_set or tr["to"] in top_set:
+                                card = card.replace("🦅🐋", "🦅👑 <b>Top20 地址動作</b>·🐋")
+                            elif tr["from"] in tracked or tr["to"] in tracked:
+                                card = card.replace("🦅🐋", "🦅📇 <b>追蹤名冊動作</b>·🐋")
+                            if tg:
+                                try:
+                                    await tg.send_message(card,
                                                           parse_mode="HTML",
                                                           disable_web_page_preview=True)
                                 except Exception:  # noqa: BLE001
@@ -230,6 +291,62 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
             # 事件驅動（|ΔOI 1h|≥2% 或 |Δ價 1h|≥2% 或資費翻號）＋最少每 4h 一張心跳卡
             hr_ref = st.get("hourly_ref") or {}
             if now - (hr_ref.get("ts") or 0) >= 3600:
+                # ── v185：DEX 池發現（一次性,快取）──
+                if not st.get("dex_pools"):
+                    try:
+                        st["dex_pools"] = sorted(await _discover_pools())
+                        if st["dex_pools"]:
+                            print(f"[wlfi] DEX 池發現 {len(st['dex_pools'])} 個")
+                    except Exception:  # noqa: BLE001
+                        pass
+                # ── v185：Top20 持倉每小時差分（增減 ≥0.05% 供給即推）──
+                try:
+                    cur_top = await _top_holders(20)
+                    prev_top = st.get("top_holders") or {}
+                    if cur_top and prev_top and tg:
+                        supply = 1e11          # 總供給 100B（名目,比例用）
+                        moves = []
+                        for a, bal in cur_top.items():
+                            d = bal - prev_top.get(a, bal)
+                            if abs(d) >= supply * 0.0005:
+                                moves.append((a, d))
+                        for a, d in moves[:3]:
+                            try:
+                                await tg.send_message(
+                                    f"🦅👑 <b>Top20 持倉變動</b> "
+                                    f"<code>{label_of(a)}</code> "
+                                    f"{'增持' if d > 0 else '減持'} {abs(d):,.0f} 枚"
+                                    f"（{abs(d) / supply * 100:.2f}% 供給）\n"
+                                    "<i>鏈上觀察·非訊號</i>", parse_mode="HTML")
+                            except Exception:  # noqa: BLE001
+                                pass
+                    if cur_top:
+                        st["top_holders"] = cur_top
+                        top10_share = sum(sorted(cur_top.values())[-10:]) / 1e11 * 100
+                        st["top10_share"] = round(top10_share, 2)
+                except Exception:  # noqa: BLE001
+                    pass
+                # ── v185：每小時 WLFI 新聞掃描（新條目才推,最多 1 則/時）──
+                try:
+                    from news_feed.okx_news import _okx_news, parse_items
+                    code, out = await asyncio.to_thread(
+                        _okx_news, ["news", "by-coin", "--coins", "WLFI",
+                                    "--lang", "zh-CN", "--limit", "5"])
+                    if code == 0:
+                        seen_news = st.get("seen_news", [])
+                        for it in parse_items(out)[:5]:
+                            nid = str(it.get("id") or it.get("title"))[:60]
+                            if nid and nid not in seen_news:
+                                t = (it.get("title") or "").strip()
+                                if t and tg:
+                                    await tg.send_message(
+                                        f"🦅📰 <b>WLFI 動態</b>\n{t[:200]}\n"
+                                        "<i>OKX News·僅供參考</i>", parse_mode="HTML")
+                                seen_news.append(nid)
+                                break
+                        st["seen_news"] = seen_news[-50:]
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     from market_intel_mcp.sources.binance_perp import get_binance_perp
                     bsrc = get_binance_perp()
