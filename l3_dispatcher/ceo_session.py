@@ -580,7 +580,40 @@ def _section_self_assessment() -> str:
                     if _us_net_t is not None else f"扣費後淨值證據不足（n={_us_net_n}）")
         body += (f"\n（分引擎：美股毛 t≈{_us_t:.2f}（預註冊統計閘 PSRc≥0.95 是在**毛利口徑**"
                  f"上通過的）、{_net_txt}——真錢 0 筆，兩個口徑都不作對外宣稱）")
+    body += _dp2_scoreboard_line()
     return "🧠 <b>系統自評</b>（跨 session 綜合·確定性推理非欄位回音）：\n" + body
+
+
+def _dp2_scoreboard_line() -> str:
+    """v184：dp2（數據面修復後,v178 起）世代單獨記分——「修好沒有,數字自己說話」。
+    每日一行:n_closed/淨R合計/在場數;n<30 明標未驗證。失敗回空字串不擋日報。"""
+    try:
+        import json as _json
+        import sqlite3
+        from botpaths import db_path
+        from l3_dispatcher import universe_provenance as up
+        conn = sqlite3.connect(f"file:{db_path('trade_journal.db')}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT status, net_r, plan_snapshot FROM paper_trades "
+            "WHERE setup='deepdive' AND plan_snapshot IS NOT NULL").fetchall()
+        conn.close()
+        n_closed = n_open = 0
+        net_sum = 0.0
+        for status, net_r, snap in rows:
+            if up.data_plane_of_row({"plan_snapshot": snap}) != up.DATA_PLANE:
+                continue
+            if status == "closed":
+                n_closed += 1
+                net_sum += float(net_r or 0)
+            elif status in ("open", "pending"):
+                n_open += 1
+        if n_closed == 0 and n_open == 0:
+            return ""
+        tag = "未驗證(n<30)" if n_closed < 30 else "可初讀"
+        return (f"\n📊 dp2 世代記分（數據面修復後,獨立結算）：已平 {n_closed} 筆 "
+                f"淨 {net_sum:+.2f}R｜在場 {n_open}｜{tag}")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def probe_learning_loop(window_hours: float = 26.0, data_dir_fn=None) -> dict:
