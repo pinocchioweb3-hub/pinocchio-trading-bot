@@ -236,6 +236,48 @@ def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
     return out
 
 
+def pnl_gap_verdict(health: dict | None, *, now_s: float | None = None,
+                    max_age_sec: int = LIVE_HEALTH_MAX_AGE_SEC) -> dict | None:
+    """把「已了結但損益查不到、已放棄」的累計筆數翻成阻塞（純函式，可離線測）。
+
+    v170（監督員 r68）：那筆已實現損益是日/週熔斷唯一的輸入，漏記＝風險上限被低估，
+    而且不可逆。健康檔多一個欄位只是把「只存在於 log」搬成「只存在於一個沒人開的
+    json」；要真的有出口，必須進帳本 blockers。
+
+    ⛔ 與 live_exec_verdict 的**刻意差異**：這裡不套新鮮度閘。
+    consecutive_fail_rounds 是「現況量」，舊檔＝執行器沒在跑，拿昨天的 streak 當
+    今天的阻塞是舊快照陷阱；但 pnl_unaccounted_total 是**累計的既成事實**，漏掉的
+    損益不會因為執行器停了就補回來。對它套新鮮度閘＝執行器一停，真實且不可逆的
+    漏記就從帳本上消失——那正是 v162-v167 一路在修的「把已知壓回未知」。
+    檔太舊改成在文字裡標注「截至」時點，讓人知道這是量到哪一刻為止的數。
+    """
+    if not health:
+        return None
+    try:
+        count = int(health.get("pnl_unaccounted_total", 0) or 0)
+    except (TypeError, ValueError):
+        return None                              # 壞值＝不知道，不可憑空宣稱有漏記
+    if count <= 0:
+        return None
+    now_s = now_s if now_s is not None else time.time()
+    try:
+        updated_at = float(health.get("updated_at", 0) or 0)
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    stale = updated_at <= 0 or (now_s - updated_at) > max_age_sec
+    asof = (f"（截至 {_fmt_age(now_s - updated_at)} 前的量測，執行器健康檔已不新鮮）"
+            if stale else "")
+    recent = health.get("pnl_unaccounted_recent")
+    recent = recent[-3:] if isinstance(recent, list) else []
+    names = "、".join(str(r.get("inst_id")) for r in recent if isinstance(r, dict))
+    tail = f"（最近：{names}）" if names else ""
+    text = (f"真錢日/週熔斷口徑已有 {count} 筆已了結部位的損益漏記{tail}{asof}——"
+            f"該部位在交易所上已平掉，但連查數輪都拿不到已實現損益，紀錄已移出本地帳；"
+            f"⛔ 這是不可逆的：熔斷從此低估已實現虧損，修好連線也不會自己補回來。"
+            f"請到 OKX 用上述 instId 查回金額，自行把熔斷餘額打折看待")
+    return {"count": count, "text": text, "recent": recent, "stale": stale}
+
+
 def org_digest_verdict(latest_by_role: dict | None, *, today,
                        cadence: dict | None = None,
                        miss_periods: int = ORG_DIGEST_MISS_PERIODS,
@@ -295,7 +337,7 @@ def org_digest_verdict(latest_by_role: dict | None, *, today,
 def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
            demo_n, demo_live, demo_active, open_decisions, pending_outbox,
            demo_rejected=0, demo_reject_hint=None, real_output_age_sec=None,
-           live_exec=None, org_digest=None, demo_stall_reason=None,
+           live_exec=None, org_digest=None, demo_stall_reason=None, pnl_gap=None,
            last_nudge_ms=0, stall_sec=STALL_SEC, nudge_cooldown_sec=NUDGE_COOLDOWN_SEC) -> dict:
     """核心判定（純函式）。回 state / next_step / blockers / should_nudge。
 
@@ -318,6 +360,12 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
             blockers.append(live_exec["text"])
         else:
             system_faults.append(live_exec["text"])
+    # r68：熔斷口徑漏記。歸 blockers 而非 system_faults——CEO 改碼救不回那筆金額
+    #   （查不到正是故障本身），只有人能到 OKX 查回來、也只有人能決定要不要在一個
+    #   已知低估的熔斷下繼續跑真錢。⛔ 不可因為「已經有 401 在 blockers」就省略：
+    #   兩者要做的事完全不同（一個是補白名單，一個是補帳）。
+    if pnl_gap:
+        blockers.append(pnl_gap["text"])
     # r30：組織產出斷檔＝系統故障（該 push CEO／監督員代補產），球不在使用者。
     if org_digest:
         system_faults.append(org_digest["text"])
@@ -372,6 +420,7 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
         "blockers": blockers,
         "system_faults": system_faults,
         "live_exec": live_exec,
+        "pnl_gap": pnl_gap,
         "org_digest": org_digest,
         "should_nudge": should_nudge,
         "commit_age_sec": commit_age_sec,
@@ -588,8 +637,12 @@ def build_snapshot(now_ms: int | None = None) -> dict:
 
     # r26：真錢執行器健康（v143 健康檔）。純讀＋新鮮度閘，讀不到就當「無故障」。
     live_exec = None
+    pnl_gap = None
     try:
-        live_exec = live_exec_verdict(_read_live_exec_health(), now_s=now_ms / 1000)
+        _live_health = _read_live_exec_health()
+        live_exec = live_exec_verdict(_live_health, now_s=now_ms / 1000)
+        # r68：熔斷口徑漏記（累計既成事實，不套新鮮度閘——理由見 pnl_gap_verdict）
+        pnl_gap = pnl_gap_verdict(_live_health, now_s=now_ms / 1000)
     except Exception:
         pass
 
@@ -614,7 +667,7 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         open_decisions=open_decisions, pending_outbox=pending_outbox,
         demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint,
         real_output_age_sec=real_output_age_sec,
-        live_exec=live_exec, org_digest=org_digest,
+        live_exec=live_exec, org_digest=org_digest, pnl_gap=pnl_gap,
         demo_stall_reason=demo_stall_reason,
         last_nudge_ms=last_nudge_ms,
     )

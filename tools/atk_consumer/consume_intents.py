@@ -72,7 +72,15 @@ _BENIGN_MARKERS = ("51603", "doesn't exist", "does not exist")
 # v165（r56）：done_state_* 兩類緊接在 pos_state_* 之後——同樣是本地檔壞掉、與網路無關、
 # 不可能被斷流洗掉，且後果同樣是「風險閘暫時不存在」（分不出哪些單下過 ⇒ 全面停接新單）；
 # 排在 pos_state_* 之後是因為部位帳壞掉會直接讓熔斷消失，比冪等清單壞掉更前面一步。
-_CLASS_PRIORITY = ("orphan_position", "pos_state_unreadable", "pos_state_write_fail",
+# v170（r68）：pnl_unaccounted 緊接在 orphan_position 之後——它是唯一「已經發生且
+# 不可逆」的類別（已了結的真錢損益永遠不會再進 day_pnl ⇒ 日/週熔斷從此低估）。
+# 其餘 pos_state_*／done_state_* 雖然也會讓風險閘失效，但都是**暫時**的（下輪重試
+# 就回來）；傳輸類更只是「這輪送不出去」。代表類別若被下游的 query_fail 蓋掉，
+# 使用者看到的處置建議會變成「等網路好」，而這一類等再久也不會好。
+# 與 orphan_position 同理：它只可能在 account positions 查詢成功的輪被記到，
+# 不可能發生在斷流輪 ⇒ 不會洗掉斷流主因。
+_CLASS_PRIORITY = ("orphan_position", "pnl_unaccounted",
+                   "pos_state_unreadable", "pos_state_write_fail",
                    "done_state_unreadable", "done_state_write_fail",
                    "cli_missing", "auth_ip_whitelist", "auth",
                    "rate_limit", "timeout", "leverage_fail", "query_fail",
@@ -88,6 +96,14 @@ _ROUND_OKS: dict[str, int] = {"ok": 0}
 # 再重送，這是斷流唯一會造成的實質損失，必須是數字而不是一行 log（見 _account_expiry）。
 _ROUND_EXPIRED: list[dict] = []
 EXPIRED_RECENT_MAX = 20             # 健康檔內保留的丟棄明細筆數上限
+# v170（監督員 r68）：本輪「已了結、但已實現損益查不到而放棄」的部位；每輪開頭清空。
+# 那筆損益是日/週熔斷**唯一**的輸入，漏記＝風險上限被低估，而且不可逆（紀錄一從
+# 本地帳移出，就再也沒有任何東西知道要去查它）。必須是數字，不能只是一行 log。
+_ROUND_PNL_GAPS: list[dict] = []
+PNL_GAP_RECENT_MAX = 20             # 健康檔內保留的漏記明細筆數上限
+# 放棄前先重試幾輪。⛔ 用「輪數」不用牆鐘：每輪都是獨立行程（schtasks 每分鐘一次），
+# 牆鐘門檻會在排程漏跑／休眠時把重試窗白白吃掉，反而更容易走到不可逆那一步。
+PNL_RETRY_MAX = 5
 
 
 # Windows 陷阱：npm 全域裝的 okx 是 okx.cmd shim，subprocess 不走 shell 找不到裸名
@@ -281,8 +297,36 @@ def _account_expiry(h: dict, expired, now_s: float, in_fault: bool,
     h["expired_dropped_recent"] = recent[-EXPIRED_RECENT_MAX:]
 
 
+def _account_pnl_gap(h: dict, gaps, now_s: float) -> None:
+    """把本輪「已了結但損益查不到、已放棄」的部位記進健康帳（就地改 h）。
+
+    v170（監督員 r68）：舊碼查不到損益就直接把紀錄從本地帳移出，只留一行 print。
+    那筆已實現損益是 day_pnl（日 60U／週 150U 熔斷）唯一的輸入 ⇒ 熔斷從此低估已實現
+    虧損，而且不可逆：紀錄一移出，就沒有任何東西知道要回去查它。與 v164/v166/v167/
+    v169 同一物種（要下判斷的量只以 log 文字存在），差別是這次落在風險上限上。
+
+    ⛔ 不分「斷流期／健康期」（與 _account_expiry 刻意不同）：過期丟棄只有在斷流時
+    才是故障的代價，日常老化是正常的；但損益漏記在任何情況下都是同一個洞，
+    切兩本帳只會讓人以為健康期那幾筆比較不要緊。"""
+    drops = list(gaps or [])
+    if not drops:
+        return                                  # 沒事不生欄位＝帳本不長出一排 0
+    h["pnl_unaccounted_total"] = int(h.get("pnl_unaccounted_total", 0)) + len(drops)
+    h["pnl_unaccounted_last_ts"] = now_s
+    recent = list(h.get("pnl_unaccounted_recent") or [])
+    for d in drops:
+        # 明細只留「查得回去」需要的東西：instId + 開倉時間就足以在 OKX 成交紀錄
+        # 裡框出區間。⛔ 不記金額——金額正是我們查不到的那個量，寫 0 會變成謊報。
+        recent.append({"inst_id": d.get("inst_id"), "pos_side": d.get("pos_side"),
+                       "symbol": d.get("symbol"), "intent_id": d.get("intent_id"),
+                       "placed_at": d.get("placed_at"), "retries": d.get("retries"),
+                       "ts": now_s})
+    # 上限：健康檔每輪整份重寫，無界成長會養到寫不進去，反過來打死 v166 的告警計數
+    h["pnl_unaccounted_recent"] = recent[-PNL_GAP_RECENT_MAX:]
+
+
 def update_health(h: dict, fails: dict, now_s: float, oks: int = 0,
-                  expired=None) -> dict:
+                  expired=None, pnl_gaps=None) -> dict:
     """把本輪結果併進健康狀態（純函式，不做 I/O）。
 
     connsecutive_fail_rounds 只在「有故障的輪」累加；乾淨輪歸零並在曾告警過時
@@ -309,6 +353,9 @@ def update_health(h: dict, fails: dict, now_s: float, oks: int = 0,
                     in_fault=bool(fails) or int(h.get("consecutive_fail_rounds", 0)) > 0,
                     fault_class=(worst_class(fails.keys()) if fails
                                  else h.get("last_fail_class")))
+    # v170（r68）：同理，記在空轉輪提早 return 之前。漏記不必然發生在空轉輪，但只要
+    #   有一次落在那條路徑上就永久記不到，而這種東西只會在事後才被發現。
+    _account_pnl_gap(h, pnl_gaps, now_s)
     if not fails and int(oks or 0) <= 0:
         # 空轉輪：沒故障也沒成功呼叫＝本輪對「是否已恢復」零資訊，維持原判
         h["idle_rounds"] = int(h.get("idle_rounds", 0)) + 1
@@ -395,6 +442,11 @@ _CLASS_HINT = {
                      "多半是該 instId／posSide 已有持倉導致交易所拒絕調整槓桿——"
                      "此時算出的槓桿低於上限的單會 fail-closed 不送出（下輪重試）",
     "query_fail": "查單失敗導致 fail-closed（下游症狀，先看同時段的認證／網路類別）",
+    "pnl_unaccounted": "有部位已了結、但連查幾輪都拿不到已實現損益 → 該筆損益**永遠**"
+                       "不會進日/週熔斷口徑（熔斷會低估已實現虧損）。這是不可逆的，"
+                       "修好連線也不會自己補回來。請到 OKX 用健康檔 "
+                       "pnl_unaccounted_recent 裡的 instId 與開倉時間查回那筆成交損益，"
+                       "自行把熔斷餘額打折看待；若同時段有認證／網路類別，先修那個",
     "other": "未分類錯誤 → 讀 atk_live.log 原文",
 }
 
@@ -505,7 +557,8 @@ def send_alert(text: str, dry: bool = False) -> tuple[str, str | None]:
 
 
 def finish_round(fails: dict, now_s: float | None = None,
-                 dry: bool = False, oks: int = 0, expired=None) -> dict:
+                 dry: bool = False, oks: int = 0, expired=None,
+                 pnl_gaps=None) -> dict:
     """每輪收尾：更新健康檔、必要時告警。永不對外拋例外——
     告警層絕不可以把交易執行器弄掛（它的職責只是「讓失敗有出口」）。
 
@@ -523,7 +576,8 @@ def finish_round(fails: dict, now_s: float | None = None,
                     "health_unknown_at": now_s}
             print(f"⚠️ 健康檔讀取失敗（{HEALTH.name}）——連續故障計數視為未知，"
                   f"本輪若有故障即告警，不從零重數")
-        h = update_health(base, fails, now_s, oks, expired=expired)
+        h = update_health(base, fails, now_s, oks, expired=expired,
+                          pnl_gaps=pnl_gaps)
         if h.get("recovered_from"):
             ch, err = send_alert(recovery_text(h), dry=dry)
             h["last_alert_channel"], h["last_alert_error"] = ch, err
@@ -851,10 +905,33 @@ def manage_positions(dry: bool) -> list | None:
                 print(f"🏁 {rec['inst_id']} {rec['pos_side']} 已了結，"
                       f"已實現≈{pnl:+.2f} USDT"
                       f"（記入 {dk} UTC，該日累計 {ps['day_pnl'][dk]:+.2f}）")
+                ps["open"].pop(iid, None)
             else:
-                print(f"🏁 {rec['inst_id']} {rec['pos_side']} 已了結（損益查詢失敗，"
-                      "不計入熔斷口徑）")
-            ps["open"].pop(iid, None)
+                # v170（監督員 r68）：⛔ 這裡舊碼直接 pop——那筆已實現損益就此永遠不會
+                #   進 day_pnl，而 day_pnl 是日 60U／週 150U 熔斷唯一的輸入 ⇒ 熔斷低估
+                #   已實現虧損，該停手的日子可能照常接新單。且不可逆：紀錄一移出，
+                #   沒有任何東西知道要回去查它。改成①有限重試（重試計數寫回檔案才活得過
+                #   下一輪——每輪是獨立行程）②真的放棄時留下數字與故障類別，不只 print。
+                tries = int(rec.get("pnl_retry", 0) or 0) + 1
+                rec["pnl_retry"] = tries
+                if tries < PNL_RETRY_MAX:
+                    print(f"⏳ {rec['inst_id']} {rec['pos_side']} 已了結但損益查詢失敗"
+                          f"（第 {tries}/{PNL_RETRY_MAX} 輪）——保留紀錄，下輪重查")
+                    continue                      # ⛔ 不 pop：可重試的事不做成不可逆
+                msg = (f"{rec['inst_id']} {rec['pos_side']} 已了結，但連 {tries} 輪都查"
+                       f"不到已實現損益 ⇒ 該筆損益**永遠**不進日/週熔斷口徑（熔斷會低估"
+                       f"已實現虧損）。開倉時間 "
+                       f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(rec['placed_at']))}"
+                       f" UTC，請人工到 OKX 查回金額。")
+                print(f"🚨 {msg}")
+                _ROUND_PNL_GAPS.append({"intent_id": iid,
+                                        "inst_id": rec["inst_id"],
+                                        "pos_side": rec["pos_side"],
+                                        "symbol": rec.get("symbol"),
+                                        "placed_at": rec.get("placed_at"),
+                                        "retries": tries})
+                _note_fail("pnl_unaccounted", msg)
+                ps["open"].pop(iid, None)
         elif timed_out(rec["placed_at"], now_s):
             if dry:
                 print(f"DRY-RUN: 逾時平倉 {rec['inst_id']} {rec['pos_side']}")
@@ -1113,6 +1190,7 @@ def main() -> int:
         state_blind = state is None
         _ROUND_OKS["ok"] = 0             # v151：成功帳同步歸零（分辨空轉輪用）
         _ROUND_EXPIRED.clear()           # v169：本輪丟棄帳從零開始
+        _ROUND_PNL_GAPS.clear()          # v170：本輪熔斷漏記帳從零開始
         # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
         # v159（r47）：manage_positions 同時做反向對帳，回本輪的孤兒部位鍵
         # v162（r53）：None＝本輪掃描沒跑成（查不到交易所部位）⇒ 擋單閘等於瞎掉，
@@ -1232,7 +1310,8 @@ def main() -> int:
             _save_state(state)
         # v143：本輪收尾——把 fail-closed 記帳並在連續失敗時告警（dry-run 不真送）
         finish_round(dict(_ROUND_FAILS), dry=a.dry_run, oks=_ROUND_OKS["ok"],
-                     expired=list(_ROUND_EXPIRED))
+                     expired=list(_ROUND_EXPIRED),
+                     pnl_gaps=list(_ROUND_PNL_GAPS))
         if a.once or a.dry_run:
             return 0
         time.sleep(60)
