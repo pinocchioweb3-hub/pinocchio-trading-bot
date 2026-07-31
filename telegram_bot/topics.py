@@ -37,6 +37,8 @@ TOPIC_DEFS = [
     ("ideas",     "💡 意見箱"),       # 社群建議 + 貢獻積分（開源共建互動入口）
     ("cycle",     "🌊 週期·熊底→牛頂"),  # 週期/部位層 shadow：每日深度價值帶觀察（純定位非進場；
     #                                     未 provision thread_id 前 router.client 優雅落 General/主聊）
+    ("wlfi",      "🦅 WLFI 專屬追蹤"),   # v179：鏈上大額轉帳/行情劇變/每日日報（display_only,
+    #                                     使用者 2026-08-01 指定;thread_id 已 provision=11775）
 ]
 
 # v36 已退役（migrate 後關閉封存）的舊 key → 內容去向：

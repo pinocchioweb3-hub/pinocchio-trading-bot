@@ -265,6 +265,8 @@ async def amain(args: argparse.Namespace) -> int:
     from news_feed.us_news import run_us_news_loop as _run_us_news
     # v52: CoinGlass 加密新聞快訊（/api/article/list，$79 Startup，AI 過濾+繁中翻譯）
     from news_feed.coinglass_news import run_coinglass_news_loop as _run_cg_news
+    # v179: WLFI 專屬追蹤（鏈上+行情+日報,display_only,🦅 主題）
+    from l3_dispatcher.wlfi_watch import run_wlfi_watch_loop as _run_wlfi
     # v176: 對外 IP 變更哨兵（浮動 IP 輪換事前告警,7/30 白名單 401 事故的預防層）
     from l3_dispatcher.ip_watch import run_ip_watch_loop as _run_ip_watch
     # v177: 電力哨兵（拔電/低電量/危急事前告警——斷電＝真錢消費器零送單、關機後 watchdog 也救不回）
@@ -388,6 +390,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("us_news", lambda: _run_us_news(router.client("news"))),
         # v52: CoinGlass 加密快訊（AI 過濾+繁中）→ 📰新聞快訊；共用 source 限流器
         ("cg_news", lambda: _run_cg_news(router.client("news"), source)),
+        # v179: WLFI 專屬追蹤 → 🦅 主題
+        ("wlfi_watch", lambda: _run_wlfi(router.client("wlfi"))),
         # v176: IP 變更哨兵 → 系統主題
         ("ip_watch", lambda: _run_ip_watch(tg_sys)),
         # v177: 電力哨兵 → 系統主題
