@@ -472,6 +472,39 @@ def timed_out(placed_at_s: float, now_s: float,
     return (now_s - placed_at_s) > limit_h * 3600
 
 
+def orphan_positions(exchange_positions, open_map: dict) -> list:
+    """反向對帳（純函式）：列出「交易所上真的有、但本地帳沒有」的部位。
+
+    ⚠️ 目前**尚未接入主迴圈**（規格見 docs/2026-07-31-斷流期倉位保護-規格.md）。
+    manage_positions() 只從本地帳 open_map 出發逐倉去問交易所，因此「交易所有、
+    本地帳沒有」的部位在結構上永遠看不見——不會逾時平倉、了結損益也永遠不會進
+    day_pnl（＝日/週熔斷少算一筆真實虧損）。
+
+    這種部位怎麼生出來的：place() 分批進場是多腿，任何一腿查單失敗就整筆回 False，
+    而 main() 只在 True 時才寫本地帳；若此時前面幾腿已經成交（交易所已有倉、附掛
+    SL/TP 都在），本地帳是空的。斷流（如 401 白名單）會讓後續每一輪都查單失敗，
+    直到 intent 過了 expires_at 被丟棄 ⇒ 那個部位就此脫離帳本。
+
+    回 [(inst_id, pos_side, contracts), ...]（依鍵排序）。pos=0 的不算（已平）。
+    畸形資料一律略過而不丟例外——本函式將來會跑在交易路徑上。
+    """
+    known = {(r.get("inst_id"), r.get("pos_side"))
+             for r in (open_map or {}).values()}
+    out = []
+    for p in (exchange_positions or []):
+        if not isinstance(p, dict):
+            continue
+        try:
+            sz = float(p.get("pos") or 0)
+        except (TypeError, ValueError):
+            continue
+        key = (p.get("instId"), p.get("posSide"))
+        if sz == 0 or not key[0] or key in known:
+            continue
+        out.append((key[0], key[1], sz))
+    return sorted(out)
+
+
 WEEKLY_STOP_USD = 750.0          # 週虧熔斷（≈7.5R）：近 7 日合計虧損達此值→停接新單
 
 
