@@ -265,6 +265,8 @@ async def amain(args: argparse.Namespace) -> int:
     from news_feed.us_news import run_us_news_loop as _run_us_news
     # v52: CoinGlass 加密新聞快訊（/api/article/list，$79 Startup，AI 過濾+繁中翻譯）
     from news_feed.coinglass_news import run_coinglass_news_loop as _run_cg_news
+    # v176: 對外 IP 變更哨兵（浮動 IP 輪換事前告警,7/30 白名單 401 事故的預防層）
+    from l3_dispatcher.ip_watch import run_ip_watch_loop as _run_ip_watch
     # v175: OKX 官方新聞（ATK CLI news/important,原生中文,live 唯讀鎖 news 子指令）
     from news_feed.okx_news import run_okx_news_loop as _run_okx_news
     # v175: CoinDesk RSS（免金鑰,AI 過濾+繁中,使用者 2026-08-01 指定接入）
@@ -384,6 +386,8 @@ async def amain(args: argparse.Namespace) -> int:
         ("us_news", lambda: _run_us_news(router.client("news"))),
         # v52: CoinGlass 加密快訊（AI 過濾+繁中）→ 📰新聞快訊；共用 source 限流器
         ("cg_news", lambda: _run_cg_news(router.client("news"), source)),
+        # v176: IP 變更哨兵 → 系統主題
+        ("ip_watch", lambda: _run_ip_watch(tg_sys)),
         # v175: OKX 官方新聞快訊（等使用者補 IP 白名單後自癒）→ 📰
         ("okx_news", lambda: _run_okx_news(router.client("news"))),
         # v175: CoinDesk RSS → 📰
