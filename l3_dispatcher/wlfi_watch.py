@@ -166,6 +166,19 @@ async def _discover_pools() -> set[str]:
     return pools
 
 
+async def _usd1_supply() -> float | None:
+    """v186：USD1 穩定幣跨鏈總供給（≈市值,$1 錨定）。CoinGecko usd1-wlfi,
+    合約 0x8d0d...8b0d 已於 2026-08-01 經 CoinGecko+Ethplorer 雙源驗證。
+    生態命脈指標：供給成長=採用擴張,通常領先幣價。失敗回 None。"""
+    try:
+        async with httpx.AsyncClient(timeout=25) as c:
+            r = await c.get("https://api.coingecko.com/api/v3/simple/price"
+                            "?ids=usd1-wlfi&vs_currencies=usd&include_market_cap=true")
+        return float(r.json()["usd1-wlfi"]["usd_market_cap"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
 _DISCLAIMER = ("<i>⚠️ 固定誠實聲明：top10 地址持 87% 供給｜專案方具凍結任意錢包能力"
                "（Justin Sun 訴訟在案）｜2028-05 起 543 億枚解鎖（流通量 171%）｜"
                "政治連結=題材與打擊面一體兩面。以上為觀察數據，非投資建議、"
@@ -442,6 +455,15 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                     st["holders_prev"] = holders
                 card.append(f"24h 鯨魚：入交易所 ${in_ex / 1e6:.2f}M｜"
                             f"提出 ${out_ex / 1e6:.2f}M｜共 {len(ws)} 筆≥$200K")
+                # v186：USD1 生態命脈——供給成長=採用擴張,領先指標
+                u1 = await _usd1_supply()
+                if u1:
+                    prev_u1 = st.get("usd1_prev")
+                    d1 = (f"（vs 昨日 {(u1 - prev_u1) / 1e6:+,.0f}M）"
+                          if prev_u1 else "")
+                    card.append(f"💵 USD1 供給 ${u1 / 1e9:.2f}B{d1}"
+                                f"　Top10 集中度 {st.get('top10_share', '—')}%")
+                    st["usd1_prev"] = u1
                 _days = max(0, int((1841500800 - now) / 86400))   # 2028-05-06
                 card.append(f"⏳ 解鎖牆倒數 {_days} 天（2028-05,543億枚=流通171%）")
                 if news_lines:
