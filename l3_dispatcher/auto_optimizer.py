@@ -96,8 +96,13 @@ def _same_generation_only(rows: list[dict]) -> tuple[list[dict], dict]:
     rows = list(rows or [])
     mix = up.cohort_mix(rows)
     gen = up.active_generation(rows)
-    kept = [r for r in rows if up.generation_of_row(r) == gen]
-    return kept, {"active_generation": gen, "mix": mix,
+    # v178：同代鍵擴成 (宇宙源, 數據面版本)——數據面修復前的樣本(dp1)不得替
+    # 修復後(dp2)的參數背書，與宇宙換代同物種、同醫法
+    kept = [r for r in rows
+            if up.generation_of_row(r) == gen
+            and up.data_plane_of_row(r) == up.DATA_PLANE]
+    return kept, {"active_generation": gen, "data_plane": up.DATA_PLANE,
+                  "mix": mix,
                   "n_in": len(rows), "n_kept": len(kept),
                   "n_excluded_other_generation": len(rows) - len(kept)}
 

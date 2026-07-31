@@ -330,7 +330,9 @@ async def run_entry_optimization(*, days: int = 120, at_ms: int | None = None,
     from l3_dispatcher import universe_provenance as up
     _cohort_mix, _cohort_gen = up.cohort_mix(rows), up.active_generation(rows)
     _n_in = len(rows)
-    rows = [r for r in rows if up.generation_of_row(r) == _cohort_gen]
+    # v178：同代鍵=(宇宙源,數據面版本)——dp1 舊樣本不替 dp2 參數背書
+    rows = [r for r in rows if up.generation_of_row(r) == _cohort_gen
+            and up.data_plane_of_row(r) == up.DATA_PLANE]
     if ledger is None:
         from backtest.l2_stat_gates import TrialLedger, default_ledger_path
         ledger = TrialLedger(default_ledger_path())

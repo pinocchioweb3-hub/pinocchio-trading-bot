@@ -264,6 +264,16 @@ def build_plan_snapshot(*, source: str, direction: str,
             # 加密樣本**不可直接合併統計**；沒有這一欄，日後在帳上分不出來。只能前向
             # 累積——封存快照永不回填（紅線③）。美股路徑恆 None（不經加密宇宙）。
             "universe_source": _resolve_universe_source(source),
+            # v178：數據面世代標記——修復前後樣本可分（缺欄=dp1 舊版,永不回填）
+            "data_plane": _data_plane_tag(),
         }
     except Exception:
+        return None
+
+
+def _data_plane_tag() -> str | None:
+    try:
+        from .universe_provenance import DATA_PLANE
+        return DATA_PLANE
+    except Exception:  # noqa: BLE001
         return None

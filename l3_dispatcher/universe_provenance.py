@@ -55,6 +55,28 @@ def get_universe_source() -> str | None:
     return _LAST_UNIVERSE_SOURCE
 
 
+# ── 數據面世代（v178）──────────────────────────────────────────────
+# 修復數據面（CVD備援/BTC閘自算/備援上桌）不會改 universe_source，但會實質改變
+# 「訊號是在多少資訊下做出的」——修復前後樣本混算＝v144 同物種污染在數據面維度
+# 重演。dp 版本每次數據面能力變更時遞增；缺欄＝dp1（修復前舊樣本，缺席自成一代）。
+DATA_PLANE = "dp2"          # dp2 = v178 起（CVD備援+BTC閘+備援上桌）
+_LEGACY_DATA_PLANE = "dp1"  # v178 前（數據面殘缺的兩桶版）
+
+
+def data_plane_of_row(row: dict) -> str:
+    """一筆樣本出自哪個數據面版本。缺鍵/壞資料一律回 dp1（誠實：舊版沒標記）。"""
+    try:
+        snap = row.get("plan_snapshot")
+        if isinstance(snap, str):
+            snap = json.loads(snap or "") or {}
+        if not isinstance(snap, dict):
+            return _LEGACY_DATA_PLANE
+        dp = snap.get("data_plane")
+        return dp if isinstance(dp, str) and dp else _LEGACY_DATA_PLANE
+    except Exception:  # noqa: BLE001
+        return _LEGACY_DATA_PLANE
+
+
 # ── 統計層消費者的共用底座（純函式，無狀態、不擲出） ──────────────────
 def generation_of_row(row: dict) -> str:
     """一筆已平倉紙上單出自哪一代宇宙。
