@@ -527,7 +527,9 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                 ax.annotate(mk, (x0, ev["level"]), color=col, fontsize=7.5,
                             ha="center", va=va, alpha=0.9, zorder=6)
             if wy.get("narrative"):
-                ax.text(0.01, 0.02, f"Wyckoff：{wy['narrative']}　〔{wy.get('caveat','')}〕",
+                # v183：標明時框——圖上是本時框的 Wyckoff 讀數,與卡文的週線段不同口徑,
+                # 不標時框會被讀成互相矛盾（BCH 卡活案例）
+                ax.text(0.01, 0.02, f"Wyckoff（{tf}）：{wy['narrative']}　〔{wy.get('caveat','')}〕",
                         transform=ax.transAxes, color="#c9b6e0", fontsize=7.2,
                         va="bottom", ha="left", zorder=6,
                         bbox=dict(boxstyle="round,pad=0.3", fc="#1a1f2e",
@@ -566,9 +568,11 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
                         linewidth=1.0 if is_key else 0.6,
                         linestyle=(0, (5, 4)) if is_key else (0, (1, 3)),
                         alpha=0.8 if is_key else 0.5, zorder=1)
-                ax.text(xs + 0.3, price, f"Fib {r:.3f}　{price:,.6g}", color=col,
-                        fontsize=6.6, va="center", ha="left", alpha=0.9, zorder=4,
-                        bbox=dict(boxstyle="round,pad=0.1", fc=BG, ec=col, lw=0.3, alpha=0.6))
+                # v183：標籤只標關鍵級且移到最後一根K的右側——原本六個框疊在圖中央
+                # 遮住價格行為（2026-08-01 BCH 卡使用者反映「說不出哪裡怪」的主因）
+                if r in (0.382, 0.5, 0.618, 0.786):
+                    ax.text(n + 0.6, price, f"{r:.3f}·{price:,.6g}", color=col,
+                            fontsize=6.4, va="center", ha="left", alpha=0.9, zorder=4)
             _leg = "上升腿回撤·找支撐" if fib["up"] else "下降腿回撤·找阻力"
             ax.text(xs + 0.3, fib["end"], f"Fib {_leg}", color=FIB_GOLD,
                     fontsize=6.8, fontweight="bold",
@@ -705,7 +709,8 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
 
         # === 結構評分卡 + 基差 + 情緒（v33：CoinGlass 佐證，標在價格面板右上）===
         _sc = _structure_scorecard_lines(overlays)
-        if _sc:
+        # v183：≥2 行（標題+至少一行實資料）才畫——CG 停權後全 None 會剩孤兒標題框
+        if _sc and len(_sc) >= 2:
             ax.text(0.985, 0.97, "\n".join(_sc), transform=ax.transAxes,
                     color=FG, fontsize=7.3, va="top", ha="right", zorder=6,
                     bbox=dict(boxstyle="round,pad=0.4", fc="#1a1f2e", ec=GRID, lw=0.6, alpha=0.85))
