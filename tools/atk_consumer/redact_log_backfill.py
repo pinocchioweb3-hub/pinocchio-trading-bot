@@ -208,14 +208,18 @@ def _selftest() -> bool:
         print(("  [OK] " if cond else "  [FAIL] ") + name)
         ok = ok and bool(cond)
 
-    KID = b"a1b2c3d4-e5f6-4708-9a0b-1c2d3e4f5061"
+    # ⛔ 測試素材一律用「掃描器認得的假貨」，絕不抄真實日誌原文（r71 實測踩到：
+    #    v172 這支自己就把真實出口 IP 寫進測試素材、隨 e7c3b3b 進了 PUBLIC repo，
+    #    而該輪還宣稱 secret_leak_scan 乾淨）。判準見 tools/secret_leak_scan.py：
+    #    key-id 佔位＝00000000 開頭；IP 佔位＝RFC 5737 文件用網段（203.0.113.0/24）。
+    KID = b"00000000-0000-4000-8000-000000000000"
     LINE = ("⚠️ 設槓桿失敗 MU-USDT-SWAP/long：Error: HTTP 401 from OKX: "
-            "Your IP 36.228.168.118 is not included in your API key's ").encode()
+            "Your IP 203.0.113.7 is not included in your API key's ").encode()
 
     out, hits = redact_bytes(LINE + KID + b" IP whitelist.\n")
     check("命中並換成標記", hits == 1 and MARKER in out and KID not in out)
     # ⛔ 回歸鎖：IP 是使用者補白名單唯一有用的資訊，永遠不遮。
-    check("IP 不被遮（口徑同 redact_secrets）", b"36.228.168.118" in out)
+    check("IP 不被遮（口徑同 redact_secrets）", b"203.0.113.7" in out)
     check("其餘文字原樣保留", b"MU-USDT-SWAP/long" in out and out.endswith(b" IP whitelist.\n"))
     check("冪等：再跑一次零命中", redact_bytes(out)[1] == 0)
     check("空輸入不炸", redact_bytes(b"") == (b"", 0))

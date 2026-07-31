@@ -334,10 +334,65 @@ def org_digest_verdict(latest_by_role: dict | None, *, today,
             "all_covered_by_backfill": all_covered}
 
 
+def org_coverage_verdict(cov: dict | None, *, exclude_roles=None) -> dict | None:
+    """把 `org_digest_coverage.coverage()` 的結果翻成帳本欄位（純函式，永不拋）。
+
+    為什麼要有這一層（檔齡制的盲點）
+    --------------------------------
+    `org_digest_verdict()` 只看各席「最新一份自產檔有多舊」⇒ 任何一份新檔都會把它
+    前面的歷史缺口一起蓋掉。實例：創意總監 7/08 交、7/15 與 7/22 兩期零產出、7/29
+    又交，檔齡制看「最新才 2 天前」判無斷檔，那兩期**從未上過任何一輪帳本**，是
+    2026-07-31 人工逐檔清點才看見的。檔齡是「連續性」的代理值，不是連續性本身。
+
+    ⛔ 為什麼這個結果**不**進 system_faults、**不**改 CEO 狀態
+    ----------------------------------------------------------
+    覆蓋率講的是**既成事實**（過去 N 期交了幾期），現況停不停擺由檔齡制負責。若把
+    已經結束的歷史缺口也丟進 system_faults，該席明明已恢復，state 仍會被壓成 STALLED
+    長達整個回看窗（12 期）＝慢性假警報，最後連真的那則也一起被忽略（r66 memguard
+    噪音稀釋訊號的同一個教訓）。這裡只負責**讓事實每輪出現在帳本上**，判斷留給人。
+    日後若要升級成告警，需要的是「長期低度交付」的判準（例如近 12 期只交 4 期），
+    那是另一次刻意的決定，不是本函式順手做掉的事。
+
+    exclude_roles: 已經在檔齡制斷檔清單裡的席次。⛔ 只影響 `hidden_from_age_check`
+                   （＝這一輪的**新發現**是什麼），**不刪資料**——那些席的覆蓋率
+                   數字照樣留在 roles 裡，否則帳本又會少一塊事實。
+    """
+    try:
+        rows = [r for r in ((cov or {}).get("roles") or [])
+                if isinstance(r, dict) and isinstance(r.get("missed"), int)
+                and r.get("missed")]
+        if not rows:
+            return None
+        exclude = set(exclude_roles or ())
+        hidden = [r for r in rows if r.get("role") not in exclude]
+        parts = []
+        for r in rows:
+            s = (f"{r.get('label') or r.get('role')}近 {r.get('periods')} 期自產 "
+                 f"{r.get('coverage_text')}（缺 {r['missed']} 期、最長連缺 "
+                 f"{r.get('longest_miss_streak')} 期）")
+            if r.get("backfill_only_hits"):
+                s += f"，其中 {r['backfill_only_hits']} 期只有監督員代補產（排程仍未自產）"
+            s += "［檔齡制已在報］" if r.get("role") in exclude else "［檔齡制看不見：已被較新的檔蓋掉］"
+            parts.append(s)
+        text = ("組織產出期別覆蓋率（既成事實，非現況故障）：" + "；".join(parts)
+                + "——⛔ 本欄不進 system_faults 也不改 CEO 狀態：現況停擺由檔齡制負責，"
+                  "把已結束的歷史缺口長期壓成 STALLED 會變成慢性假警報")
+        return {
+            "roles": rows,
+            "text": text,
+            "hidden_from_age_check": [r.get("role") for r in hidden],
+            "any_hidden_gap": bool(hidden),
+            "worst_missed": max(r["missed"] for r in rows),
+        }
+    except Exception:
+        return None      # 帳本任何一塊都不准把 daemon 弄掛
+
+
 def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
            demo_n, demo_live, demo_active, open_decisions, pending_outbox,
            demo_rejected=0, demo_reject_hint=None, real_output_age_sec=None,
            live_exec=None, org_digest=None, demo_stall_reason=None, pnl_gap=None,
+           org_coverage=None,
            last_nudge_ms=0, stall_sec=STALL_SEC, nudge_cooldown_sec=NUDGE_COOLDOWN_SEC) -> dict:
     """核心判定（純函式）。回 state / next_step / blockers / should_nudge。
 
@@ -369,6 +424,9 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
     # r30：組織產出斷檔＝系統故障（該 push CEO／監督員代補產），球不在使用者。
     if org_digest:
         system_faults.append(org_digest["text"])
+    # r71：org_coverage（期別覆蓋率）刻意**不**加進 system_faults——理由見
+    #   org_coverage_verdict 的 docstring：它是既成事實不是現況故障，混進來會讓
+    #   已恢復的席次把 state 壓成 STALLED 長達整個回看窗。⛔ 勿「順手」補上。
     # r64：模擬盤鏡像實測停擺（此前 50+ 小時完全無聲，因為只看旗標）。歸屬比照 live_exec：
     #   閘擋＝只有使用者能決定是否移除觸發條件（實盤金鑰共存與否）→ blockers；
     #   worker 不見了/狀態不明＝系統問題 → system_faults（該 push CEO）。
@@ -422,6 +480,8 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
         "live_exec": live_exec,
         "pnl_gap": pnl_gap,
         "org_digest": org_digest,
+        # r71：欄位恆存在（無缺報時為 None）——Layer 2 才分得出「沒缺報」與「這版沒這功能」。
+        "org_coverage": org_coverage,
         "should_nudge": should_nudge,
         "commit_age_sec": commit_age_sec,
         "real_output_age_sec": real_output_age_sec,
@@ -660,6 +720,21 @@ def build_snapshot(now_ms: int | None = None) -> dict:
     except Exception:
         pass
 
+    # r71：期別覆蓋率——補上檔齡制的盲點（新檔會蓋掉它前面的歷史缺口）。
+    #   ⛔ 這個 import 一定要留在函式內：org_digest_coverage 反過來 import 本模組，
+    #      搬到檔頭會變成循環匯入、daemon 直接起不來。
+    #   ⛔ 只讀 docs/org/digests/ 的檔名與檔頭，零網路、零寫入。
+    org_coverage = None
+    try:
+        from .org_digest_coverage import coverage as _org_cov, scan_all as _org_scan
+        org_coverage = org_coverage_verdict(
+            _org_cov(_org_scan(),
+                     today=_datetime.fromtimestamp(now_ms / 1000).date()),
+            exclude_roles=[r.get("role") for r in ((org_digest or {}).get("roles") or [])],
+        )
+    except Exception:
+        pass
+
     verdict = assess(
         now_ms=now_ms, commit_age_sec=commit_age_sec,
         paper_n=paper_n, paper_min=paper_min, live_n=live_n, live_min=live_min,
@@ -668,6 +743,7 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint,
         real_output_age_sec=real_output_age_sec,
         live_exec=live_exec, org_digest=org_digest, pnl_gap=pnl_gap,
+        org_coverage=org_coverage,
         demo_stall_reason=demo_stall_reason,
         last_nudge_ms=last_nudge_ms,
     )
