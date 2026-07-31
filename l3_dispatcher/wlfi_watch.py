@@ -392,7 +392,8 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                     event = ((oi_1h is not None and abs(oi_1h) >= 2.0)
                              or (px_chg is not None and abs(px_chg) >= 2.0)
                              or fr_flip)
-                    heartbeat = now - (st.get("hourly_card_ts") or 0) >= 4 * 3600
+                    # v187：使用者指定小時級穩定節奏——每小時保證一張（原 4h 心跳改 1h）
+                    heartbeat = now - (st.get("hourly_card_ts") or 0) >= 3600
                     if (event or heartbeat) and tg:
                         # 軋空燃料啟發式：OI升+價未漲+資費負=空方擁擠
                         squeeze = (oi_1h is not None and oi_1h > 2
