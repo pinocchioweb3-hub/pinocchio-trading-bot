@@ -63,9 +63,11 @@ def classify_wyckoff(candles: list[dict], cvd_slope: float | None = None,
     mid = (box_hi + box_lo) / 2
     prior = candles[max(0, n - w - w // 2):n - w]
     prior_px = mean(c["close"] for c in prior) if prior else mid
-    context = "吸籌" if prior_px > mid else "派發"   # 前段較高=高位派發；較低=低位吸籌
-    # 修正：前段在箱上方下跌進箱 = 高檔派發；前段在箱下方上來 = 低檔吸籌
-    context = "派發" if prior_px > box_hi else "吸籌" if prior_px < box_lo else context
+    # v181：前段較高＝價格「跌進」箱體＝低位吸籌脈絡；前段較低＝「漲進」箱體＝高位派發。
+    # 舊碼此處曾有一行「修正」覆蓋把方向整個反轉（深跌進箱標成派發），2026-08-01 XRP
+    # 週線活案例實證誤標（前置均價 2.77 vs 箱頂 2.22、現價貼箱底,被標「高檔派發」）。
+    # 該覆蓋已刪除——本行已正確涵蓋全部情形,測試 test_wyckoff_context_v181 雙向鎖死。
+    context = "吸籌" if prior_px > mid else "派發"
 
     recent_types = [e["type"] for e in events if e["ago_bars"] <= 8]
     # 階段與下一關鍵

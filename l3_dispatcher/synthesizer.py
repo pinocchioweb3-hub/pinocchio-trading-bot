@@ -180,6 +180,7 @@ PER_SYMBOL_DEEPDIVE_PROMPT = """你是專業加密貨幣交易計畫師。針對
   - **依資料中「## ⚠️ 帳戶約束」區塊給的 1R(USD) 與使用者自選槓桿計算 —— 不要自行假設金額、也不要替使用者改槓桿**
   - position_notional = 1R(USD) / 1R價差(%) × entry；margin = notional / leverage
   - 用使用者設定的槓桿算 margin；**若 margin > 帳戶約束的安全上限，只「提示保證金偏重、注意爆倉」，不主動建議調低槓桿**
+  - **倉位段開頭必須標明「（紙上研究口徑，非實盤下單指示）」**——帳戶約束區塊的本金是名目研究值
 - **槓桿**：使用使用者自己設定的值（1–50x 由他決定），**不做「你應該用幾倍」這類個人化建議**；只在風險偏高時誠實提示
 - **R:R 報酬比**：TP2 至少 1.5R，TP3 至少 2R，否則 setup 不值得
 - **持倉時長預估**：日內 / 1-3 日 / 1 週
@@ -216,6 +217,16 @@ PER_SYMBOL_DEEPDIVE_PROMPT = """你是專業加密貨幣交易計畫師。針對
 （之後在 user message 給你 5 時框 + 全數據）"""
 
 
+
+def _fmt_funding(x) -> str:
+    """v181：資費顯示——|值|過小時印「≈0.0000%」而非偽精度的「-0.0000%」。"""
+    if x is None:
+        return "n/a"
+    pct = x * 100
+    if abs(pct) < 0.00005:
+        return "≈0.0000%"
+    return f"{pct:+.4f}%"
+
 def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
                             watchlist=None) -> str:
     """把 state + tradfi 結構化成 LLM 易讀的格式"""
@@ -239,7 +250,7 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
         line += f"  距期內高 {m.get('drawdown_from_high_pct', 0):.1f}%"
         if m.get("ma50"): line += f"  50d MA ${m.get('ma50')}"
         if e.get("funding") is not None:
-            line += f"  funding {e['funding']*100:+.4f}%/8h"
+            line += f"  funding {_fmt_funding(e['funding'])}/8h"
         parts.append(line)
     parts.append(f"- ETH/BTC ratio: {state.get('eth_btc_ratio')}")
     parts.append(f"- 系統判定 regime: {state.get('regime')}")
@@ -252,7 +263,7 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
         if m.get("error"): continue
         line = f"- {sym}: ${m.get('current_price')}  7d {m.get('return_7d_pct','—')}%  30d {m.get('return_30d_pct','—')}%"
         if e.get("funding") is not None:
-            line += f"  funding {e['funding']*100:+.4f}%/8h"
+            line += f"  funding {_fmt_funding(e['funding'])}/8h"
         parts.append(line)
 
     # ----- 期現基差 -----
@@ -446,9 +457,9 @@ def _format_pulse_data(pulse_state: dict) -> str:
         parts.append("\n## Funding 24h 變化")
         for sym, d in fund.items():
             if d.get("error"): continue
-            cur = d.get("current", 0) * 100
             chg = d.get("change_24h_pct_points", 0) * 100
-            parts.append(f"- {sym}: 現 {cur:+.4f}%/8h  24h 變化 {chg:+.4f} 百分點")
+            parts.append(f"- {sym}: 現 {_fmt_funding(d.get('current'))}/8h  "
+                         f"24h 變化 {chg:+.4f} 百分點")
 
     # ---- 鯨魚最新狀態 ----
     whales = pulse_state.get("whales_now", {})
@@ -479,6 +490,9 @@ def _account_constraints_block() -> list[str]:
     margin_cap = round(bal * 0.10)
     return [
         "## ⚠️ 帳戶約束（護欄，非投資建議）",
+        # v181：口徑錯配修——此本金是「紙上研究口徑」名目值,與任何實盤帳戶無關;
+        # 讀者按卡上金額實單會超風險數倍（真錢管線另有自己的小額參數）
+        "- **以上與以下皆為紙上研究口徑（名目本金），非任何實盤帳戶的下單指示**",
         f"- 本金：約 ${bal:,.0f} USDT（{CONFIG.tier.label}級保守護欄，不可超倉）",
         f"- 1R＝「一個風險單位」＝|entry − stop| 的價差；此帳戶單筆 1R 設為 ${risk_1r:,.0f} USDT"
         "（使用者自設值，可在 /settings 改；R 不是固定金額）",
@@ -589,7 +603,7 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
             parts.append(f"- OI: ${snap.get('oi', 0):,.0f}  24h 變化 {snap.get('oi_delta_pct', 0):+.2f}%（備援源）")
             funding = snap.get("funding", 0)
             if funding is not None:
-                parts.append(f"- Funding: {funding*100:+.4f}%/8h（備援源）")
+                parts.append(f"- Funding: {_fmt_funding(funding)}/8h（備援源）")
             parts.append(f"- 大戶持倉比: {snap.get('top_trader_ratio')}  vs 散戶: {snap.get('ls_ratio')}（備援源）")
             if snap.get("cvd_slope") is not None:
                 _cs = snap["cvd_slope"]
@@ -628,12 +642,12 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
             f = cg["funding"]
             ftone = ("過熱偏多（軋空風險）" if f > 0.0005 else
                      "偏空（空頭擁擠）" if f < -0.0005 else "中性")
-            parts.append(f"- 資金費率：{f*100:+.4f}%/8h（{ftone}）")
+            parts.append(f"- 資金費率：{_fmt_funding(f)}/8h（{ftone}）")
         if cg.get("funding_oi_weighted") is not None:   # M5
             fw = cg["funding_oi_weighted"]
             wtone = ("（OI 加權偏高＝大倉位方向擁擠，反指/軋空風險↑）" if fw > 0.0005 else
                      "（OI 加權偏低＝空方擁擠，反彈風險↑）" if fw < -0.0005 else "")
-            parts.append(f"- 資金費率(OI 加權)：{fw*100:+.4f}%{wtone}")
+            parts.append(f"- 資金費率(OI 加權)：{_fmt_funding(fw)}{wtone}")
         if cg.get("ls_ratio") is not None:
             ls = cg["ls_ratio"]
             ltone = "大戶偏多" if ls > 1.05 else "大戶偏空" if ls < 0.95 else "多空均衡"
@@ -685,7 +699,7 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
         if bn.get("ls_ratio") is not None:
             parts.append(f"- Binance 大戶多空比：{bn['ls_ratio']:.2f}")
         if bn.get("funding") is not None:
-            parts.append(f"- Binance 資金費率：{bn['funding']*100:+.4f}%/8h")
+            parts.append(f"- Binance 資金費率：{_fmt_funding(bn['funding'])}/8h")
         if xc.get("flags"):
             for fl in xc["flags"]:
                 parts.append(f"- ⚠️ {fl}（兩所分歧，留意）")
