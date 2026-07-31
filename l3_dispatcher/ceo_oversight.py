@@ -102,9 +102,25 @@ ORG_HEADER_LINES = 12
 # 純決策層（可離線測試，不碰 IO）
 # ===========================================================================
 def next_step(*, paper_n, paper_min, live_n, live_min,
-              demo_n, demo_active, demo_rejected=0, demo_reject_hint=None) -> str:
+              demo_n, demo_active, demo_rejected=0, demo_reject_hint=None,
+              demo_stall_reason=None) -> str:
     """依目前進度推「下一步該做什麼」（確定性階梯，非 LLM）。"""
     if not demo_active:
+        # 監督員 r64：旗標已開、卻被閘擋住／輪次狀態不明時，叫使用者「去啟用它」是錯的建議
+        #   （他去開只會發現早就開著）。據實說出實測到的停擺原因，把球放回正確的人手上。
+        r = str(demo_stall_reason or "")
+        if r and r not in ("flag_off",):
+            if "demo_guard" in r:
+                return ("模擬盤操盤手旗標已開、但每輪都被 demo_guard 擋下（實測），故零新單、"
+                        "既有部位亦停止對帳——擋單原因見下方；⛔ 該閘是杜絕對真錢下單的防線，"
+                        f"永不弱化，只能由你決定是否移除觸發條件。實測理由：{r}")
+            if r == "unknown":
+                return ("模擬盤操盤手活性未知（讀不到輪次紀錄）——⛔ 未知一律不當『在跑』，"
+                        "請先確認 daemon 的 demo worker 是否存活，再談累積樣本")
+            if r == "stale":
+                return ("模擬盤操盤手輪次紀錄過舊＝該 worker 已停止跑輪（非閘擋）——"
+                        "請先查 daemon 的 demo worker 是否活著")
+            return f"模擬盤操盤手未在運行（實測理由：{r}）——先排除該原因再談累積樣本"
         return ("啟用 OKX 模擬盤操盤手：先做單次 --cycle-once 監督試跑，確認真實成交與"
                 "帳本回寫無誤後再常駐，開始累積實倉樣本（零真錢）")
     if demo_n < DEMO_SAMPLE_TARGET:
@@ -135,6 +151,40 @@ def next_step(*, paper_n, paper_min, live_n, live_min,
         return ("模擬盤實倉樣本已達階段目標；下一步是「真錢小額」驗證——"
                 "依紅線①須由本人逐筆親手下單，非系統自動（待你拍板＋律師）")
     return "樣本接近 Phase 0 門檻，準備由人判讀是否對外宣告（系統不自我宣告，紅線③）"
+
+
+DEMO_CYCLE_MAX_AGE_SEC = 900          # demo worker 每 180s 一輪；超過此齡＝該 worker 沒在跑
+
+
+def demo_activity_verdict(flag_on, last_cycle_ts, last_cycle_outcome, *,
+                          now_s: float | None = None,
+                          max_age_sec: int = DEMO_CYCLE_MAX_AGE_SEC) -> dict:
+    """模擬盤到底有沒有在運轉——**量測**而非拿旗標當代理（純函式，可離線測）。
+
+    監督員 r64 治本。原本 demo_active 只讀 is_active()＝環境旗標，於是 demo_guard 擋了
+    50+ 小時、零新單、在場部位 50 小時未對帳，ledger 仍每輪寫 demo_active=true。
+    這是「拿代理值當事實」同物種第三次。
+
+    回 {active, reason}。⚠️ 未知一律 active=False，且 reason 說「unknown」不說「停了」——
+    承接 v162-v166 的同一紀律：不可把「未知」壓成「確認」，兩個方向都不行。
+    """
+    if not flag_on:
+        return {"active": False, "reason": "flag_off"}
+    try:
+        ts = float(last_cycle_ts)
+    except (TypeError, ValueError):
+        return {"active": False, "reason": "unknown"}
+    if ts <= 0:
+        return {"active": False, "reason": "unknown"}
+    outcome = str(last_cycle_outcome or "").strip()
+    if not outcome:
+        return {"active": False, "reason": "unknown"}
+    now_s = now_s if now_s is not None else time.time()
+    if now_s - ts > max_age_sec:
+        return {"active": False, "reason": "stale"}
+    if outcome == "ran" or outcome.startswith("ran"):
+        return {"active": True, "reason": "ran"}
+    return {"active": False, "reason": outcome}
 
 
 def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
@@ -232,7 +282,7 @@ def org_digest_verdict(latest_by_role: dict | None, *, today,
 def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
            demo_n, demo_live, demo_active, open_decisions, pending_outbox,
            demo_rejected=0, demo_reject_hint=None, real_output_age_sec=None,
-           live_exec=None, org_digest=None,
+           live_exec=None, org_digest=None, demo_stall_reason=None,
            last_nudge_ms=0, stall_sec=STALL_SEC, nudge_cooldown_sec=NUDGE_COOLDOWN_SEC) -> dict:
     """核心判定（純函式）。回 state / next_step / blockers / should_nudge。
 
@@ -258,10 +308,27 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
     # r30：組織產出斷檔＝系統故障（該 push CEO／監督員代補產），球不在使用者。
     if org_digest:
         system_faults.append(org_digest["text"])
+    # r64：模擬盤鏡像實測停擺（此前 50+ 小時完全無聲，因為只看旗標）。歸屬比照 live_exec：
+    #   閘擋＝只有使用者能決定是否移除觸發條件（實盤金鑰共存與否）→ blockers；
+    #   worker 不見了/狀態不明＝系統問題 → system_faults（該 push CEO）。
+    _r = str(demo_stall_reason or "")
+    if _r and _r != "flag_off":
+        if "demo_guard" in _r:
+            blockers.append(
+                "模擬盤鏡像實測停擺：旗標已開但每輪被 demo_guard 擋下，零新單且既有部位停止"
+                "對帳（帳面數字會越來越舊，不可當現況讀）——⛔ 該閘杜絕對真錢下單、永不弱化，"
+                "只有你能決定是否移除觸發條件（實盤金鑰與模擬盤鏡像是否共存）"
+            )
+        elif _r in ("unknown", "stale"):
+            system_faults.append(
+                f"模擬盤操盤手輪次狀態{'不明' if _r == 'unknown' else '過舊'}——"
+                "無法證明該 worker 還活著（未知不當在跑），須查 daemon"
+            )
 
     ns = next_step(paper_n=paper_n, paper_min=paper_min, live_n=live_n,
                    live_min=live_min, demo_n=demo_n, demo_active=demo_active,
-                   demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint)
+                   demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint,
+                   demo_stall_reason=demo_stall_reason)
 
     # v84 task#7（CEO 深度綜合）：ADVANCING 不再只看 git commit 時效——補「實質產出代理」
     #   （近期紙上活動：新進場/平倉）。無關 commit 不再謊報推進；有真產出即使無 commit 也算推進；
@@ -454,11 +521,30 @@ def build_snapshot(now_ms: int | None = None) -> dict:
     except Exception:
         pass
 
-    demo_active = False
+    # r64：demo_active 改看實測輪次結果（demo_operator 每輪寫入），不再拿閘①旗標當事實。
+    #   旗標仍保留為 demo_active_flag，兩者不一致本身就是要被看見的訊號。
+    demo_active_flag = False
+    demo_cycle_ts = None
+    demo_cycle_outcome = None
     try:
         from .demo_operator import is_active
-        demo_active = is_active()
+        demo_active_flag = is_active()
     except Exception:
+        pass
+    try:
+        from . import demo_journal as _dj
+        demo_cycle_ts = _dj.get_state("last_cycle_ts")
+        demo_cycle_outcome = _dj.get_state("last_cycle_outcome")
+    except Exception:
+        pass
+    _dv = demo_activity_verdict(demo_active_flag, demo_cycle_ts, demo_cycle_outcome)
+    demo_active = _dv["active"]
+    demo_stall_reason = None if demo_active else _dv["reason"]
+    demo_cycle_age_sec = None
+    try:
+        if demo_cycle_ts:
+            demo_cycle_age_sec = int(time.time() - float(demo_cycle_ts))
+    except (TypeError, ValueError):
         pass
 
     open_decisions = 0
@@ -516,6 +602,7 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         demo_rejected=demo_rejected, demo_reject_hint=demo_reject_hint,
         real_output_age_sec=real_output_age_sec,
         live_exec=live_exec, org_digest=org_digest,
+        demo_stall_reason=demo_stall_reason,
         last_nudge_ms=last_nudge_ms,
     )
 
@@ -527,6 +614,10 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         "demo_n": demo_n,
         "demo_live": demo_live,
         "demo_active": demo_active,
+        # r64：旗標與實測分開存。兩者不一致（flag=true / active=false）本身就是要被看見的事實。
+        "demo_active_flag": demo_active_flag,
+        "demo_stall_reason": demo_stall_reason,
+        "demo_cycle_age_sec": demo_cycle_age_sec,
         "demo_rejected": demo_rejected,
         "demo_reject_hint": demo_reject_hint,
         "open_decisions": open_decisions,

@@ -709,6 +709,23 @@ async def _intake(ex, *, now_ms, tg=None) -> dict:
     return summary
 
 
+def _record_cycle(dj, outcome: str) -> None:
+    """把「這一輪到底跑了沒、為何沒跑」留成實測紀錄（監督員 r64）。
+
+    治的是「拿代理值當事實」同物種第三次：ceo_oversight 的 demo_active 原本只讀
+    is_active()＝環境旗標，於是 demo_guard 擋了 50+ 小時（零新單、在場部位 50 小時
+    未對帳），oversight_ledger 每輪照樣寫 demo_active=true。旗標不是事實，輪次結果才是。
+
+    ⛔ 純記帳：不影響任何閘的判斷，寫入失敗也絕不可讓交易迴圈中斷。
+    """
+    try:
+        dj.set_state("last_cycle_ts", str(int(time.time())))
+        dj.set_state("last_cycle_outcome", outcome)
+    except Exception as e:  # noqa: BLE001
+        # 寫不進去也要出聲——靜默失敗會讓 oversight 一路判 unknown 卻沒人知道為什麼
+        print(f"[demo_op] ⚠️ 輪次狀態寫入失敗（不影響本輪交易邏輯）：{type(e).__name__}: {e}")
+
+
 async def run_demo_operator_cycle(*, now_ms=None, tg=None) -> dict:
     """一輪：鑰匙/kill-switch 閘 → 建全新 ex → 監控（先收斂既有）→ 進場（鏡像新訊號）。
     任一鑰匙沒開 / kill switch / demo_guard 設定不過 → 完全空轉、零 OKX 互動。"""
@@ -720,14 +737,20 @@ async def run_demo_operator_cycle(*, now_ms=None, tg=None) -> dict:
 
     if not is_active():
         out["skipped"] = f"inactive({ACTIVE_FLAG}!=1)"
+        _record_cycle(dj, f"skipped:{out['skipped']}")
         return out
     if dt.kill_switch_active():
         out["skipped"] = "kill_switch"
+        _record_cycle(dj, "skipped:kill_switch")
         return out
     try:
         demo_guard.ensure_demo_env()          # 鑰匙① + 實盤金鑰全空 + 模擬金鑰齊備
     except demo_guard.DemoGuardError as e:
         out["skipped"] = f"demo_guard:{e}"
+        # ⛔ 這裡只記帳、不繞路：既有部位的對帳同輪一併停是這個閘的**必然後果**，不是可修的 bug。
+        #   （make_demo_exchange 自己也呼叫 ensure_demo_env，要讓對帳在閘擋時仍跑，唯一途徑是
+        #     放寬實盤金鑰檢查＝弱化 demo_guard，永久禁止。）能做的只有別再謊報它活著。
+        _record_cycle(dj, f"skipped:demo_guard:{e}")
         return out
 
     ex = None
@@ -739,10 +762,13 @@ async def run_demo_operator_cycle(*, now_ms=None, tg=None) -> dict:
             out["intake_skipped"] = f"halted:{reason}"
         else:
             out["intake"] = await _intake(ex, now_ms=now_ms, tg=tg)
+        _record_cycle(dj, "ran")
     except demo_guard.DemoGuardError as e:
         out["error"] = f"demo_guard:{e}"
+        _record_cycle(dj, f"error:demo_guard:{e}")
     except Exception as e:  # noqa: BLE001
         out["error"] = f"{type(e).__name__}: {e}"
+        _record_cycle(dj, f"error:{type(e).__name__}")
     finally:
         if ex is not None:
             try:
@@ -758,12 +784,21 @@ async def run_demo_operator_loop(interval_s: int = 180, tg=None):
     import asyncio
     await asyncio.sleep(20)
     last_halt_log = 0.0
+    last_skip_log = 0.0
     while True:
         try:
             res = await run_demo_operator_cycle(tg=tg)
             if res.get("error"):
                 print(f"[demo_op] cycle error: {res['error']}")
-            elif not res.get("skipped"):
+            elif res.get("skipped"):
+                # r64：v137 只讓 halted 出聲，skipped 這一路仍是全靜音——demo_guard 擋單
+                #   實測靜默 50+ 小時無人知（且同輪連既有部位對帳一起停）。停擺不可以是隱形的。
+                now = time.time()
+                if now - last_skip_log > 3600:
+                    last_skip_log = now
+                    print(f"[demo_op] ⏸ 本輪完全空轉（{res['skipped']}）"
+                          "——零新單，且既有部位本輪未與交易所對帳（帳面會越來越舊）")
+            else:
                 mon = res.get("monitor", {})
                 ink = res.get("intake", {})
                 if any(mon.get(k) for k in ("filled", "closed", "expired",
