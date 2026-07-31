@@ -60,8 +60,11 @@ ENV_FILE = Path(r"C:\Users\user\OneDrive\桌面\交易機器人\.env")  # 只讀
 # 良性回應：查無此單是「冪等查詢」的正常答案，不是故障
 _BENIGN_MARKERS = ("51603", "doesn't exist", "does not exist")
 # 故障嚴重度排序（同輪多類時取最前者當代表）
-_CLASS_PRIORITY = ("cli_missing", "auth_ip_whitelist", "auth", "rate_limit",
-                   "timeout", "leverage_fail", "query_fail", "other")
+# orphan_position 排最前：它是唯一代表「真錢部位在交易所上、但已脫離本地帳」的類別，
+# 而且只有在「account positions 查詢成功」時才可能被記到（＝不可能發生在斷流輪，
+# 不會像 leverage_fail 那樣有洗掉斷流主因的疑慮）。見 r47。
+_CLASS_PRIORITY = ("orphan_position", "cli_missing", "auth_ip_whitelist", "auth",
+                   "rate_limit", "timeout", "leverage_fail", "query_fail", "other")
 _ROUND_FAILS: dict[str, str] = {}   # 本輪故障 {類別: 樣本}；每輪開頭清空
 # v151：本輪「成功呼叫數」；每輪開頭歸零。沒有它就無法分辨「全部呼叫都成功」
 # 與「這輪根本沒呼叫」——後者被當成乾淨輪會蓋出假痊癒（見 update_health）。
@@ -244,6 +247,11 @@ def should_alert(h: dict, now_s: float, threshold: int = FAIL_ALERT_AFTER,
 
 
 _CLASS_HINT = {
+    "orphan_position": "交易所上有一個本地帳沒有的真錢部位（多半是分批進場只成交了"
+                       "前面幾腿、後面查單失敗導致整筆未記帳）→ 它不在自動管理之下："
+                       "不會逾時平倉、了結損益也不會進日/週熔斷口徑；但它的止損仍掛在"
+                       "交易所，單筆風險仍受 SL 上限保護。請人工到 OKX 確認該倉並決定"
+                       "是否平掉；在它消失前，同幣同向的新單會被自動擋下",
     "auth_ip_whitelist": "呼叫端 IP 不在 API key 白名單（住宅浮動 IP 換掉會復發）"
                          "→ 到 OKX 後台把下方錯誤訊息中的 IP 加進白名單，"
                          "消費器每分鐘自動重試、不需重啟",
@@ -475,8 +483,10 @@ def timed_out(placed_at_s: float, now_s: float,
 def orphan_positions(exchange_positions, open_map: dict) -> list:
     """反向對帳（純函式）：列出「交易所上真的有、但本地帳沒有」的部位。
 
-    ⚠️ 目前**尚未接入主迴圈**（規格見 docs/2026-07-31-斷流期倉位保護-規格.md）。
-    manage_positions() 只從本地帳 open_map 出發逐倉去問交易所，因此「交易所有、
+    v159（r47）已接入 manage_positions()（規格見
+    docs/2026-07-31-斷流期倉位保護-規格.md §4.2）：偵測到→記健康帳 orphan_position
+    ＋擋同幣同向新單；⛔ 不自動平倉、⛔ 不自動收編進本地帳。
+    接入前 manage_positions() 只從本地帳 open_map 出發逐倉去問交易所，因此「交易所有、
     本地帳沒有」的部位在結構上永遠看不見——不會逾時平倉、了結損益也永遠不會進
     day_pnl（＝日/週熔斷少算一筆真實虧損）。
 
@@ -545,17 +555,36 @@ def _realized_pnl_since(inst_id: str,
         return None
 
 
-def manage_positions(dry: bool) -> None:
-    """每輪管理：①對帳（OKX 上已消失＝TP/SL 已了結→記日損益）②逾時強平。
-    任何查詢失敗→本輪跳過該倉不猜（下輪重試）。"""
+def manage_positions(dry: bool) -> list:
+    """每輪管理：①反向對帳（交易所有、本地帳沒有＝孤兒部位）②對帳（OKX 上已消失＝
+    TP/SL 已了結→記日損益）③逾時強平。任何查詢失敗→本輪什麼都不做（下輪重試）。
+
+    回 [(inst_id, pos_side), ...]＝本輪偵測到的孤兒，給主迴圈擋同幣同向新單。
+    """
     ps = _load_positions()
-    if not ps.get("open"):
-        return
+    # v159（監督員 r47）：⛔ 不可再因「本地帳空」就提早返回——「只從本地帳出發」正是
+    #   孤兒部位的結構盲點本身（規格 docs/2026-07-31-斷流期倉位保護-規格.md §4.2）。
     code, out = _okx(["account", "positions"])
     if code != 0 or not out.strip().startswith(("[", "{")):
-        return                                   # 查不到就不動，別誤判平倉
-    plist = json.loads(out)
-    plist = plist if isinstance(plist, list) else plist.get("data", [])
+        return []                                # 查不到就不動，別誤判平倉
+    try:
+        plist = json.loads(out)
+        plist = plist if isinstance(plist, list) else plist.get("data", [])
+    except Exception:  # noqa: BLE001
+        return []                                # 解析不了＝等同查不到（fail-closed）
+    # 反向對帳：⛔ 不自動平倉、⛔ 不自動收編進本地帳（理由見規格 §4.2）——
+    # 只記健康帳（讓既有的連續輪告警機制自然接手）＋擋同幣同向新單。
+    orphans = orphan_positions(plist, ps.get("open") or {})
+    orphan_keys = [(i, s) for i, s, _ in orphans]
+    for _iid, _side, _sz in orphans:
+        msg = (f"孤兒部位 {_iid} {_side} {_sz:g} 張：交易所上有、本地帳沒有。"
+               "此倉不在自動管理之下（不會逾時平倉、了結損益不進日/週熔斷口徑），"
+               "但它的止損仍掛在交易所。請人工確認後決定是否平倉；在它消失前，"
+               "同幣同向的新單一律擋下。")
+        print(f"🚨 {msg}")
+        _note_fail("orphan_position", msg)
+    if not ps.get("open"):
+        return orphan_keys
     live = {(p.get("instId"), p.get("posSide")): float(p.get("pos") or 0)
             for p in plist}
     now_s = time.time()
@@ -597,6 +626,7 @@ def manage_positions(dry: bool) -> None:
     ps["day_pnl"] = {k: v for k, v in ps["day_pnl"].items()
                      if k >= _day_key(time.time() - 14 * 86400)}
     _save_positions(ps)
+    return orphan_keys
 
 
 TP_WEIGHTS3 = (0.40, 0.30, 0.30)   # 對齊 demo 帳 TP1/2/3 分腿口徑（尾腿吃餘數）
@@ -782,7 +812,8 @@ def main() -> int:
         _ROUND_FAILS.clear()             # v143：本輪故障帳從零開始
         _ROUND_OKS["ok"] = 0             # v151：成功帳同步歸零（分辨空轉輪用）
         # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
-        manage_positions(a.dry_run)
+        # v159（r47）：manage_positions 同時做反向對帳，回本輪的孤兒部位鍵
+        orphan_keys = set(manage_positions(a.dry_run) or [])
         halted_today = breaker_tripped(_load_positions().get("day_pnl", {}))
         if halted_today:
             print(f"⛔ 日虧熔斷已觸發（≤ -{DAILY_STOP_USD:.0f} USDT）——今日不接新單，"
@@ -815,6 +846,14 @@ def main() -> int:
                                   intent["inst_id"], intent["pos_side"]):
                 print(f"⏸ {iid} {intent.get('symbol')} 同幣同向已在場——本輪不接"
                       "（OKX hedge 併倉會使已實現損益無法歸屬兩單）")
+                continue
+            # v159（監督員 r47）：同幣同向有「孤兒部位」（交易所有、本地帳沒有）
+            #   → 本輪不接。理由與修A 完全相同（併倉後已實現損益無法歸屬），
+            #   而孤兒的情況更糟：本地帳根本不知道那筆倉存在，曝險會無聲翻倍。
+            #   不記 done：人工處理掉那筆倉後、intent 若還沒過期就自然接上。
+            if (intent["inst_id"], intent["pos_side"]) in orphan_keys:
+                print(f"⏸ {iid} {intent.get('symbol')} 同幣同向有孤兒部位在交易所上"
+                      "——本輪不接（先人工確認那筆脫帳的倉）")
                 continue
             sz = contracts_for(intent["inst_id"], intent["entry"], intent["stop"], ct_cache)
             if sz is None:

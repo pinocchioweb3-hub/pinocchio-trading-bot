@@ -242,7 +242,7 @@ def test_dup_gate_pure_blocks_same_side_allows_opposite():
     assert not ci.dup_open_same_side(None, "BTC-USDT-SWAP", "long")
 
 
-def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True):
+def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True, orphans=()):
     """把主迴圈接到臨時目錄上跑一輪 --once（零網路、零下單）。回 (下單清單, done)。"""
     outbox = tmp_path / "outbox"
     outbox.mkdir()
@@ -258,7 +258,9 @@ def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True):
     monkeypatch.setattr(ci, "STATE", tmp_path / "state.json")
     monkeypatch.setattr(ci, "POS_STATE", tmp_path / "pos.json")
     monkeypatch.setattr(ci, "verify_demo_profile", lambda: True)
-    monkeypatch.setattr(ci, "manage_positions", lambda dry: None)
+    # v159（r47）：manage_positions 回本輪孤兒鍵；預設無孤兒（回 None 也要能吃）
+    monkeypatch.setattr(ci, "manage_positions",
+                        lambda dry: list(orphans) or None)
     monkeypatch.setattr(ci, "finish_round", lambda *a, **k: {})
     monkeypatch.setattr(ci, "contracts_for", lambda *a, **k: 1.0)
     # place_ok=False 模擬「部分成腿」：交易所側可能已有一腿成交，但整筆回報失敗
@@ -432,16 +434,16 @@ def test_loop_writes_no_ledger_record_when_place_reports_failure(tmp_path, monke
     assert "i-new" not in done               # 未記 done：會重試到 expires_at 為止
 
 
-def test_manage_positions_is_structurally_blind_to_orphans(tmp_path, monkeypatch):
-    """盲點特徵化：本地帳空 ⇒ manage_positions 連交易所都不問就返回。
-    ⚠️ 偵測接入迴圈後，本支的預期會改成「有問到並回報孤兒」——屆時一起改。"""
+def test_manage_positions_enumerates_exchange_even_when_ledger_empty(tmp_path, monkeypatch):
+    """v159（r47）盲點已翻面：本地帳空**也要**枚舉交易所側，否則孤兒永遠看不見。
+    （本支原本是盲點特徵化「calls == []」，接入後預期反過來。）"""
     (tmp_path / "pos.json").write_text(
         json.dumps({"open": {}, "day_pnl": {}}), encoding="utf-8")
     monkeypatch.setattr(ci, "POS_STATE", tmp_path / "pos.json")
     calls: list = []
     monkeypatch.setattr(ci, "_okx", lambda args, timeout=30: calls.append(args) or (0, "[]"))
-    ci.manage_positions(dry=False)
-    assert calls == [], "本地帳空就直接返回——交易所側從未被枚舉過"
+    assert ci.manage_positions(dry=False) == []
+    assert calls == [["account", "positions"]], "本地帳空也要問交易所一次"
 
 
 def test_orphan_detector_flags_exchange_only_positions():
@@ -467,6 +469,101 @@ def test_orphan_detector_never_raises_on_malformed_input():
     assert ci.orphan_positions(ex, None) == []
     assert ci.orphan_positions(None, None) == []
     assert ci.orphan_positions([], {"i": {"inst_id": "A", "pos_side": "long"}}) == []
+
+
+# ── v159（監督員 r47）孤兒偵測接入主迴圈：記帳＋擋單，但⛔不平倉⛔不收編 ────
+# 規格 §4.2。方向只有一個：保守側。偵測到孤兒 → 記健康帳（既有連續輪告警自然接手）
+# ＋擋同幣同向新單；⛔ 不自動平倉（不確定時動真錢部位是把不確定變成損失）、
+# ⛔ 不自動收編進本地帳（沒有 placed_at／進場價／R 值，收編＝製造假帳）。
+
+def _arm_orphan_round(tmp_path, monkeypatch, ex_positions, open_map=None,
+                      query_ok=True):
+    """跑一輪 manage_positions，交易所側回 ex_positions。回 (回傳值, 送出的呼叫)。"""
+    (tmp_path / "pos.json").write_text(
+        json.dumps({"open": open_map or {}, "day_pnl": {}}), encoding="utf-8")
+    monkeypatch.setattr(ci, "POS_STATE", tmp_path / "pos.json")
+    ci._ROUND_FAILS.clear()
+    calls: list = []
+
+    def fake_okx(args, timeout=30):
+        calls.append(args)
+        if args[:2] == ["account", "positions"]:
+            if not query_ok:
+                return 1, "Error: HTTP 401 from OKX"      # 斷流輪
+            return 0, json.dumps(ex_positions)
+        return 0, "[]"
+
+    monkeypatch.setattr(ci, "_okx", fake_okx)
+    return ci.manage_positions(dry=False), calls
+
+
+def test_orphan_is_recorded_into_health_with_identifiers(tmp_path, monkeypatch):
+    """偵測到孤兒 → 記健康帳 orphan_position，且樣本要講得出是哪一筆倉
+    （instId／posSide／張數），告警才有可操作性。"""
+    ex = [{"instId": "ETH-USDT-SWAP", "posSide": "short", "pos": "5"}]
+    got, _ = _arm_orphan_round(tmp_path, monkeypatch, ex)
+    assert got == [("ETH-USDT-SWAP", "short")]
+    assert "orphan_position" in ci._ROUND_FAILS
+    sample = ci._ROUND_FAILS["orphan_position"]
+    assert "ETH-USDT-SWAP" in sample and "short" in sample and "5" in sample
+    ci._ROUND_FAILS.clear()
+
+
+def test_orphan_is_never_auto_closed_nor_adopted_into_ledger(tmp_path, monkeypatch):
+    """⛔ 兩條紅線：不得送出平倉、不得把孤兒寫進本地帳（會製造假的 placed_at／R）。"""
+    ex = [{"instId": "ETH-USDT-SWAP", "posSide": "short", "pos": "5"}]
+    _, calls = _arm_orphan_round(tmp_path, monkeypatch, ex)
+    assert calls == [["account", "positions"]], "只准查，不准動"
+    assert not any(a[:2] == ["swap", "close"] for a in calls)
+    ps = json.loads((tmp_path / "pos.json").read_text(encoding="utf-8"))
+    assert ps["open"] == {}, "孤兒不得被收編進本地帳"
+    ci._ROUND_FAILS.clear()
+
+
+def test_orphan_query_failure_is_not_treated_as_no_orphan(tmp_path, monkeypatch):
+    """fail-closed 方向：查不到 ≠ 沒有孤兒。不得記成『本輪乾淨無孤兒』，
+    也不得因查不到就動既有的本地帳（那是誤判平倉）。"""
+    held = {"i-old": {"inst_id": "BTC-USDT-SWAP", "pos_side": "long",
+                      "symbol": "BTC", "contracts": 1.0,
+                      "placed_at": time.time() - 600}}
+    got, calls = _arm_orphan_round(tmp_path, monkeypatch, [], open_map=held,
+                                   query_ok=False)
+    assert got == []                                   # 不宣稱有孤兒
+    assert "orphan_position" not in ci._ROUND_FAILS    # 也不宣稱沒有（不記乾淨）
+    assert calls == [["account", "positions"]]         # 查失敗就停手，不再往下動
+    ps = json.loads((tmp_path / "pos.json").read_text(encoding="utf-8"))
+    assert ps["open"] == held                          # 既有倉一個字都不准改
+    ci._ROUND_FAILS.clear()
+
+
+def test_loop_blocks_new_order_when_orphan_same_symbol_same_side(tmp_path, monkeypatch):
+    """迴圈級：孤兒在場 ⇒ 同幣同向新單本輪不接、且不記 done（人工處理完可自然接上）。"""
+    placed, done = _arm_loop(tmp_path, monkeypatch, {}, "long",
+                             orphans=[("BTC-USDT-SWAP", "long")])
+    assert placed == []
+    assert "i-new" not in done
+
+
+def test_loop_still_places_when_orphan_is_opposite_side(tmp_path, monkeypatch):
+    """別擋過頭（一）：hedge 反向合法。"""
+    placed, _ = _arm_loop(tmp_path, monkeypatch, {}, "long",
+                          orphans=[("BTC-USDT-SWAP", "short")])
+    assert placed == ["i-new"]
+
+
+def test_loop_still_places_when_orphan_is_another_symbol(tmp_path, monkeypatch):
+    """別擋過頭（二）：別的幣的孤兒與本單無關。"""
+    placed, _ = _arm_loop(tmp_path, monkeypatch, {}, "long",
+                          orphans=[("ETH-USDT-SWAP", "long")])
+    assert placed == ["i-new"]
+
+
+def test_orphan_class_outranks_transport_classes_and_has_hint():
+    """孤兒只可能在『查詢成功』的輪被記到（⇒ 不可能洗掉斷流主因），
+    而它代表真錢部位脫帳 ⇒ 同輪多類故障時它要當代表。"""
+    assert ci._CLASS_PRIORITY.index("orphan_position") == 0
+    assert ci.worst_class({"orphan_position", "query_fail"}) == "orphan_position"
+    assert "orphan_position" in ci._CLASS_HINT
 
 
 def test_leverage_for_trade_risk_band_boundaries():
