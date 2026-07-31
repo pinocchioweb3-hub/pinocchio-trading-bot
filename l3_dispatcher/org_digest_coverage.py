@@ -28,6 +28,10 @@ py_compile → 測 → 單次乾淨重啟 → 驗 → 復原 watchdog）。真�
   today-k*cad]。不依賴 cron 的星期錨點，換排程日也不會整排錯位。
 • 某席**從未自產過** ⇒ 沒有基準，整席略過（不誤報）。
 • 該席**首份自產檔之前**的視窗一律不算缺（那時這席還沒上線，不該被追溯記過）。
+• r73：第 0 格（右端＝今天）**還沒走完**。這一格沒有自產檔時記為 `pending_period`
+  而非缺報——「尚未到期」是未知，不是「確認沒交」。代價是最新一期會晚一格才記上
+  （滾動視窗看不出班已經在格子裡跑過沒交），這符合本模組「寧可晚叫不可誤報」，
+  且**現況停擺本來就由檔齡制負責**。已經交了的第 0 格是確定事實，照算 hit。
 • 代補產（檔頭含「代補」）**單獨計一軌**：補的是內容，不是排程。一格若只有代補產檔，
   記為 backfill_only，不算該席自產有交。
 """
@@ -38,10 +42,10 @@ from datetime import date as _date
 from pathlib import Path
 
 from .ceo_oversight import (
-    ORG_BACKFILL_MARKER,
     ORG_DIGEST_DIR,
     ORG_HEADER_LINES,
     ORG_ROLE_CADENCE_DAYS,
+    is_backfill_header,
 )
 
 DEFAULT_LOOKBACK_PERIODS = 12
@@ -72,6 +76,7 @@ def coverage(dates_by_role: dict | None, *, today,
         first_self = self_dates[0]
 
         windows = []
+        pending = None
         for k in range(lookback_periods):
             hi = today - _td(k * cad)
             lo = today - _td((k + 1) * cad)
@@ -79,8 +84,19 @@ def coverage(dates_by_role: dict | None, *, today,
                 continue                  # 該席上線前的期別，不追溯記過
             has_self = any(lo < d <= hi for d in self_dates)
             has_bf = any(lo < d <= hi for d in bf_dates)
-            windows.append({"start": lo, "end": hi, "self": has_self,
-                            "backfill_only": (not has_self) and has_bf})
+            w = {"start": lo, "end": hi, "self": has_self,
+                 "backfill_only": (not has_self) and has_bf}
+            # r73：第 0 格的右端就是「今天」＝**這一期還沒走完**。沒有自產檔時，
+            #   事實是「尚未到期」（未知），不是「沒交」（確認沒有）——記成缺報
+            #   就是拿沒考完的試卷當不及格。CEO 節奏每天、排程 09:08 才跑，等於
+            #   每天 00:00–09:08 都被灌水 +1 期，且連缺數恆 ≥1＝慢性假警報。
+            #   ⛔ 只有「沒交」才轉 pending；已經交了的那格是確定的事實，照算 hit。
+            #   ⛔ 不可因此漏掉「今天真的沒交」——現況停擺由檔齡制
+            #      （org_digest_verdict）負責，期別制只管已結束的期別。
+            if k == 0 and not has_self:
+                pending = w
+                continue
+            windows.append(w)
         if not windows:
             continue
         windows.reverse()                 # 由舊到新，讀起來順
@@ -101,6 +117,13 @@ def coverage(dates_by_role: dict | None, *, today,
             "missed_windows": [(w["start"].isoformat(), w["end"].isoformat(),
                                 "代補產填過" if w["backfill_only"] else "全無")
                                for w in missed],
+            # r73：未到期的那一期不算缺報，但也**不准就這樣消失**——帳本會原樣夾帶
+            #   roles，留在這裡才分得出「這期還沒到」與「這期根本沒這一格」。
+            "pending_period": (
+                (pending["start"].isoformat(), pending["end"].isoformat(),
+                 "尚未到期·僅代補產填過" if pending["backfill_only"]
+                 else "尚未到期·尚無產出")
+                if pending else None),
         })
     out.sort(key=lambda x: (-x["missed"], x["role"]))
     return {"roles": out, "any_gap": any(x["missed"] for x in out)}
@@ -128,6 +151,9 @@ def render(cov: dict) -> str:
                 f"{a}~{b}［{why}］" for a, b, why in x["missed_windows"])
         else:
             s += "，無缺報"
+        if x.get("pending_period"):
+            a, b, why = x["pending_period"]
+            s += f"\n    本期（{a}~{b}）［{why}］——未走完，不計入上列數字"
         lines.append(s)
     return "\n".join(lines)
 
@@ -161,7 +187,9 @@ def scan_all(dirpath: Path | None = None) -> dict:
                     head = "".join(f.readline() for _ in range(ORG_HEADER_LINES))
             except Exception:
                 head = ""      # 讀不到檔頭就當自產（與既有口徑一致：寧可晚叫不可誤報）
-            res.setdefault(role, []).append((d, ORG_BACKFILL_MARKER in head))
+            # r73：用 is_backfill_header()（會剔除「非監督員代補」這種否定句），
+            #   與 ceo_oversight._read_org_digest_latest 保持同一口徑。
+            res.setdefault(role, []).append((d, is_backfill_header(head)))
     except Exception:
         return {}
     return res
@@ -196,12 +224,29 @@ def _selftest() -> bool:
     check("自產覆蓋率 2/4", d["coverage_text"] == "2/4")
 
     # --- 代補產單獨計一軌，不得洗成痊癒 -----------------------------------
+    # r73：代補產日期用 7/20（落在已結束的 (7/17, 7/24] 那格）。7/30 會落進「今天
+    # 這一格」，而那格 r73 起算 pending 不算期別——那件事由下一段專門驗。
     cad_pm = {"pm": ("產品總監週報", 7)}
-    pm_hist = {"pm": [(_date(2026, 7, 6), False), (_date(2026, 7, 30), True)]}
+    pm_hist = {"pm": [(_date(2026, 7, 6), False), (_date(2026, 7, 20), True)]}
     p = coverage(pm_hist, today=TODAY, cadence=cad_pm)["roles"][0]
     check("代補產不算該席自產有交", p["self_hits"] == 1)
     check("代補產另計一軌 backfill_only=1", p["backfill_only_hits"] == 1)
-    check("pm 近 4 期缺 3 期", p["missed"] == 3)
+    # r73：分母不含未走完的本期 ⇒ 3 期（原本 4 期含今天那格）、缺 2 期（原本 3）。
+    check("pm 已結束的 3 期裡缺 2 期", p["missed"] == 2 and p["periods"] == 3)
+
+    # --- r73：未到期的那一期是「未知」不是「沒交」 -------------------------
+    # CEO 節奏每天、排程 09:08 才跑 ⇒ 每天 00:00–09:08 舊碼都會多記一期缺報，
+    # 且連缺數恆 ≥1（天天準時交也會被寫成「缺 1 期」）＝慢性假警報。
+    cad_ceo = {"ceo": ("CEO 日報", 1)}
+    ceo_hist = {"ceo": [(_date(2026, 7, d0), False) for d0 in range(20, 31)]}
+    c = coverage(ceo_hist, today=TODAY, cadence=cad_ceo)["roles"][0]
+    check("天天準時交 → 未到期的今天不算缺報", c["missed"] == 0)
+    check("未到期的那期不進分母", c["coverage_text"] == "11/11")
+    check("但那一期沒有消失（pending_period 留著）",
+          c["pending_period"][:2] == ("2026-07-30", "2026-07-31"))
+    c2 = coverage({"ceo": ceo_hist["ceo"] + [(_date(2026, 7, 31), False)]},
+                  today=TODAY, cadence=cad_ceo)["roles"][0]
+    check("今天已經交了 → 那格是確定事實不是 pending", c2["pending_period"] is None)
 
     # --- 兩條不誤報守則 ---------------------------------------------------
     check("從未自產過的席次整席略過",
@@ -224,8 +269,11 @@ if __name__ == "__main__":
     import sys
     if "--selftest" in sys.argv:
         sys.exit(0 if _selftest() else 1)
-    from datetime import datetime, timezone
-    today = datetime.now(timezone.utc).date()
+    from datetime import datetime
+    # r73：用**本地日期**，與 daemon 呼叫端（ceo_oversight 傳 fromtimestamp().date()）
+    #   以及 digest 檔名/cron 的台北時間口徑一致。原本用 UTC ⇒ 每天 00:00–08:00 這支
+    #   CLI 會比帳本少算一天，拿它驗帳本會得到對不起來的數字（驗證工具本身失真）。
+    today = datetime.now().date()
     cov = coverage(scan_all(), today=today)
     if "--json" in sys.argv:
         print(json.dumps(cov, ensure_ascii=False, default=str, indent=2))

@@ -96,6 +96,39 @@ ORG_DIGEST_MISS_PERIODS = int(os.getenv("OVERSIGHT_ORG_DIGEST_MISS_PERIODS", "2"
 # 例如 CEO 日報會在表格裡描述別席的代補產狀態，那不代表 CEO 日報自己是代補的。
 ORG_BACKFILL_MARKER = "代補"
 ORG_HEADER_LINES = 12
+# r73：純子字串比對分不出「聲明」與**否定**。實測（2026-08-01）：CEO 席自產的
+# ceo-2026-07-31.md 檔頭寫「**本檔為 CEO 席自產**（非監督員代補）」——正因為它
+# 聲明自己「不是」代補產，反而被判成代補產。後果不只是數字難看：`_read_org_digest_latest`
+# 用它分流「各席最新自產」，該席新鮮度會憑空老一天，而檔齡制是**會把 state 壓成
+# STALLED** 的那一支 ⇒ 差一天就會對準時交件的席次發出假斷檔。
+# 判法：看 marker 前面一小段有沒有否定詞（否定詞一定在前，如「非監督員代補」）。
+# ⛔ 不可改成「整行含『非』就當否定」——pm-2026-07-30.md 的檔頭是
+#    「**監督員 Layer 2 代補產**，非 PM Session 自產」，否定詞在**後面**，
+#    那是如假包換的代補產，整行判會把它洗成自產＝缺報被蓋成痊癒（本 marker 的病根）。
+ORG_BACKFILL_NEGATIONS = ("非", "不是", "未")
+ORG_BACKFILL_LOOKBEHIND = 6
+
+
+def is_backfill_header(head: str) -> bool:
+    """檔頭是否**聲明**自己是監督員代補產（純函式，永不拋）。
+
+    只要有任何一個未被否定的 marker 出現就算代補產；全部都被否定才算自產。
+    """
+    try:
+        text = head or ""
+        start = 0
+        while True:
+            i = text.find(ORG_BACKFILL_MARKER, start)
+            if i < 0:
+                return False         # 沒出現過，或出現的全被否定 ⇒ 自產
+            # 只往回看同一行的一小段——跨行的「非」與本行的「代補」無關。
+            line_start = text.rfind("\n", 0, i) + 1
+            ctx = text[max(line_start, i - ORG_BACKFILL_LOOKBEHIND):i]
+            if not any(n in ctx for n in ORG_BACKFILL_NEGATIONS):
+                return True          # 有一個沒被否定 ⇒ 是代補產
+            start = i + len(ORG_BACKFILL_MARKER)
+    except Exception:
+        return False                 # 判不出來就當自產（沿用既有口徑：不誤報斷檔）
 
 
 # ===========================================================================
@@ -592,7 +625,7 @@ def _read_org_digest_latest() -> tuple:
                     head = "".join(f.readline() for _ in range(ORG_HEADER_LINES))
             except Exception:
                 head = ""      # 讀不到檔頭就當自產——寧可晚一期叫，不可誤報斷檔
-            tgt = bf_latest if ORG_BACKFILL_MARKER in head else self_latest
+            tgt = bf_latest if is_backfill_header(head) else self_latest
             if role not in tgt or d > tgt[role]:
                 tgt[role] = d
     except Exception:
@@ -1010,8 +1043,15 @@ def _selftest():
     check("代補產有被辨識出來(非空)", len(real_bf) > 0)
     check("代補產不混進自產表",
           all(real_self.get(k) != v for k, v in real_bf.items()))
-    # CEO 7/30 日報正文裡提到別席的「代補產」，不可因此被誤判成代補
-    check("正文提及代補不誤判(只看檔頭)", real_self.get("ceo") == _date(2026, 7, 30))
+    # CEO 日報正文裡提到別席的「代補產」，不可因此被誤判成代補（只看檔頭）
+    # r73：原本這條寫死 `== 7/30`，而 7/30 之所以是「最新自產」，正是因為 7/31 那份
+    #   被誤判成代補產（檔頭寫「**本檔為 CEO 席自產**（非監督員代補）」＝否定句被
+    #   當成聲明）。改成不綁死日期的兩條：7/31 那份不准出現在代補表、最新自產不得
+    #   早於 7/31。⛔ 不要再寫死成某一天，否則每天 09:08 新檔一落地這條就會紅。
+    check("正文提及代補不誤判(只看檔頭)", real_self.get("ceo") is not None)
+    check("r73：自產檔的『非監督員代補』否定句不得被判成代補產",
+          real_bf.get("ceo") != _date(2026, 7, 31)
+          and (real_self.get("ceo") or _date(2000, 1, 1)) >= _date(2026, 7, 31))
 
     # render 不爆
     r = render_nudge({**a3, "phase0": {"paper_n": 38, "paper_min": 100, "live_n": 0, "live_min": 30},

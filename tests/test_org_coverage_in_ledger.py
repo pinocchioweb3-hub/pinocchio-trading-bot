@@ -143,8 +143,15 @@ def test_garbage_shape_never_raises():
 
 
 def test_backfill_only_period_is_shown_separately():
-    """監督員代補產只補內容不補排程——不可把缺報洗成有交。"""
-    hist = {"pm": [(date(2026, 7, 6), False), (date(2026, 7, 30), True)]}
+    """監督員代補產只補內容不補排程——不可把缺報洗成有交。
+
+    r73 註：代補產日期由 7/30 改為 7/20。原因不是為了讓測試變綠——7/30 落在
+    「(7/25, 8/01]」這一格，而那一格的右端就是今天＝**尚未走完**，r73 起不再計為
+    缺報／代補產期，改以 `pending_period` 呈現（見 test_org_coverage_pending_period）。
+    本測試要釘的是「代補產不得被算成該席自產有交」這件事，把日期挪進一格**已結束**
+    的視窗才測得到它；同一件事在 pending 那一格另有專門測試把關。
+    """
+    hist = {"pm": [(date(2026, 7, 6), False), (date(2026, 7, 20), True)]}
     v = org_coverage_verdict(coverage(hist, today=TODAY,
                                       cadence={"pm": ("產品總監週報", 7)}))
     assert v["roles"][0]["backfill_only_hits"] == 1
