@@ -245,8 +245,10 @@ def test_dup_gate_pure_blocks_same_side_allows_opposite():
 
 
 def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True, orphans=(),
-              scan_failed=False):
-    """把主迴圈接到臨時目錄上跑一輪 --once（零網路、零下單）。回 (下單清單, done)。"""
+              scan_failed=False, ledger_raw=None, day_pnl=None):
+    """把主迴圈接到臨時目錄上跑一輪 --once（零網路、零下單）。回 (下單清單, done)。
+
+    ledger_raw＝直接寫進本地帳檔的原文（給 v163 的壞檔情境用；None＝正常 JSON）。"""
     outbox = tmp_path / "outbox"
     outbox.mkdir()
     intent = {"intent_id": "i-new", "symbol": "BTC", "inst_id": "BTC-USDT-SWAP",
@@ -255,7 +257,9 @@ def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True, orphans=
               "expires_at": (time.time() + 3600) * 1000}
     (outbox / "a.json").write_text(json.dumps(intent), encoding="utf-8")
     (tmp_path / "pos.json").write_text(
-        json.dumps({"open": open_map, "day_pnl": {}}), encoding="utf-8")
+        ledger_raw if ledger_raw is not None
+        else json.dumps({"open": open_map, "day_pnl": day_pnl or {}}),
+        encoding="utf-8")
     placed: list = []
     monkeypatch.setattr(ci, "OUTBOX", outbox)
     monkeypatch.setattr(ci, "STATE", tmp_path / "state.json")
@@ -647,6 +651,94 @@ def test_redaction_happens_before_truncation_not_after(monkeypatch, capsys):
     # 標記本身被 120 字元截斷成 "<key-id-r" 是無害的，不必完整；
     # 有它就證明「替換發生在截斷之前」——順序反了這裡會是原始 UUID 前半段。
     assert "<key-id-" in printed
+
+
+# ── v163（監督員 r54）本地部位帳：「讀失敗」不可再等於「確認空帳」 ────────────
+# 與 r53 修的孤兒閘同一物種，但下游更致命：同一個空值同時餵三個地方——
+#   ①breaker_tripped(day_pnl={}) ⇒ 日/週熔斷整個消失；
+#   ②dup_open_same_side(open={}) ⇒ 同幣同向擋單閘瞎掉；
+#   ③下單成功後拿這本空帳寫回檔案 ⇒ 既有倉與 14 天熔斷損益被永久抹掉。
+# 觸發條件不需要網路：舊 _save_positions 是非原子寫（先截斷再寫），行程在中途被殺
+# 就留下半截 JSON，之後每一輪都讀壞。
+
+_CORRUPT = '{"open": {"i-old": {"inst_id": "BTC-USDT-SWAP", "pos_'   # 被截斷的半截檔
+
+
+def test_ledger_read_failure_is_unknown_but_missing_file_is_empty(tmp_path, monkeypatch):
+    """型別要能表達『不知道』：壞檔回 None、檔案不存在（首跑）才是合法空帳。"""
+    ci._ROUND_FAILS.clear()
+    monkeypatch.setattr(ci, "POS_STATE", tmp_path / "pos.json")
+    assert ci._load_positions() == {"open": {}, "day_pnl": {}}   # 首跑：還沒有倉
+    (tmp_path / "pos.json").write_text(_CORRUPT, encoding="utf-8")
+    assert ci._load_positions() is None, "讀壞了不可與『確認沒有倉』同型"
+    assert "pos_state_unreadable" in ci._ROUND_FAILS, "無聲失敗＝沒有出口"
+    (tmp_path / "pos.json").write_text('["not", "a", "dict"]', encoding="utf-8")
+    assert ci._load_positions() is None, "結構不對也是未知，不可當空帳"
+    ci._ROUND_FAILS.clear()
+
+
+def test_loop_never_places_when_ledger_is_unreadable(tmp_path, monkeypatch):
+    """迴圈級（本輪主修）：帳本讀不到 ⇒ 熔斷口徑與同幣同向閘皆無資料 ⇒ 本輪不接新單，
+    且不記 done（帳本修好、intent 未過期就自然接上）。"""
+    ci._ROUND_FAILS.clear()
+    placed, done = _arm_loop(tmp_path, monkeypatch, {}, "long", ledger_raw=_CORRUPT)
+    assert placed == [], "看不見在場倉與今日損益時開新倉＝風險上限暫時不存在"
+    assert "i-new" not in done
+    ci._ROUND_FAILS.clear()
+
+
+def test_corrupt_ledger_is_never_overwritten_by_an_empty_one(tmp_path, monkeypatch):
+    """⛔ 最不可逆的一條：壞檔絕不可被『空帳＋這筆新倉』覆蓋掉——
+    那會把既有倉與近 14 天熔斷損益一起清零，且無聲。"""
+    ci._ROUND_FAILS.clear()
+    _arm_loop(tmp_path, monkeypatch, {}, "long", ledger_raw=_CORRUPT)
+    assert (tmp_path / "pos.json").read_text(encoding="utf-8") == _CORRUPT
+    ci._ROUND_FAILS.clear()
+
+
+def test_ledger_write_is_atomic_so_a_failed_write_keeps_the_old_file(tmp_path, monkeypatch):
+    """寫入失敗要留下**完整的舊檔**（而不是半截新檔），並回 False 讓呼叫端出聲。"""
+    ci._ROUND_FAILS.clear()
+    good = json.dumps({"open": {}, "day_pnl": {"2026-07-31": -1.0}})
+    (tmp_path / "pos.json").write_text(good, encoding="utf-8")
+    monkeypatch.setattr(ci, "POS_STATE", tmp_path / "pos.json")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+    monkeypatch.setattr(ci.os, "replace", boom)
+    assert ci._save_positions({"open": {"x": 1}, "day_pnl": {}}) is False
+    assert (tmp_path / "pos.json").read_text(encoding="utf-8") == good
+    assert "pos_state_write_fail" in ci._ROUND_FAILS
+    ci._ROUND_FAILS.clear()
+
+
+def test_ledger_write_success_returns_true_and_round_trips(tmp_path, monkeypatch):
+    """別擋過頭：正常寫入回 True、讀得回來。"""
+    ci._ROUND_FAILS.clear()
+    monkeypatch.setattr(ci, "POS_STATE", tmp_path / "pos.json")
+    assert ci._save_positions({"open": {}, "day_pnl": {"2026-07-31": -1.0}}) is True
+    assert ci._load_positions()["day_pnl"] == {"2026-07-31": -1.0}
+    assert not ci._ROUND_FAILS
+
+
+def test_ledger_write_failure_after_a_placed_order_is_loud(tmp_path, monkeypatch, capsys):
+    """單已送出但沒記進帳本＝下一輪的孤兒。這件事必須出聲，不可無聲吞掉。"""
+    ci._ROUND_FAILS.clear()
+    monkeypatch.setattr(ci, "_save_positions", lambda ps: False)
+    placed, _ = _arm_loop(tmp_path, monkeypatch, {}, "long")
+    assert placed == ["i-new"]
+    assert "🚨" in capsys.readouterr().out
+    ci._ROUND_FAILS.clear()
+
+
+def test_pos_state_classes_outrank_transport_classes_and_have_hints():
+    """本地帳壞掉不是『這輪送不出去』而是『風險上限暫時不存在』，且與網路無關、
+    修法完全不同（要人去看那個檔案）⇒ 同輪多類故障時它要蓋過傳輸類當代表。"""
+    for cls in ("pos_state_unreadable", "pos_state_write_fail"):
+        assert cls in ci._CLASS_PRIORITY and cls in ci._CLASS_HINT
+        assert (ci._CLASS_PRIORITY.index(cls)
+                < ci._CLASS_PRIORITY.index("auth_ip_whitelist"))
+    assert ci.worst_class({"pos_state_unreadable", "query_fail"}) == "pos_state_unreadable"
 
 
 def test_no_print_echoes_raw_okx_body_unredacted():

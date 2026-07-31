@@ -63,7 +63,12 @@ _BENIGN_MARKERS = ("51603", "doesn't exist", "does not exist")
 # orphan_position 排最前：它是唯一代表「真錢部位在交易所上、但已脫離本地帳」的類別，
 # 而且只有在「account positions 查詢成功」時才可能被記到（＝不可能發生在斷流輪，
 # 不會像 leverage_fail 那樣有洗掉斷流主因的疑慮）。見 r47。
-_CLASS_PRIORITY = ("orphan_position", "cli_missing", "auth_ip_whitelist", "auth",
+#
+# v163（r54）：pos_state_* 兩類排在傳輸類之前——本地帳壞掉會同時讓熔斷口徑與同幣同向
+# 閘失去資料（不是「這輪送不出去」，是「風險上限暫時不存在」），且與網路無關、
+# 不可能被斷流洗掉；修法也完全不同（要人去看那個檔案，不是等網路好）。
+_CLASS_PRIORITY = ("orphan_position", "pos_state_unreadable", "pos_state_write_fail",
+                   "cli_missing", "auth_ip_whitelist", "auth",
                    "rate_limit", "timeout", "leverage_fail", "query_fail", "other")
 _ROUND_FAILS: dict[str, str] = {}   # 本輪故障 {類別: 樣本}；每輪開頭清空
 # v151：本輪「成功呼叫數」；每輪開頭歸零。沒有它就無法分辨「全部呼叫都成功」
@@ -252,6 +257,13 @@ _CLASS_HINT = {
                        "不會逾時平倉、了結損益也不會進日/週熔斷口徑；但它的止損仍掛在"
                        "交易所，單筆風險仍受 SL 上限保護。請人工到 OKX 確認該倉並決定"
                        "是否平掉；在它消失前，同幣同向的新單會被自動擋下",
+    "pos_state_unreadable": "本地部位帳讀不到或內容壞掉（多半是寫到一半被中斷留下半截"
+                            "JSON）→ 熔斷口徑與同幣同向擋單閘在修好前都沒有資料，"
+                            "執行器已自動停接新單（既有倉的止損仍掛在交易所）。"
+                            "請人工檢查 atk_positions*.json；⛔ 不要直接刪掉——"
+                            "刪掉等於把在場倉與近 14 天熔斷損益一起清零",
+    "pos_state_write_fail": "本地部位帳寫不進去 → 剛送出的單可能沒記進帳本（下一輪會"
+                            "被當孤兒部位偵測到）。請確認磁碟空間／檔案沒被鎖住",
     "auth_ip_whitelist": "呼叫端 IP 不在 API key 白名單（住宅浮動 IP 換掉會復發）"
                          "→ 到 OKX 後台把下方錯誤訊息中的 IP 加進白名單，"
                          "消費器每分鐘自動重試、不需重啟",
@@ -453,19 +465,52 @@ def ensure_leverage(inst_id: str, pos_side: str, dry: bool,
 
 
 # ── 倉位管理（v139：對帳／逾時平倉／日虧熔斷） ──────────────────────────
-def _load_positions() -> dict:
+def _load_positions() -> dict | None:
+    """讀本地部位帳。回 None＝讀不到／讀壞了（**未知**）；⛔ 不可再當成「確認空帳」。
+
+    v163（監督員 r54）：舊版把任何例外都壓成 {"open": {}, "day_pnl": {}}，與 r53 修的
+    孤兒閘同一物種（把「查詢失敗」寫成「確認沒有」），但下游更致命——同一個空值同時
+    餵三個地方：①breaker_tripped 讀到空 day_pnl ⇒ 日/週熔斷整個消失，該停手的日子照
+    接新單；②dup_open_same_side 讀到空 open ⇒ 同幣同向擋單閘瞎掉、曝險無聲翻倍；
+    ③下單成功後 main() 會拿這本空帳寫回檔案 ⇒ 既有倉與 14 天熔斷損益被**永久抹掉**
+    （倉就此脫帳成孤兒）。這三條在同一輪一起發生，而且是無聲的。
+
+    「檔案還不存在」＝首跑，是真的空帳（合法）；JSON 壞掉／IO 錯／型別不對一律未知。
+    半截 JSON 不是理論風險：舊 _save_positions 是「先截斷再寫」的非原子寫，行程在
+    中途被殺（排程逾時／休眠／當機）就會留下壞檔（本機已有 utf16-corrupt 前例）。"""
     try:
-        return json.loads(POS_STATE.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return {"open": {}, "day_pnl": {}}
+        raw = json.loads(POS_STATE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"open": {}, "day_pnl": {}}          # 首跑：還沒有任何倉＝合法空帳
+    except Exception as e:  # noqa: BLE001
+        _note_fail("pos_state_unreadable",
+                   f"{POS_STATE.name} 讀取失敗：{type(e).__name__}: {e}")
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("open", {}), dict) \
+            or not isinstance(raw.get("day_pnl", {}), dict):
+        _note_fail("pos_state_unreadable", f"{POS_STATE.name} 內容結構不對")
+        return None
+    raw.setdefault("open", {})
+    raw.setdefault("day_pnl", {})
+    return raw
 
 
-def _save_positions(ps: dict) -> None:
+def _save_positions(ps: dict) -> bool:
+    """原子寫回本地部位帳。回 False＝沒寫成（呼叫端必須出聲，見 main）。
+
+    v163（監督員 r54）：①改「暫存檔＋os.replace」——非原子寫留下的半截 JSON 會讓
+    _load_positions 從此永遠讀壞（見上）。②失敗不再無聲吞掉：寫不進去＝剛送出的真錢
+    單沒進帳本，那筆倉下一輪就是孤兒，這件事必須有出口。"""
+    tmp = POS_STATE.with_name(POS_STATE.name + ".tmp")
     try:
-        POS_STATE.write_text(json.dumps(ps, ensure_ascii=False, indent=1),
-                             encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        pass
+        tmp.write_text(json.dumps(ps, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        os.replace(tmp, POS_STATE)
+        return True
+    except Exception as e:  # noqa: BLE001
+        _note_fail("pos_state_write_fail",
+                   f"{POS_STATE.name} 寫入失敗：{type(e).__name__}: {e}")
+        return False
 
 
 def _day_key(ts: float | None = None) -> str:
@@ -571,6 +616,12 @@ def manage_positions(dry: bool) -> list | None:
     擋單閘因此在查詢失敗的輪整個消失。呼叫端必須把 None 當「不接新單」。
     """
     ps = _load_positions()
+    if ps is None:
+        # v163（r54）：本地帳讀不到＝連「哪些倉是我的」都不知道 ⇒ 對帳／逾時平倉一律
+        #   不做（誤判會平掉不該平的、或把別人的損益記進熔斷），並回 None 讓主迴圈走
+        #   既有的「未知就不接新單」分支。既有倉的交易所端止損仍在，不會裸奔。
+        print("⛔ 本地部位帳讀取失敗（未知）——本輪不對帳、不平倉、不接新單（下輪重試）")
+        return None
     # v159（監督員 r47）：⛔ 不可再因「本地帳空」就提早返回——「只從本地帳出發」正是
     #   孤兒部位的結構盲點本身（規格 docs/2026-07-31-斷流期倉位保護-規格.md §4.2）。
     code, out = _okx(["account", "positions"])
@@ -828,7 +879,15 @@ def main() -> int:
         orphan_scan = manage_positions(a.dry_run)
         orphan_blind = orphan_scan is None
         orphan_keys = set(orphan_scan or [])
-        halted_today = breaker_tripped(_load_positions().get("day_pnl", {}))
+        # v163（r54）：本地帳是熔斷口徑與同幣同向閘的唯一資料源——讀不到就兩個閘都
+        #   瞎掉（day_pnl 空＝熔斷永不觸發、open 空＝併倉閘永不擋）。⛔ 勿寫成
+        #   `_load_positions() or {}`：那又把「未知」壓回「確認乾淨」。
+        ps_round = _load_positions()
+        ledger_blind = ps_round is None
+        if ledger_blind:
+            print("⛔ 本地部位帳讀取失敗——熔斷口徑與同幣同向閘皆無資料，本輪不接新單"
+                  "（既有倉的交易所端止損仍在）")
+        halted_today = breaker_tripped((ps_round or {}).get("day_pnl", {}))
         if halted_today:
             print(f"⛔ 日虧熔斷已觸發（≤ -{DAILY_STOP_USD:.0f} USDT）——今日不接新單，"
                   "既有倉位照常管理")
@@ -850,13 +909,22 @@ def main() -> int:
                 continue
             if halted_today:
                 continue                     # 熔斷日不接新單；intent 未記 done，明日過期自清
+            if ledger_blind:
+                continue                     # v163（r54）：帳本未知＝風險閘全瞎，不記 done、下輪重試
             # v154（監督員 r44・修A）：同幣同向已在場 → 本輪不接。
             #   OKX hedge mode 會把同幣同向併成交易所側單一部位，一筆 realizedPnl
             #   無法歸屬兩個 intent（v130 已在模擬盤實證：同筆 pnl 雙重記帳、
             #   R 虛增 +1.30），且曝險會在逐單檢查下無聲翻倍。
             #   反向不擋（hedge 雙向合法）。不記 done：比照熔斷日，
             #   倉平掉後 intent 若還沒過期就自然接上。
-            if dup_open_same_side(_load_positions().get("open", {}),
+            #   逐單重讀：同一輪內前一筆下單會改動帳本，後一筆必須看得到。
+            #   v163（r54）：輪中途才壞掉（例如上一筆寫到一半被殺）也要擋，不是只在輪首檢查。
+            ps_i = _load_positions()
+            if ps_i is None:
+                print(f"⏸ {iid} {intent.get('symbol')} 本地部位帳讀取失敗——本輪不接"
+                      "（下輪重試）")
+                continue
+            if dup_open_same_side(ps_i.get("open", {}),
                                   intent["inst_id"], intent["pos_side"]):
                 print(f"⏸ {iid} {intent.get('symbol')} 同幣同向已在場——本輪不接"
                       "（OKX hedge 併倉會使已實現損益無法歸屬兩單）")
@@ -887,12 +955,23 @@ def main() -> int:
                 done.add(iid)
                 if not a.dry_run:
                     ps = _load_positions()
-                    ps["open"][iid] = {"inst_id": intent["inst_id"],
-                                       "pos_side": intent["pos_side"],
-                                       "symbol": intent.get("symbol"),
-                                       "contracts": sz,
-                                       "placed_at": time.time()}
-                    _save_positions(ps)
+                    if ps is None:
+                        # v163（r54）：⛔ 絕不可拿空帳寫回——那會把既有倉與 14 天熔斷
+                        #   損益整本抹掉。上面的閘理論上已擋住，這裡是縱深防禦：真的走
+                        #   到了就出聲，那筆倉下一輪由孤兒閘接手（它的 SL 仍在交易所）。
+                        print(f"🚨 {iid} 已送出但本地帳讀不到、無法記帳——"
+                              "該倉下輪會被當孤兒偵測到，請人工到 OKX 確認")
+                        _note_fail("pos_state_unreadable",
+                                   f"{iid} 已下單但帳本讀取失敗、未記帳")
+                    else:
+                        ps["open"][iid] = {"inst_id": intent["inst_id"],
+                                           "pos_side": intent["pos_side"],
+                                           "symbol": intent.get("symbol"),
+                                           "contracts": sz,
+                                           "placed_at": time.time()}
+                        if not _save_positions(ps):
+                            print(f"🚨 {iid} 已送出但帳本寫入失敗——"
+                                  "該倉下輪會被當孤兒偵測到，請人工到 OKX 確認")
         state["done"] = sorted(done)[-500:]
         try:
             STATE.write_text(json.dumps(state), encoding="utf-8")
