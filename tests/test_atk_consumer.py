@@ -903,3 +903,89 @@ def test_done_state_write_success_returns_true_and_round_trips(tmp_path, monkeyp
     assert ci._load_state()["done"] == ["aaa"]
     assert not (tmp_path / "state.json.tmp").exists(), "暫存檔不可留下"
     assert not ci._ROUND_FAILS
+
+
+# ── v166（監督員 r57）：健康檔「寫不進去」＝告警層記不住事情 ──────────────
+def _arm_unwritable_health(tmp_path, monkeypatch):
+    """健康檔導到一個不存在的資料夾底下（寫必失敗、讀是合法首跑），
+    節流痕跡也導進 tmp（不污染真實暫存目錄）。回收到的告警文字清單。"""
+    monkeypatch.setattr(ci, "HEALTH", tmp_path / "nodir" / "health.json")
+    monkeypatch.setattr(ci, "DEGRADED_MARKER", tmp_path / "marker.ts", raising=False)
+    sent: list[str] = []
+    monkeypatch.setattr(ci, "send_alert",
+                        lambda text, dry=False: (sent.append(text), ("dry", None))[1])
+    return sent
+
+
+def test_frozen_counter_never_silences_the_alert_layer(tmp_path, monkeypatch):
+    """本輪主修：健康檔寫不進去 ⇒ 每輪都從舊值重數、**永遠**到不了 FAIL_ALERT_AFTER
+    ⇒ 一場真實斷流可以整場零通知（v164 治讀、這裡治寫，同一物種）。
+    舊碼只 print 一行到 log ⇒ 連續 5 輪 401 一封通知都沒有。"""
+    sent = _arm_unwritable_health(tmp_path, monkeypatch)
+    for i in range(5):
+        ci.finish_round({"auth_ip_whitelist": "401 ... not included in ..."},
+                        1000.0 + i * 60, dry=True)
+    assert sent, "計數凍結時完全不出聲＝告警層自己無聲死掉"
+    assert "健康檔寫不進去" in sent[0]
+    assert "不可信" in sent[0], "數字已不可信必須講清楚，否則使用者會照著讀"
+
+
+def test_degraded_notice_fires_even_on_a_clean_round(tmp_path, monkeypatch):
+    """不可以只在『這輪剛好有故障』時才講——記事本已經壞了本身就是事故，
+    等下一次故障才講，等到的時候已經沒有能力講了。"""
+    sent = _arm_unwritable_health(tmp_path, monkeypatch)
+    h = ci.finish_round({}, 1000.0, dry=True, oks=1)
+    assert h.get("health_write_failed") is True
+    assert h.get("degraded_alert_ts") == 1000.0
+    assert len(sent) == 1
+
+
+def test_degraded_notice_is_throttled_but_not_muted(tmp_path, monkeypatch):
+    """節流：一小時內只講一次（否則每分鐘一封＝使用者靜音＝又變回無聲）；
+    超過重複間隔就要再講一次（故障還在，不能只講開頭那一封）。"""
+    sent = _arm_unwritable_health(tmp_path, monkeypatch)
+    ci.finish_round({}, 1000.0, dry=True, oks=1)
+    ci.finish_round({}, 1060.0, dry=True, oks=1)
+    ci.finish_round({}, 1120.0, dry=True, oks=1)
+    assert len(sent) == 1, "冷卻內不可重複轟炸"
+    ci.finish_round({}, 1000.0 + ci.FAIL_ALERT_REPEAT_SEC + 1, dry=True, oks=1)
+    assert len(sent) == 2, "超過重複間隔仍要再提醒＝故障沒好就不能停口"
+
+
+def test_unreadable_throttle_marker_defaults_to_speaking_up(tmp_path, monkeypatch):
+    """⛔ 節流痕跡讀不到／寫不進去＝『不知道剛剛講過沒有』，
+    只能推 True（講）。推 False 就是拿沒有證據當作已經講過——同一個坑再踩一次。"""
+    sent = _arm_unwritable_health(tmp_path, monkeypatch)
+    monkeypatch.setattr(ci, "DEGRADED_MARKER", tmp_path / "nodir" / "marker.ts",
+                        raising=False)
+    assert ci.degraded_alert_due(1000.0) is True
+    assert ci.degraded_alert_due(1001.0) is True, "痕跡寫不進去時不可自行閉嘴"
+    ci.finish_round({}, 1000.0, dry=True, oks=1)
+    assert len(sent) == 1
+
+
+def test_degraded_notice_never_fires_while_health_writes_fine(tmp_path, monkeypatch):
+    """反向護欄：正常情況（寫得進去）永不出現降級通知，也不留旗標——
+    fail-closed 不等於可以亂吵。"""
+    _arm_health(tmp_path, monkeypatch)
+    monkeypatch.setattr(ci, "DEGRADED_MARKER", tmp_path / "marker.ts", raising=False)
+    sent: list[str] = []
+    monkeypatch.setattr(ci, "send_alert",
+                        lambda text, dry=False: (sent.append(text), ("dry", None))[1])
+    h = ci.finish_round({}, 1000.0, dry=True, oks=1)
+    assert not h.get("health_write_failed")
+    assert not h.get("degraded_alert_ts")
+    assert sent == []
+    assert not (tmp_path / "marker.ts").exists(), "沒事就不該留節流痕跡"
+
+
+def test_degraded_alert_text_redacts_key_ids_and_claims_no_performance(tmp_path):
+    """告警文字鐵則：不得洩漏 key-id（公開 repo／截圖風險），
+    也不得出現任何績效字樣（紅線③）。"""
+    # 佔位 UUID 一律 00000000 開頭（tools/secret_leak_scan.py 的約定，⛔勿改成真實樣式）
+    fake_key = "00000000-1111-4000-8000-000000000001"
+    txt = ci.degraded_alert_text({"profile": "live", "consecutive_fail_rounds": 7},
+                                 1000.0, f"OSError: key {fake_key}")
+    assert fake_key not in txt and "<key-id-redacted>" in txt
+    assert not any(w in txt for w in ("勝率", "報酬", "年化", "獲利"))
+    assert "交易路徑與風險閘不受影響" in txt

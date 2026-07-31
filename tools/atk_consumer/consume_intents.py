@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -75,9 +76,10 @@ _CLASS_PRIORITY = ("orphan_position", "pos_state_unreadable", "pos_state_write_f
                    "done_state_unreadable", "done_state_write_fail",
                    "cli_missing", "auth_ip_whitelist", "auth",
                    "rate_limit", "timeout", "leverage_fail", "query_fail",
-                   # v164：健康檔壞掉排在最後——它是告警層自己的內傷，永遠不該蓋掉
-                   # 同輪真正的交易故障當代表（否則使用者看到的主因會被換掉）
-                   "health_state_unreadable", "other")
+                   # v164/v166：健康檔壞掉（讀不到／寫不進去）排在最後——它是告警層
+                   # 自己的內傷，永遠不該蓋掉同輪真正的交易故障當代表（否則使用者
+                   # 看到的主因會被換掉）
+                   "health_state_unreadable", "health_state_write_fail", "other")
 _ROUND_FAILS: dict[str, str] = {}   # 本輪故障 {類別: 樣本}；每輪開頭清空
 # v151：本輪「成功呼叫數」；每輪開頭歸零。沒有它就無法分辨「全部呼叫都成功」
 # 與「這輪根本沒呼叫」——後者被當成乾淨輪會蓋出假痊癒（見 update_health）。
@@ -173,6 +175,17 @@ def verify_demo_profile() -> bool:
 
 
 # ── 健康狀態／告警（v143） ────────────────────────────────────────────
+# v166（r57）：健康檔「寫不進去」時的最後出口。
+# 健康檔是告警層自己的記事本：寫不進去 ⇒ consecutive_fail_rounds 停在舊值、
+# last_alert_ts 也落不了地 ⇒ 門檻（連 3 輪才告警）與冷卻（同類 1 小時）雙雙失效。
+# 最壞情況不是吵，是**啞**：若舊值是 0，之後每輪都從 0 數到 1、永遠到不了門檻，
+# 一場真實斷流可以整場沒有任何通知——與 v164 讀失敗同一物種，只是走寫入這條路。
+# 節流痕跡刻意放在系統暫存目錄（跟壞掉的資料目錄不同一個地方），寫不進去／讀不到
+# 一律視為「該講」——這條路徑上「沒有證據」永遠不可以推論成「不用講」。
+_HEALTH_WRITE_ERR: dict[str, str] = {}
+DEGRADED_MARKER = Path(tempfile.gettempdir()) / f"atk_health_write_fail_{PROFILE}.ts"
+
+
 def _load_health() -> dict | None:
     """讀健康檔。回 None＝主檔與備份都讀不到／壞掉（**未知**）；⛔ 不可再回 {}。
 
@@ -205,16 +218,19 @@ def _save_health(h: dict) -> bool:
     v164（監督員 r55）：①暫存檔＋os.replace——非原子寫留下的半截 JSON 正是上面
     _load_health 要防的壞檔來源本身。②另存 .bak：兩次分開的原子寫，行程被砍時
     最多壞掉其中一個，另一個仍是 last-known-good。③失敗不再完全無聲（印出來）。
-    ⚠️ 已知殘留缺口：寫得進去與否只進日誌，寫不進去時連續故障計數會停在舊值
-    （凍結而非歸零，方向仍是保守的）——待後續輪次處理。"""
+
+    v166（監督員 r57）：失敗原因存進 _HEALTH_WRITE_ERR 供 finish_round 組告警文字用
+    （回傳值仍是 bool，不動既有呼叫端）。"""
     tmp = HEALTH.with_name(HEALTH.name + ".tmp")
     body = json.dumps(h, ensure_ascii=False, indent=1)
     ok = False
+    _HEALTH_WRITE_ERR.pop("err", None)
     try:
         tmp.write_text(body, encoding="utf-8")
         os.replace(tmp, HEALTH)
         ok = True
     except Exception as e:  # noqa: BLE001
+        _HEALTH_WRITE_ERR["err"] = f"{type(e).__name__}: {str(e)[:160]}"
         print(f"⚠️ 健康檔寫入失敗（告警計數將停在舊值）：{type(e).__name__}: {e}")
     try:
         bak_tmp = HEALTH.with_name(HEALTH.name + ".bak.tmp")
@@ -326,6 +342,12 @@ _CLASS_HINT = {
                                "計數失去歷史，本輪已改為「有故障就直接告警」以免無聲。"
                                "多半是寫到一半被中斷；執行器會自動重寫一份好的，"
                                "下一輪起恢復正常冷卻。連續多輪出現才需人工看磁碟／權限",
+    "health_state_write_fail": "告警層自己的健康檔寫不進去 → 連續故障計數與冷卻時間都"
+                               "落不了地，告警門檻可能永遠到不了（＝真的斷流也可能"
+                               "不出聲）。請檢查 %LOCALAPPDATA%\\TradingBot 的磁碟空間、"
+                               "資料夾權限，以及是否被防毒／同步軟體鎖住；"
+                               "⛔ 不要直接刪掉 atk_consumer_*health.json——"
+                               "刪掉會讓「已持續多久」從零重數，低報斷流時長",
     "cli_missing": "okx CLI 不存在 → npm install -g @okx_ai/okx-trade-cli",
     "rate_limit": "被限流 → 通常自癒；持續出現才需降頻",
     "timeout": "呼叫逾時 → 檢查網路；持續出現代表對外連線有問題",
@@ -351,6 +373,45 @@ def alert_text(h: dict, now_s: float) -> str:
         f"錯誤原文：{(h.get('last_fail_sample') or '')[:200]}\n"
         f"⚠️ 期間未下任何單（fail-closed 正確），也未平既有倉——"
         f"這是「沒下單」不是「虧損」。"
+    )
+
+
+def degraded_alert_due(now_s: float,
+                       repeat_sec: float = FAIL_ALERT_REPEAT_SEC) -> bool:
+    """健康檔寫不進去時，這輪要不要出聲（best-effort 節流）。
+
+    ⛔ 節流痕跡讀不到／寫不進去一律回 True——寧可每輪吵，不可無聲：這條路徑存在的
+    唯一理由就是「告警層已經記不住事情了」，此時再用『沒看到痕跡』推論『剛講過』
+    就是同一個坑再踩一次。痕跡放在系統暫存目錄＝與壞掉的資料目錄分開，資料目錄被
+    鎖住／權限壞掉時仍能正常節流；整台機器磁碟滿了才會退化成每輪吵（那也是對的）。"""
+    due = True
+    try:
+        due = (now_s - float(DEGRADED_MARKER.read_text(encoding="utf-8").strip())
+               ) >= repeat_sec
+    except Exception:  # noqa: BLE001
+        due = True
+    if due:
+        try:
+            DEGRADED_MARKER.write_text(f"{now_s:.0f}", encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+    return due
+
+
+def degraded_alert_text(h: dict, now_s: float, err: str = "") -> str:
+    """告警層自我降級通知（純函式）。⛔只講告警可信度，不含任何績效宣稱。"""
+    streak = int(h.get("consecutive_fail_rounds", 0))
+    return (
+        f"🚨 告警層降級：健康檔寫不進去（profile={h.get('profile') or PROFILE}）\n"
+        f"連續故障計數無法落地，會停在舊值（目前記到第 {streak} 輪）——"
+        f"『連續幾輪／已持續多久』的數字在修好前都不可信。\n"
+        f"影響：①門檻可能永遠到不了＝真的斷流也可能一聲不吭；"
+        f"②冷卻也記不住＝同一則故障通知可能每輪重送；"
+        f"③恢復通知可能不會出現。\n"
+        f"⚠️ 交易路徑與風險閘不受影響（下單、熔斷、擋單各自獨立記帳）——"
+        f"壞掉的是「你會不會被通知」，不是「會不會亂下單」。\n"
+        f"處置：{_CLASS_HINT['health_state_write_fail']}\n"
+        f"錯誤原文：{redact_secrets(err)[:200]}"
     )
 
 
@@ -447,7 +508,21 @@ def finish_round(fails: dict, now_s: float | None = None,
                     f"分鐘才再提醒一次）" if h.get("last_alert_ts")
                     else f"（達 {FAIL_ALERT_AFTER} 輪才告警）")
             print(f"⚠️ 本輪故障 {sorted(fails)}；連續第 {streak} 輪{tail}")
-        _save_health(h)
+        if not _save_health(h):
+            # v166（r57）：寫不進去＝從這輪起計數與冷卻都記不住（見 DEGRADED_MARKER
+            # 上方註解）。此時**不能等門檻**——門檻本身就是靠這個檔案在數的，
+            # 等下去就是等一場永遠不會來的告警。改成直接出聲（每小時最多一次）。
+            h["health_write_failed"] = True
+            if degraded_alert_due(now_s):
+                ch, err = send_alert(
+                    degraded_alert_text(h, now_s, _HEALTH_WRITE_ERR.get("err", "")),
+                    dry=dry)
+                h["degraded_alert_ts"] = now_s
+                h["degraded_alert_channel"] = ch
+                print(f"🚨 告警層降級（健康檔寫不進去）——已通知，管道={ch}"
+                      + (f"，管道錯誤={err}" if err else ""))
+            else:
+                print("⚠️ 健康檔仍寫不進去（已在冷卻內，不重複通知）")
         return h
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ 健康狀態更新失敗（不影響交易路徑）：{type(e).__name__}: {e}")
