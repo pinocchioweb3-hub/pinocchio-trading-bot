@@ -96,6 +96,8 @@ def test_orphan_text_names_the_instrument():
     """人要去 OKX 找那筆倉，帳本必須講是哪一個。"""
     t = live_exec_verdict(ORPHAN, now_s=NOW)["text"]
     assert "WLFI-USDT-SWAP" in t
+    assert "11618 張" in t                       # 張數要在（人要照這個數字去核對）
+    assert t.count("孤兒部位") == 1              # 樣本原文的重複類別名前綴要去掉
 
 
 # --------------------------------------------------------------------------

@@ -77,6 +77,9 @@ USER_ACTIONABLE_FAIL_CLASSES = {
 EXPOSURE_FAIL_CLASSES = {
     "orphan_position": (
         "孤兒部位（交易所上有、本地部位帳沒有的真錢倉）",
+        # 樣本原文開頭會重複類別名（「孤兒部位 WLFI-… long …」）——只去掉這個重複前綴，
+        # ⛔ 其餘一字不動：識別欄位（instId／方向／張數）要與日誌可逐字比對。
+        "孤兒部位",
         "⛔ 這**不是**「沒下單所以沒風險」：那是一筆在場的真實**曝險**，"
         "不受自動管理（不會逾時平倉、了結損益不進日/週熔斷口徑），"
         "但它的交易所端止損仍掛著；管線其餘部分照常運作，只有**同幣同向**的新單被擋。"
@@ -298,10 +301,11 @@ def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
     cost = (f"；斷流期間已有 {dropped} 筆訊號逾時被**永久**丟棄（過期不補送，"
             f"修好也追不回來）" if dropped > 0 else "")
     if exposure:
-        label, detail = exposure
+        label, strip_prefix, detail = exposure
         # 哪一筆倉：人要拿著它去 OKX 找，帳本不講等於沒講。取樣本冒號前那段即為
         # 「孤兒部位 <instId> <side> <張數> 張」，⛔ 不重排格式（原文才是可比對的）。
         sample = str(health.get("last_fail_sample") or "").split("：")[0].strip()
+        sample = sample.removeprefix(strip_prefix).strip()
         which = f"（最近一筆：{sample}）" if sample else ""
         text = (f"真錢執行器{streak}偵測到{label}{which}{dur}——{detail}{mix_note}{cost}")
     elif known:
