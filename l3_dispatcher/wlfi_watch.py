@@ -226,6 +226,67 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                 elif not ref:
                     st["px_1h_ref"] = {"ts": now, "px": price}
 
+            # ── ②b 小時級深度卡（v180 使用者指定：幣安=WLFI最深池,接OI/大戶/taker）──
+            # 事件驅動（|ΔOI 1h|≥2% 或 |Δ價 1h|≥2% 或資費翻號）＋最少每 4h 一張心跳卡
+            hr_ref = st.get("hourly_ref") or {}
+            if now - (hr_ref.get("ts") or 0) >= 3600:
+                try:
+                    from market_intel_mcp.sources.binance_perp import get_binance_perp
+                    bsrc = get_binance_perp()
+                    boi = await bsrc.get_oi("WLFI", "1h", 26)
+                    bpos = await bsrc.get_positioning("WLFI", "1h", 3)
+                    btak = await bsrc.get_taker_ratio("WLFI", "1h", 7)
+                    oi_now = (boi or {}).get("latest")
+                    oi_1h = None
+                    srs = (boi or {}).get("series") or []
+                    if len(srs) >= 2 and srs[-2].get("value"):
+                        oi_1h = (srs[-1]["value"] / srs[-2]["value"] - 1) * 100
+                    tt = (bpos or {}).get("latest")
+                    tvols = [(s.get("buy_vol"), s.get("sell_vol"))
+                             for s in ((btak or {}).get("series") or [])
+                             if s.get("buy_vol") is not None]
+                    net1h = (tvols[-1][0] - tvols[-1][1]) if tvols else None
+                    px_chg = ((price / hr_ref["px"] - 1) * 100
+                              if price and hr_ref.get("px") else None)
+                    fr = mkt.get("funding_pct8h")
+                    fr_flip = (hr_ref.get("fr") is not None and fr is not None
+                               and (fr > 0) != (hr_ref["fr"] > 0))
+                    event = ((oi_1h is not None and abs(oi_1h) >= 2.0)
+                             or (px_chg is not None and abs(px_chg) >= 2.0)
+                             or fr_flip)
+                    heartbeat = now - (st.get("hourly_card_ts") or 0) >= 4 * 3600
+                    if (event or heartbeat) and tg:
+                        # 軋空燃料啟發式：OI升+價未漲+資費負=空方擁擠
+                        squeeze = (oi_1h is not None and oi_1h > 2
+                                   and (px_chg or 0) < 1 and (fr or 0) < 0)
+                        lines = ["🦅📊 <b>WLFI 小時深度（幣安池）</b>"
+                                 + ("　⚡事件" if event else "　♥心跳")]
+                        if price:
+                            lines.append(f"價 ${price:.5f}"
+                                         + (f"（1h {px_chg:+.1f}%）" if px_chg is not None else ""))
+                        if oi_now:
+                            lines.append(f"幣安OI {oi_now:,.0f} 枚"
+                                         + (f"（1h {oi_1h:+.1f}%）" if oi_1h is not None else ""))
+                        if tt:
+                            lines.append(f"大戶多空比 {tt:.2f}"
+                                         + ("（偏多）" if tt > 1.1 else "（偏空）" if tt < 0.9 else ""))
+                        if net1h is not None:
+                            lines.append(f"taker 1h 淨流 {net1h:+,.0f}"
+                                         + ("（買方主動）" if net1h > 0 else "（賣方主動）"))
+                        if fr is not None:
+                            lines.append(f"OKX 資費 {fr:+.4f}%/8h" + ("　🔁翻號" if fr_flip else ""))
+                        if squeeze:
+                            lines.append("🧨 軋空燃料觀察：OI升+價滯+負資費=空方擁擠（觀察非預測）")
+                        lines.append("<i>幣安+OKX 雙池觀察·非訊號</i>")
+                        try:
+                            await tg.send_message("\n".join(lines), parse_mode="HTML")
+                            st["hourly_card_ts"] = now
+                        except Exception:  # noqa: BLE001
+                            pass
+                    st["hourly_ref"] = {"ts": now, "px": price, "fr": fr}
+                except Exception as e:  # noqa: BLE001
+                    print(f"[wlfi] hourly 深度失敗（下小時再試）：{type(e).__name__}: {e}")
+
             # ── ③ 每日日報（09:30 台北 = 01:30 UTC；poll 窗內只發一次）──
             tpe_now = time.gmtime(now + 8 * 3600)
             day_key = time.strftime("%Y-%m-%d", tpe_now)

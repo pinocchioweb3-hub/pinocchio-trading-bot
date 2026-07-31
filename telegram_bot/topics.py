@@ -39,6 +39,8 @@ TOPIC_DEFS = [
     #                                     未 provision thread_id 前 router.client 優雅落 General/主聊）
     ("wlfi",      "🦅 WLFI 專屬追蹤"),   # v179：鏈上大額轉帳/行情劇變/每日日報（display_only,
     #                                     使用者 2026-08-01 指定;thread_id 已 provision=11775）
+    ("alt20",     "💎 山寨抄底·現貨Top20"),  # v180：20檔賽道名單每日深度卡+大跌雷達
+    #                                     （display_only;thread_id=11807）
 ]
 
 # v36 已退役（migrate 後關閉封存）的舊 key → 內容去向：
