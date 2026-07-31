@@ -72,7 +72,22 @@ async def run_ip_watch_loop(tg=None, poll_seconds: int = _POLL_S):
                         except Exception as e:  # noqa: BLE001
                             print(f"[ip_watch] TG 告警失敗：{type(e).__name__}: {e}")
                 if old != ip:
-                    _save({"ip": ip, "changed_at": time.time()})
+                    # ⛔ 首輪基線 vs 真的輪換：光看 changed_at 分不出來——哨兵第一次
+                    # 開機也會寫一個「剛剛」的 changed_at。r78 監督員差點據此推出
+                    # 「IP 在 01:41 換過」的假結論（實際是 v176 上線後的基線寫入）。
+                    # 判據是 rotations：==0 ⇒ 從未觀測到輪換，不論 changed_at 幾點。
+                    st = {
+                        "ip": ip,
+                        "changed_at": time.time(),
+                        "baseline": not old,
+                        "rotations": int(st.get("rotations") or 0) + (1 if old else 0),
+                    }
+                # 每輪都落 last_seen_at：舊碼只在「變更時」寫檔 ⇒「IP 穩定沒變」與
+                # 「哨兵已死」在檔案上長得一模一樣，判活只能靠 mtime＝代理值當事實。
+                # 缺 rotations/baseline 鍵者＝v180 之前的舊紀錄，一律讀作「未知」，
+                # ⛔ 不得補寫 0 冒充「已證實沒輪換」。
+                st["last_seen_at"] = time.time()
+                _save(st)
         except Exception as e:  # noqa: BLE001
             print(f"[ip_watch] loop 例外（不致命）：{type(e).__name__}: {e}")
         await asyncio.sleep(max(120, int(poll_seconds)))
