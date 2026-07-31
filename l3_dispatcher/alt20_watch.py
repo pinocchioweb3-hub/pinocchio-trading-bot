@@ -68,8 +68,21 @@ async def read_symbol(client: httpx.AsyncClient, sym: str) -> dict | None:
     k = await _okx_pub(client, f"/api/v5/market/candles?instId={inst}&bar=1D&limit=300")
     if len(k) < 30:
         return None
-    closes = [float(c[4]) for c in reversed(k)]
+    kk = list(reversed(k))
+    closes = [float(c[4]) for c in kk]
+    highs = [float(c[2]) for c in kk]
+    lows = [float(c[3]) for c in kk]
+    vols = [float(c[5]) for c in kk]
     px = closes[-1]
+    # v182：波動壓縮（DCA 友善窗指標）——近14日振幅 vs 近60日中位振幅
+    def _rng(i0, i1):
+        return (max(highs[i0:i1]) - min(lows[i0:i1])) / closes[i1 - 1] * 100
+    compress = None
+    if len(closes) >= 74:
+        r14 = _rng(-14, len(closes))
+        r14s = [_rng(i - 14, i) for i in range(len(closes) - 60, len(closes), 5)]
+        med = sorted(r14s)[len(r14s) // 2] if r14s else None
+        compress = bool(med and r14 < med * 0.7)
     ma200 = sum(closes[-200:]) / min(200, len(closes))
     ath = max(float(c[2]) for c in k)
     mayer = px / ma200 if ma200 else None
@@ -94,7 +107,34 @@ async def read_symbol(client: httpx.AsyncClient, sym: str) -> dict | None:
                  1 if px < ma200 else 0])
     return {"sym": sym, "px": px, "mayer": mayer, "ath_dd": (px / ath - 1) * 100,
             "chg24": chg24, "funding": fr, "oi_chg": oi_chg,
-            "zone": zone, "score": score}
+            "zone": zone, "score": score, "compress": compress,
+            "highs": highs, "lows": lows, "closes": closes, "vols": vols}
+
+
+def ignition_signals(highs: list, lows: list, closes: list, vols: list,
+                     oi_chg, chg24, fr_now, fr_prev, tt_now, tt_prev) -> list[str]:
+    """點火偵測（純函式,v182）：八項起漲前兆,回命中清單。
+    設計依據=使用者四指標(大戶比↑/OI↑/流動性獵取/放量)+四補強(資費翻正/
+    收復20日高/量能翻倍/大戶比躍升幅度化)。全部啟發式,display_only。"""
+    sig = []
+    if len(closes) >= 25:
+        prior_low = min(lows[-21:-1])
+        if lows[-1] < prior_low and closes[-1] > prior_low:
+            sig.append("🪤 流動性獵取完成（掃 20 日低後收回=SMC Spring 型）")
+        vma20 = sum(vols[-21:-1]) / 20
+        if vma20 > 0 and vols[-1] >= 2 * vma20:
+            if closes[-1] > max(closes[-21:-1]):
+                sig.append("📈 放量突破 20 日高（Wyckoff SOS 型,量 2 倍+）")
+            elif closes[-1] > closes[-2]:
+                sig.append("🔊 低位放量收漲（量 2 倍+,吸籌活動跡象）")
+    if oi_chg is not None and chg24 is not None and oi_chg > 5 and chg24 > 3:
+        sig.append(f"🏗 OI+價齊升（OI {oi_chg:+.0f}%/價 {chg24:+.1f}%=健康堆倉）")
+    if (tt_now is not None and tt_prev is not None and tt_prev > 0
+            and tt_now / tt_prev >= 1.15):
+        sig.append(f"🐋 大戶多空比躍升（{tt_prev:.2f}→{tt_now:.2f},+15%+）")
+    if fr_now is not None and fr_prev is not None and fr_prev < 0 <= fr_now:
+        sig.append("🔁 資費由負翻正（空方擁擠解除）")
+    return sig
 
 
 def render_row(r: dict) -> str:
@@ -102,7 +142,7 @@ def render_row(r: dict) -> str:
     stars = "★" * r["score"] + "☆" * (4 - r["score"])
     return (f"{z} <b>{r['sym']}</b>({LANES.get(r['sym'], '?')}) "
             f"${r['px']:.4g}　距ATH {r['ath_dd']:+.0f}%　Mayer {r['mayer']:.2f}　"
-            f"合流 {stars}")
+            f"合流 {stars}" + ("　💤壓縮" if r.get("compress") else ""))
 
 
 _DISC = ("<i>⚠️ 誠實聲明：合流分=啟發式「定位」非預測；加密週期樣本結構上永不"
@@ -147,12 +187,62 @@ async def run_alt20_loop(tg=None, poll_seconds: int = POLL_S):
                     top = [r["sym"] for r in reads if r["score"] >= 3][:5]
                     if top:
                         lines.append(f"\n🎯 今日合流 ≥3★：{', '.join(top)}")
+                    # v182：DCA 友善窗＝價值帶＋波動壓縮（安靜的低位=分批建倉統計上較舒服）
+                    dca = [r["sym"] for r in reads
+                           if r["zone"] in ("深度價值", "價值") and r.get("compress")]
+                    if dca:
+                        lines.append(f"🧺 DCA 友善窗（價值帶＋波動壓縮）：{', '.join(dca)}")
                     lines.append(_DISC)
                     try:
                         await tg.send_message("\n".join(lines), parse_mode="HTML")
                         st["digest_day"] = day_key
                     except Exception:  # noqa: BLE001
                         pass
+                # ── 🚀 點火偵測（每 2h 全名單掃描,≥2 項命中才推=防噪）──
+                if now - (st.get("ignition_ts") or 0) >= 7200 and tg:
+                    ig_alerted = st.get("ignition_alerted", {})
+                    prevs = st.get("ignition_prev", {})
+                    try:
+                        from market_intel_mcp.sources.binance_perp import get_binance_perp
+                        bsrc = get_binance_perp()
+                    except Exception:  # noqa: BLE001
+                        bsrc = None
+                    for s in UNIVERSE:
+                        r = await read_symbol(client, s)
+                        if not r:
+                            continue
+                        tt_now = None
+                        if bsrc:
+                            try:
+                                bp = await bsrc.get_positioning(s, "1d", 3)
+                                tt_now = (bp or {}).get("latest")
+                            except Exception:  # noqa: BLE001
+                                tt_now = None
+                        pv = prevs.get(s, {})
+                        sigs = ignition_signals(
+                            r["highs"], r["lows"], r["closes"], r["vols"],
+                            r.get("oi_chg"), r.get("chg24"),
+                            r.get("funding"), pv.get("fr"),
+                            tt_now, pv.get("tt"))
+                        prevs[s] = {"fr": r.get("funding"), "tt": tt_now}
+                        if len(sigs) >= 2 and ig_alerted.get(s) != day_key:
+                            try:
+                                await tg.send_message(
+                                    f"🚀 <b>點火偵測</b> <b>{s}</b>"
+                                    f"（{LANES.get(s, '?')}）${r['px']:.4g}\n"
+                                    + "\n".join(f"• {x}" for x in sigs)
+                                    + f"\n合流分 {'★' * r['score']}{'☆' * (4 - r['score'])}"
+                                      f"　{r['zone']}帶\n" + _DISC,
+                                    parse_mode="HTML")
+                                ig_alerted[s] = day_key
+                            except Exception:  # noqa: BLE001
+                                pass
+                        await asyncio.sleep(0.3)
+                    st["ignition_prev"] = prevs
+                    st["ignition_alerted"] = {k: v for k, v in ig_alerted.items()
+                                              if v == day_key}
+                    st["ignition_ts"] = now
+
                 # ── 大跌雷達（30min）──
                 alerted = st.get("drop_alerted", {})
                 for s in UNIVERSE:

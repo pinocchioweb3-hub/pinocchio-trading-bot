@@ -52,10 +52,19 @@ class BinancePerpSource:
             await self._client.aclose()
             self._client = None
 
+    # v182：幣安對微價幣用「1000 前綴」合約（PEPEUSDT 不存在,只有 1000PEPEUSDT）。
+    # 缺映射時這些幣的備援全打空→OI $0/多空比 None（2026-08-01 PEPE 卡活案例）。
+    # 比率類(資費/多空比/OI變化%)不受 1000 倍計價影響;絕對量消費端須知悉單位差。
+    _THOUSAND = {"PEPE", "SHIB", "BONK", "FLOKI", "SATS", "LUNC", "XEC",
+                 "RATS", "WHY", "CHEEMS", "CAT", "MOG", "X"}
+
     @staticmethod
     def _sym(symbol: str) -> str:
-        """canonical 'BTC' → 'BTCUSDT'（USDⓈ-M 永續）"""
-        return f"{normalize(symbol)}USDT"
+        """canonical 'BTC' → 'BTCUSDT'（USDⓈ-M 永續）；微價幣 → '1000XXXUSDT'。"""
+        base = normalize(symbol)
+        if base in BinancePerpSource._THOUSAND:
+            return f"1000{base}USDT"
+        return f"{base}USDT"
 
     @staticmethod
     def _stat_period(interval: str) -> str:
