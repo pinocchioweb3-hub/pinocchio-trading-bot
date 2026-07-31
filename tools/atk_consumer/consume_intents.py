@@ -442,7 +442,12 @@ def ensure_leverage(inst_id: str, pos_side: str, dry: bool,
     if code == 0:
         _LEV_SET.add(key)
         return True
-    print(f"⚠️ 設槓桿失敗 {inst_id}/{pos_side}（應設 {lev}x）：{out[:120]}")
+    # v160（監督員 r48）：OKX 401 原文含 API key-id，print 這條路徑原本沒過遮蔽
+    # ⇒ 斷流期每輪都把明文 key-id 寫進 atk_live.log（實測已累積 1436 行）。
+    # ⚠️ 順序不可顛倒：先遮蔽再截斷。反過來會把 UUID 從中間切斷、正則失配，
+    # 反而漏出半截 key-id。三處回顯 OKX 原文的輸出點同此規則（見同名回歸鎖）。
+    print(f"⚠️ 設槓桿失敗 {inst_id}/{pos_side}（應設 {lev}x）："
+          f"{redact_secrets(out)[:120]}")
     _note_fail("leverage_fail", f"{inst_id}/{pos_side} 應設 {lev}x 失敗：{out}")
     return False
 
@@ -620,7 +625,7 @@ def manage_positions(dry: bool) -> list:
                               "--posSide", rec["pos_side"], "--autoCxl"])
             print(("⏱ 逾時平倉已送出 " if code == 0 else "❌ 逾時平倉失敗 ")
                   + f"{rec['inst_id']}（持有 {(now_s - rec['placed_at']) / 3600:.1f}h）"
-                  + ("" if code == 0 else f"：{out[:120]}"))
+                  + ("" if code == 0 else f"：{redact_secrets(out)[:120]}"))
             # 不立即移出：下輪對帳確認消失後才記損益
     # 舊日損益只留 14 天
     ps["day_pnl"] = {k: v for k, v in ps["day_pnl"].items()
@@ -743,7 +748,7 @@ def place(intent: dict, sz: float, dry: bool,
         all_ok = all_ok and ok
         print(("✅" if ok else "❌")
               + f" {intent['inst_id']} {intent['side']} 腿{i + 1}/{len(legs)} "
-              f"sz={leg_sz} tp={tp_px} → {out[:160]}")
+              f"sz={leg_sz} tp={tp_px} → {redact_secrets(out)[:160]}")
     return all_ok
 
 

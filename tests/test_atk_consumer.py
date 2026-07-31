@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """ATK 消費腳本純函式測試（v139 倉位管理迴圈）。零網路、零 OKX 呼叫。"""
+import ast
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -576,3 +578,52 @@ def test_leverage_for_trade_risk_band_boundaries():
     assert ci.leverage_for_trade(100.0, 90.0, 20) == 7        # 止損 10%
     assert ci.leverage_for_trade(100.0, 70.0, 20) == 3        # 止損 30% → 下限 3
     assert ci.leverage_for_trade(0.0, 0.0, 20) == 5           # 缺值 → min(上限,5)
+
+
+# ── v160（監督員 r48）日誌洩密：印給人看的那條路徑從沒過遮蔽 ──────────────
+# 實證：斷流期間 atk_live.log 累積 1436 行含未遮蔽 API key-id（單一 key、全部
+# 來自「設槓桿失敗」那行），遮蔽標記 0 行——redact_secrets 只掛在寫健康檔的
+# _note_fail 上。日誌本身在資料目錄不在 repo，但只要有人把片段貼進 issue／
+# docs／commit 訊息就外洩，而日誌是長期保存的＝明文永久落檔。
+
+def test_leverage_fail_log_line_masks_key_id_but_keeps_ip(monkeypatch, capsys):
+    """印出去的那一行要遮 key-id、留 IP（IP 是使用者補白名單唯一有用的資訊）。"""
+    ci._LEV_SET.clear(); ci._ROUND_FAILS.clear()
+    monkeypatch.setattr(ci, "_okx", lambda args, timeout=30: (1, _LEV_401))
+    assert ci.ensure_leverage("BTC-USDT-SWAP", "long", dry=False, lev=7) is False
+    printed = capsys.readouterr().out
+    assert "00000000-0000-4000-8000-000000000000" not in printed
+    assert "<key-id-redacted>" in printed
+    assert "203.0.113.7" in printed
+
+
+def test_redaction_happens_before_truncation_not_after(monkeypatch, capsys):
+    """順序回歸鎖：先截斷再遮蔽會把 UUID 切一半、正則失配 ⇒ 漏出半截 key-id。
+    構造一則「UUID 剛好跨過 120 字元截斷點」的錯誤訊息來釘住順序。"""
+    uuid = "00000000-0000-4000-8000-000000000000"
+    err = "x" * 110 + " " + uuid + " tail"          # UUID 起於第 111 字元
+    ci._LEV_SET.clear(); ci._ROUND_FAILS.clear()
+    monkeypatch.setattr(ci, "_okx", lambda args, timeout=30: (1, err))
+    ci.ensure_leverage("BTC-USDT-SWAP", "long", dry=False, lev=7)
+    printed = capsys.readouterr().out
+    # 半截也算洩：key-id 前 8 碼足以指認是哪一把金鑰
+    assert uuid[:8] not in printed
+    # 標記本身被 120 字元截斷成 "<key-id-r" 是無害的，不必完整；
+    # 有它就證明「替換發生在截斷之前」——順序反了這裡會是原始 UUID 前半段。
+    assert "<key-id-" in printed
+
+
+def test_no_print_echoes_raw_okx_body_unredacted():
+    """結構鎖：模組內任何 print() 只要把 OKX 回傳文字（out／body）塞進輸出，
+    就必須先過 redact_secrets——擋的是「以後又加一條沒遮蔽的 print」這種漂移。"""
+    src = Path(ci.__file__).read_text(encoding="utf-8")
+    bad = []
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name) and node.func.id == "print"):
+            continue
+        seg = ast.get_source_segment(src, node) or ""
+        if (re.search(r"\{\s*(out|body)(?![A-Za-z0-9_])", seg)
+                and "redact_secrets" not in seg):
+            bad.append(seg[:100])
+    assert not bad, f"未遮蔽就回顯 OKX 原文的 print：{bad}"
