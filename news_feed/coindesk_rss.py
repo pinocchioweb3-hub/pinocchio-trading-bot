@@ -85,22 +85,22 @@ async def run_coindesk_loop(tg, poll_seconds: int = POLL_S):
                 if pushed >= MAX_PUSH_PER_CYCLE:
                     break
                 pid = _post_id(it["guid"], it["title"])
-                if already_seen(source=SOURCE, post_id=pid):
+                if already_seen(source=SOURCE, handle="coindesk", post_id=pid):
                     continue
                 if it["pub_ts"] and now - it["pub_ts"] > MAX_AGE_S:
-                    mark_seen(source=SOURCE, post_id=pid, push_reason="too_old")
+                    mark_seen(source=SOURCE, handle="coindesk", post_id=pid, push_reason="too_old")
                     continue
                 text = f"{it['title']}. {it['desc'][:400]}"
                 if is_low_content(text):
-                    mark_seen(source=SOURCE, post_id=pid, push_reason="low_content")
+                    mark_seen(source=SOURCE, handle="coindesk", post_id=pid, push_reason="low_content")
                     continue
                 if _is_dup_story(it["title"], recent_titles):
-                    mark_seen(source=SOURCE, post_id=pid, push_reason="dup_story")
+                    mark_seen(source=SOURCE, handle="coindesk", post_id=pid, push_reason="dup_story")
                     continue
                 llm = await classify_and_translate("coindesk", "加密新聞", text)
                 if not llm or not llm.get("relevant") or \
                         (llm.get("importance", 0) or 0) < MIN_IMPORTANCE:
-                    mark_seen(source=SOURCE, post_id=pid,
+                    mark_seen(source=SOURCE, handle="coindesk", post_id=pid,
                               push_reason=f"filtered:{(llm or {}).get('importance')}")
                     continue
                 zh = _esc(llm.get("summary_zh") or it["title"])
@@ -110,7 +110,7 @@ async def run_coindesk_loop(tg, poll_seconds: int = POLL_S):
                 try:
                     await tg.send_message(msg, parse_mode="HTML",
                                           disable_web_page_preview=True)
-                    mark_seen(source=SOURCE, post_id=pid, push_reason="pushed")
+                    mark_seen(source=SOURCE, handle="coindesk", post_id=pid, pushed=True, push_reason="pushed")
                     recent_titles.append(it["title"])   # 同輪內也去重
                     pushed += 1
                 except Exception as e:  # noqa: BLE001

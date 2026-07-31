@@ -141,15 +141,15 @@ async def run_okx_news_loop(tg, poll_seconds: int = POLL_S):
                     if pushed >= MAX_PUSH_PER_CYCLE:
                         break
                     pid = _item_id(it)
-                    if already_seen(source=SOURCE, post_id=pid):
+                    if already_seen(source=SOURCE, handle="okx", post_id=pid):
                         continue
                     if now_ms - _ts_ms(it) > MAX_AGE_S * 1000:
-                        mark_seen(source=SOURCE, post_id=pid,
+                        mark_seen(source=SOURCE, handle="okx", post_id=pid,
                                   push_reason="too_old")
                         continue
                     try:
                         await tg.send_message(render_card(it), parse_mode="HTML")
-                        mark_seen(source=SOURCE, post_id=pid, push_reason="pushed")
+                        mark_seen(source=SOURCE, handle="okx", post_id=pid, pushed=True, push_reason="pushed")
                         pushed += 1
                     except Exception as e:  # noqa: BLE001
                         print(f"[okx_news] 推送失敗（下輪重試）：{type(e).__name__}: {e}")
