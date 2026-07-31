@@ -560,23 +560,27 @@ def _realized_pnl_since(inst_id: str,
         return None
 
 
-def manage_positions(dry: bool) -> list:
+def manage_positions(dry: bool) -> list | None:
     """每輪管理：①反向對帳（交易所有、本地帳沒有＝孤兒部位）②對帳（OKX 上已消失＝
     TP/SL 已了結→記日損益）③逾時強平。任何查詢失敗→本輪什麼都不做（下輪重試）。
 
     回 [(inst_id, pos_side), ...]＝本輪偵測到的孤兒，給主迴圈擋同幣同向新單。
+    v162（監督員 r53）三態回傳：list＝掃描有跑成（空清單＝**確認**沒有孤兒）；
+    None＝這輪根本查不到交易所部位（未知）。⛔ 兩者不可再合用 []——r47 只把
+    「查不到 ≠ 沒有孤兒」做在函式內（不記健康帳），下游讀到 [] 仍當成確認乾淨，
+    擋單閘因此在查詢失敗的輪整個消失。呼叫端必須把 None 當「不接新單」。
     """
     ps = _load_positions()
     # v159（監督員 r47）：⛔ 不可再因「本地帳空」就提早返回——「只從本地帳出發」正是
     #   孤兒部位的結構盲點本身（規格 docs/2026-07-31-斷流期倉位保護-規格.md §4.2）。
     code, out = _okx(["account", "positions"])
     if code != 0 or not out.strip().startswith(("[", "{")):
-        return []                                # 查不到就不動，別誤判平倉
+        return None                              # 查不到就不動，別誤判平倉（未知）
     try:
         plist = json.loads(out)
         plist = plist if isinstance(plist, list) else plist.get("data", [])
     except Exception:  # noqa: BLE001
-        return []                                # 解析不了＝等同查不到（fail-closed）
+        return None                              # 解析不了＝等同查不到（fail-closed）
     # 反向對帳：⛔ 不自動平倉、⛔ 不自動收編進本地帳（理由見規格 §4.2）——
     # 只記健康帳（讓既有的連續輪告警機制自然接手）＋擋同幣同向新單。
     orphans = orphan_positions(plist, ps.get("open") or {})
@@ -818,7 +822,12 @@ def main() -> int:
         _ROUND_OKS["ok"] = 0             # v151：成功帳同步歸零（分辨空轉輪用）
         # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
         # v159（r47）：manage_positions 同時做反向對帳，回本輪的孤兒部位鍵
-        orphan_keys = set(manage_positions(a.dry_run) or [])
+        # v162（r53）：None＝本輪掃描沒跑成（查不到交易所部位）⇒ 擋單閘等於瞎掉，
+        #   本輪一律不接新單（既有倉照常管理）。⛔ 勿再寫 `... or []`：那會把
+        #   「未知」壓成「確認乾淨」，正是本輪要修的破口。
+        orphan_scan = manage_positions(a.dry_run)
+        orphan_blind = orphan_scan is None
+        orphan_keys = set(orphan_scan or [])
         halted_today = breaker_tripped(_load_positions().get("day_pnl", {}))
         if halted_today:
             print(f"⛔ 日虧熔斷已觸發（≤ -{DAILY_STOP_USD:.0f} USDT）——今日不接新單，"
@@ -859,6 +868,13 @@ def main() -> int:
             if (intent["inst_id"], intent["pos_side"]) in orphan_keys:
                 print(f"⏸ {iid} {intent.get('symbol')} 同幣同向有孤兒部位在交易所上"
                       "——本輪不接（先人工確認那筆脫帳的倉）")
+                continue
+            # v162（監督員 r53）：本輪查不到交易所部位 ⇒ 無法確認同幣同向有沒有孤兒。
+            #   看不見就不開新倉（不記 done，下輪重試到 expires_at 為止）。
+            #   ⛔ 別把這條移到 dup 閘之前也別移走：它是孤兒閘的「未知」分支。
+            if orphan_blind:
+                print(f"⏸ {iid} {intent.get('symbol')} 本輪查不到交易所部位——"
+                      "無法確認有無孤兒，不接新單（下輪重試）")
                 continue
             sz = contracts_for(intent["inst_id"], intent["entry"], intent["stop"], ct_cache)
             if sz is None:

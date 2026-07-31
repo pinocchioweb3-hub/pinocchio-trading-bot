@@ -244,7 +244,8 @@ def test_dup_gate_pure_blocks_same_side_allows_opposite():
     assert not ci.dup_open_same_side(None, "BTC-USDT-SWAP", "long")
 
 
-def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True, orphans=()):
+def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True, orphans=(),
+              scan_failed=False):
     """把主迴圈接到臨時目錄上跑一輪 --once（零網路、零下單）。回 (下單清單, done)。"""
     outbox = tmp_path / "outbox"
     outbox.mkdir()
@@ -260,9 +261,11 @@ def _arm_loop(tmp_path, monkeypatch, open_map, pos_side, place_ok=True, orphans=
     monkeypatch.setattr(ci, "STATE", tmp_path / "state.json")
     monkeypatch.setattr(ci, "POS_STATE", tmp_path / "pos.json")
     monkeypatch.setattr(ci, "verify_demo_profile", lambda: True)
-    # v159（r47）：manage_positions 回本輪孤兒鍵；預設無孤兒（回 None 也要能吃）
+    # v162（r53）：manage_positions 的回傳有三態——list=查得到（可能空＝確認乾淨）、
+    #   None=這輪根本查不到（未知）。⛔ 不可再用 `list(orphans) or None` 把「空」
+    #   和「未知」混成同一個值：那正是 r47 只做半套的破口（見下方 scan_failed 測）。
     monkeypatch.setattr(ci, "manage_positions",
-                        lambda dry: list(orphans) or None)
+                        lambda dry: None if scan_failed else list(orphans))
     monkeypatch.setattr(ci, "finish_round", lambda *a, **k: {})
     monkeypatch.setattr(ci, "contracts_for", lambda *a, **k: 1.0)
     # place_ok=False 模擬「部分成腿」：交易所側可能已有一腿成交，但整筆回報失敗
@@ -524,18 +527,51 @@ def test_orphan_is_never_auto_closed_nor_adopted_into_ledger(tmp_path, monkeypat
 
 def test_orphan_query_failure_is_not_treated_as_no_orphan(tmp_path, monkeypatch):
     """fail-closed 方向：查不到 ≠ 沒有孤兒。不得記成『本輪乾淨無孤兒』，
-    也不得因查不到就動既有的本地帳（那是誤判平倉）。"""
+    也不得因查不到就動既有的本地帳（那是誤判平倉）。
+    v162（r53）：回傳值由 [] 改為 None——[] 在下游等同「確認乾淨」（見下一支）。"""
     held = {"i-old": {"inst_id": "BTC-USDT-SWAP", "pos_side": "long",
                       "symbol": "BTC", "contracts": 1.0,
                       "placed_at": time.time() - 600}}
     got, calls = _arm_orphan_round(tmp_path, monkeypatch, [], open_map=held,
                                    query_ok=False)
-    assert got == []                                   # 不宣稱有孤兒
+    assert got is None                                 # 不宣稱有孤兒、也不宣稱沒有
     assert "orphan_position" not in ci._ROUND_FAILS    # 也不宣稱沒有（不記乾淨）
     assert calls == [["account", "positions"]]         # 查失敗就停手，不再往下動
     ps = json.loads((tmp_path / "pos.json").read_text(encoding="utf-8"))
     assert ps["open"] == held                          # 既有倉一個字都不准改
     ci._ROUND_FAILS.clear()
+
+
+# ── v162（監督員 r53）把 r47 的 fail-closed 從「函式內」推到「迴圈」──────────
+# r47 已寫下原則「查不到 ≠ 沒有孤兒」，但只做到不記健康帳；回傳仍是 []，而主迴圈
+# 讀到 [] 就等於「本輪確認沒有孤兒」→ 擋單閘在查詢失敗的那些輪整個消失。
+# 危害場景：OKX 各端點分開限流／偶發 timeout ⇒ account positions 查失敗、下單端點
+# 仍通 ⇒ 同幣同向新單照送、與那筆脫帳的孤兒在交易所側併倉 ⇒ 曝險無聲翻倍。
+# 而孤兒正是「查單失敗」生出來的 ⇒ 最可能有孤兒的輪，恰好就是閘最可能瞎掉的輪。
+
+def test_manage_positions_reports_unknown_distinctly_from_confirmed_clean(
+        tmp_path, monkeypatch):
+    """型別要能表達『不知道』：查失敗回 None、查得到且真的沒有才回 []。"""
+    got_fail, _ = _arm_orphan_round(tmp_path, monkeypatch, [], query_ok=False)
+    got_clean, _ = _arm_orphan_round(tmp_path, monkeypatch, [], query_ok=True)
+    assert got_fail is None, "查不到必須回 None，不可與『確認乾淨』同型"
+    assert got_clean == [], "查得到且真的沒孤兒才回空清單"
+    ci._ROUND_FAILS.clear()
+
+
+def test_loop_skips_new_orders_when_orphan_scan_could_not_run(tmp_path, monkeypatch):
+    """迴圈級（本輪主修）：孤兒掃描沒跑成 ⇒ 本輪一律不接新單、且不記 done。
+    寧可少下一輪（intent 到期前每輪都會再試），也不可在看不見交易所部位時開新倉。"""
+    placed, done = _arm_loop(tmp_path, monkeypatch, {}, "long", scan_failed=True)
+    assert placed == []
+    assert "i-new" not in done
+
+
+def test_loop_still_places_when_orphan_scan_ran_and_found_nothing(tmp_path, monkeypatch):
+    """別擋過頭（三）：掃描有跑成、結果是空 ⇒ 正常下單。"""
+    placed, done = _arm_loop(tmp_path, monkeypatch, {}, "long")
+    assert placed == ["i-new"]
+    assert "i-new" in done
 
 
 def test_loop_blocks_new_order_when_orphan_same_symbol_same_side(tmp_path, monkeypatch):
