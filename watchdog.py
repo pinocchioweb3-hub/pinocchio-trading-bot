@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import json
+import locale
 import os
 import subprocess
 import sys
@@ -108,29 +109,95 @@ def _commit_pct() -> float | None:
         return None
 
 
+class _RunnerProbeError(RuntimeError):
+    """『列不出 runner 清單』（未知）—— 與『量到 0 個』是兩件不同的事實。
+
+    2026-08-01（r80）踩到的坑：本函式原本 `except Exception: return []`，於是
+    任何量測失敗都對外表現成「機器上沒有殭屍」，exit code 還是 0。實際在線上的
+    是 4 個。⛔ 未知不可折成 0 —— 本專案同物種第 8 次，這次連偵測器自己都中招。
+    """
+
+
+# 解碼 PowerShell 輸出的候選編碼順序（測試會覆寫此元組以模擬 locale 不一致）。
+# locale 優先＝跟隨排程實際環境；cp950/utf-8 為退路，⛔ 缺一個都可能整批失明。
+_CONSOLE_ENCODINGS = (locale.getpreferredencoding(False) or "utf-8", "cp950", "utf-8")
+
+
+def _decode_console(raw) -> str:
+    """把子行程 stdout 解成字串。⛔ 這一層永不拋例外、也永不用空字串假裝成功。
+
+    原本靠 `subprocess.run(text=True)`（跟隨 locale）：一旦行程被以 `-X utf8` /
+    `PYTHONUTF8=1` 起動，就會拿 UTF-8 去解 cp950 的中文輸出 → UnicodeDecodeError
+    → 沿舊路徑被吞成空表。這裡改為「多編碼依序嘗試，全失敗才 ascii+replace」，
+    讓 JSON 的 ASCII 骨架至少保得住（真的解不出來會在 json.loads 那關現形）。
+    """
+    if isinstance(raw, str):
+        return raw
+    if not raw:
+        return ""
+    for enc in _CONSOLE_ENCODINGS:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("ascii", errors="replace")
+
+
 def _stale_claude_runners() -> list[tuple[int, float]]:
     """列出符合『可殺指紋』的 claude.exe：(pid, 年齡秒)。只認 Roaming\\Claude\\claude-code
-    路徑（排程 runner）；GUI App / npm bin / 其他一律不列。失敗回空表（不動作）。"""
+    路徑（排程 runner）；GUI App / npm bin / 其他一律不列。
+
+    ⛔ 量不到時**拋 _RunnerProbeError**，不回空表——呼叫端必須自己決定「未知」怎麼辦
+    （現行決定：不動作 + 留痕）。回 [] 只代表一件事：真的一個符合指紋的都沒有。
+    """
     ps = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
           "Select-Object ProcessId,CommandLine,"
           "@{N='Age';E={[int]((Get-Date)-$_.CreationDate).TotalSeconds}} | "
           "ConvertTo-Json -Compress")
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, text=True, timeout=60)
-        if r.returncode != 0 or not r.stdout.strip():
-            return []
-        data = json.loads(r.stdout)
-        if isinstance(data, dict):
-            data = [data]
-        out = []
-        for p in data:
-            cmd = p.get("CommandLine") or ""
-            if _RUNNER_MARK.lower() in cmd.lower():
+                           capture_output=True, timeout=60)
+    except Exception as exc:                      # 逾時／powershell 不存在／被擋
+        raise _RunnerProbeError(f"{type(exc).__name__}: {exc}") from exc
+    if r.returncode != 0:
+        err = _decode_console(r.stderr).strip().replace("\n", " ")[:160]
+        raise _RunnerProbeError(f"powershell exit={r.returncode} {err}")
+    text = _decode_console(r.stdout).strip()
+    if not text:
+        return []                                 # 退出碼 0 + 空輸出＝真的沒有行程
+    try:
+        data = json.loads(text)
+    except Exception as exc:
+        raise _RunnerProbeError(f"輸出非 JSON（{len(text)} 字元）: {exc}") from exc
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        raise _RunnerProbeError(f"輸出結構非預期: {type(data).__name__}")
+    out = []
+    for p in data:
+        if not isinstance(p, dict):
+            continue
+        cmd = p.get("CommandLine") or ""
+        if _RUNNER_MARK.lower() in cmd.lower():
+            try:
                 out.append((int(p["ProcessId"]), float(p.get("Age") or 0)))
-        return out
-    except Exception:
-        return []
+            except Exception as exc:              # 單筆壞掉≠整批未知，但也不許靜音
+                raise _RunnerProbeError(f"欄位解析失敗: {exc}") from exc
+    return out
+
+
+def _probe_runners_or_log(pct: float) -> list[tuple[int, float]] | None:
+    """量 runner 清單；量不到回 None 並在本機 log 留痕（fail-loud，不 fail-silent）。
+
+    ⛔ 回 None 時呼叫端一律「不動作」：未知狀態下殺行程與不殺，只有不殺是安全的。
+    ⛔ 也不寫 memguard_last_ts —— 量測失敗不該吃掉下一輪（3 分鐘後）的重試機會。
+    """
+    try:
+        return _stale_claude_runners()
+    except _RunnerProbeError as exc:
+        log(f"[memguard] 殭屍 runner 清單量測失敗（{exc}）——⛔ 未知不折成 0 個，"
+            f"本輪不動作（commit {pct:.0f}%）")
+        return None
 
 
 def _memguard_notify(state: dict, pct: float, text: str, now: float) -> None:
@@ -169,7 +236,10 @@ def memory_guard() -> None:
         return
     if pct < MEM_EMERGENCY_PCT:
         # ①常態清掃（2026-08-01 使用者反映效能日衰後加入）
-        stale = [v for v in _stale_claude_runners() if v[1] >= MEM_MIN_AGE_MIN * 60]
+        runners = _probe_runners_or_log(pct)
+        if runners is None:                       # 未知：不動作（已留痕）
+            return
+        stale = [v for v in runners if v[1] >= MEM_MIN_AGE_MIN * 60]
         if len(stale) < 4:
             return
         state = read_json(STATE)
@@ -193,8 +263,17 @@ def memory_guard() -> None:
     now = time.time()
     if now - float(state.get("memguard_last_ts", 0) or 0) < MEM_COOLDOWN_SEC:
         return
-    victims = sorted([v for v in _stale_claude_runners()
-                      if v[1] >= MEM_MIN_AGE_MIN * 60],
+    runners = _probe_runners_or_log(pct)
+    if runners is None:
+        # 緊急線上又量不到＝最需要出聲的組合：本機已留痕，這裡再推一則誠實告警。
+        # ⛔ 不可沿用下面「無殭屍可清」那句——那是「量到 0 個」的說法，會誤導人。
+        _memguard_notify(state, pct,
+                         f"🚨 記憶體 commit {pct:.0f}% 超緊急線，但 watchdog "
+                         "<b>列不出殭屍清單（量測失敗）</b>——本輪未動作，"
+                         "無法判斷有無可清，請人工檢視 watchdog.log", now)
+        write_state(state)                          # 只存告警節流戳記，不寫清理冷卻
+        return
+    victims = sorted([v for v in runners if v[1] >= MEM_MIN_AGE_MIN * 60],
                      key=lambda v: -v[1])            # 最老的先
     if not victims:
         log(f"[memguard] commit {pct:.0f}% 超緊急線但無符合指紋的殭屍可清（App 端請人工處理）")
