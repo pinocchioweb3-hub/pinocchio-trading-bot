@@ -47,6 +47,27 @@ def _subs():
             for a, b, c in _SUB_LINE.findall(text)]
 
 
+def render_live(template_text: str, subs) -> str:
+    """純函式：把代換表整張套到模板上，得出「真錢副本應該長的樣子」。
+    邊界規則與產生器一致（錨點後接數字／小數點不算命中）。"""
+    s = template_text
+    for a, b, _lab in subs:
+        s = re.sub(re.escape(a) + r"(?![\d.])", lambda _m, b=b: b, s)
+    return s
+
+
+def live_copy_defects(live_text: str, subs) -> list:
+    """純函式：逐筆回報真錢副本裡「代換沒生效」之處。
+    (label, 症狀, 字串)；demo 值還在＝縮小暴險沒發生，真錢值不在場＝代換到一半。"""
+    bad = []
+    for a, b, lab in subs:
+        if re.search(re.escape(a) + r"(?![\d.])", live_text):
+            bad.append((lab, "demo 值仍在真錢副本裡", a))
+        if not re.search(re.escape(b) + r"(?![\d.])", live_text):
+            bad.append((lab, "真錢值不在場", b))
+    return bad
+
+
 def anchor_hits(template_text: str, anchor: str) -> int:
     """錨點命中次數。後面接數字／小數點的不算命中——純子字串比對會讓
     `LEVERAGE = 5` 命中改成 `LEVERAGE = 50` 的模板，代換後變成 `LEVERAGE = 200`
@@ -137,3 +158,62 @@ def test_profile_flip_and_demo_guard_flip_travel_together():
     assert 'PROFILE = "demo"→PROFILE = "live"' in joined, "PROFILE 沒有被轉成 live"
     assert 'prof.get("demo") is True→prof.get("demo") is False' in joined, \
         "demo 閘沒有跟著反轉——⛔ 這兩個代換必須成對存在"
+
+
+# ---------------------------------------------------------------------------
+# 以下針對「機器上實際在跑的那一份真錢副本」。上面幾支只驗『代換表 vs 模板』，
+# 驗不到落地檔：模板修好、卻忘了重新產生副本（v154/v155/v156 每一輪都要多跑一次
+# make_live_copy.ps1 -GenerateOnly），真錢執行器就繼續跑舊碼而沒有任何人會知道。
+# verify_live.ps1 第 2 段本來想擋這個，但它只硬編查 11 處中的 5 處、而且只印
+# MISSING 不改 exit code——「印了警告但回傳成功」在本專案已是重複出現的失效物種。
+# ---------------------------------------------------------------------------
+
+LIVE_COPY = ROOT / "tools" / "atk_consumer" / "consume_intents_live.py"
+
+_NO_LIVE_COPY = (
+    f"本機沒有 {LIVE_COPY.name}（尚未產生過真錢副本）——本檢查不適用，"
+    "⛔ 不可解讀為『副本已驗過』"
+)
+
+
+def test_live_copy_is_exactly_the_current_template_rendered():
+    """落地的真錢副本必須逐字等於「現行模板套上代換表」的結果。
+
+    不等於的兩種成因都要擋：(a) 模板改了但沒重新產生副本＝真錢在跑舊碼；
+    (b) 有人直接手改副本＝下次重新產生時那些手改會被無聲蓋掉。
+    修法一律是重跑 `make_live_copy.ps1 -GenerateOnly`（它自己也是 fail-closed）。
+    """
+    if not LIVE_COPY.exists():
+        import pytest
+        pytest.skip(_NO_LIVE_COPY)
+    subs = _subs()
+    live = LIVE_COPY.read_text(encoding="utf-8-sig")
+    defects = live_copy_defects(live, subs)
+    assert not defects, f"真錢副本的代換沒生效：{defects}"
+    expect = render_live(TEMPLATE.read_text(encoding="utf-8-sig"), subs)
+    assert live == expect, (
+        "真錢副本與現行模板不一致（副本已過期或被手改）——"
+        "真錢執行器正在跑的不是模板上這份碼。請跑 make_live_copy.ps1 -GenerateOnly"
+    )
+
+
+def test_drift_checker_catches_a_stale_live_copy():
+    """負向檢定：模板新增一行安全檢查、副本停留在舊版（＝忘了重新產生）。
+    此時 11 處代換全部好端端在場，defects 是空的——只有逐字比對抓得到。"""
+    subs = _subs()
+    template = TEMPLATE.read_text(encoding="utf-8-sig")
+    stale = render_live(template, subs)
+    fresh = render_live(template + "\n# 模板新增的安全檢查\n", subs)
+    assert not live_copy_defects(stale, subs), \
+        "這個情境本來就該讓逐筆檢查全過（不然證明不了逐字比對的必要性）"
+    assert stale != fresh, "副本落後模板一整段修改卻沒被抓到——逐字比對是空的"
+
+
+def test_drift_checker_catches_a_half_substituted_live_copy():
+    """負向檢定二：副本裡 RISK_USD 沒被代換（沿用 demo 級 100U＝5 倍暴險）。"""
+    subs = _subs()
+    half = render_live(TEMPLATE.read_text(encoding="utf-8-sig"), subs).replace(
+        "RISK_USD = 20.0", "RISK_USD = 100.0")
+    labels = [lab for lab, _sym, _s in live_copy_defects(half, subs)]
+    assert "risk 1R 20U" in labels, \
+        f"副本沿用 demo 級風險值竟沒被抓到，檢查本身是空的：{labels}"
