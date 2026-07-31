@@ -1,0 +1,18 @@
+#!/bin/sh
+# 公開 repo 洩漏閘·訊息端（v174 / 監督員 r72）。
+#
+# pre-commit 掃的是檔案內容，掃不到 commit 訊息——而 2026-07-31 那次外洩，
+# 抄進去的正是日誌原文。訊息一旦進歷史同樣是公開的。
+# $1 = git 給的訊息暫存檔路徑；剪刀線以下與 # 註解行由掃描器自行剔除。
+
+ROOT=$(git rev-parse --show-toplevel)
+PY=$(command -v python 2>/dev/null)
+if [ -z "$PY" ]; then
+  PY="C:/Users/user/AppData/Local/Python/pythoncore-3.14-64/python.exe"
+fi
+if [ ! -x "$PY" ] && ! command -v "$PY" >/dev/null 2>&1; then
+  echo "[secret-leak] ⛔ 找不到 python，無法掃 commit 訊息——fail-closed 擋下。"
+  exit 1
+fi
+
+PYTHONIOENCODING=utf-8 "$PY" -X utf8 "$ROOT/tools/secret_leak_scan.py" --message-file "$1"

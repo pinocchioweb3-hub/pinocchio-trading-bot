@@ -85,6 +85,61 @@ def _git(args: list[str], root: Path) -> str:
     return r.stdout.decode("utf-8", errors="replace")
 
 
+def list_staged_files(root: Path) -> list[str]:
+    """本次 commit 即將寫進歷史的檔案（index 版本，非工作區版本）。
+
+    v174（監督員 r72）：pre-commit 閘要看的是 index，不是工作區——
+    `git add` 之後又改回來的檔案，工作區乾淨但進歷史的是髒的那版。
+    -z：這個 repo 有大量中文檔名，預設輸出會被 git 加引號並跳脫，切不出真名。
+    """
+    raw = _git(["diff", "--cached", "--name-only", "-z",
+                "--diff-filter=ACM"], root)
+    out = []
+    for name in raw.split("\x00"):
+        if not name.strip():
+            continue
+        if Path(name).suffix.lower() in _BINARY_SUFFIXES:
+            continue
+        out.append(name)
+    return out
+
+
+def scan_staged(root: Path) -> list[tuple[str, int, str, str]]:
+    """掃 index 裡的內容。回 [(相對路徑, 行號, 類別, 命中字串)]。"""
+    hits: list[tuple[str, int, str, str]] = []
+    for name in list_staged_files(root):
+        try:
+            text = _git(["show", f":{name}"], root)
+        except subprocess.CalledProcessError:
+            continue        # 例如 submodule／已被同一次 commit 移走
+        for lineno, kind, value in scan_text(text):
+            hits.append((name, lineno, kind, value))
+    return hits
+
+
+# git 在 `commit -v` 時把整份 diff 附在這條剪刀線之下，並全數以 # 開頭；
+# 那段不會進 commit 訊息，掃它只會製造假警報。
+_SCISSORS = "------------------------ >8 ------------------------"
+
+
+def strip_commit_comments(text: str) -> str:
+    """把 git 會自行丟棄的部分（# 註解行、剪刀線以下）先拿掉再掃。"""
+    kept = []
+    for line in text.splitlines():
+        if _SCISSORS in line:
+            break
+        if line.startswith("#"):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def scan_message_file(path: Path) -> list[tuple[int, str, str]]:
+    """掃「即將送出」的 commit 訊息檔（commit-msg hook 的 $1）。"""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return scan_text(strip_commit_comments(text))
+
+
 def list_repo_files(root: Path, include_untracked: bool = False) -> list[Path]:
     """git 追蹤中的檔案（可選：加上未追蹤、未被 .gitignore 排除的檔案）。"""
     names = _git(["ls-files"], root).splitlines()
@@ -131,13 +186,47 @@ def scan_commit_messages(root: Path, limit: int = 50
     return hits
 
 
+def _main_staged(root: Path) -> int:
+    """pre-commit 模式：只掃 index，回非 0 就擋下這次 commit。"""
+    hits = scan_staged(root)
+    for path, lineno, kind, value in hits:
+        print(f"LEAK staged {path}:{lineno} [{kind}] {value}")
+    if hits:
+        print(f"\n[secret-leak] 這次 commit 的暫存內容有 {len(hits)} 筆疑似洩漏"
+              f"——⛔ 已擋下。清掉後重 commit（repo 是 PUBLIC，進了歷史就追不回）。")
+        return 4
+    print("[secret-leak] 暫存內容乾淨")
+    return 0
+
+
+def _main_message(root: Path, msg_path: Path) -> int:
+    """commit-msg 模式：只掃即將送出的訊息本身。"""
+    hits = scan_message_file(msg_path)
+    for lineno, kind, value in hits:
+        print(f"LEAK message :{lineno} [{kind}] {value}")
+    if hits:
+        print(f"\n[secret-leak] commit 訊息有 {len(hits)} 筆疑似洩漏——⛔ 已擋下。"
+              f"訊息裡不要抄日誌原文（出口 IP／key-id）。")
+        return 4
+    print("[secret-leak] commit 訊息乾淨")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     root = Path(__file__).resolve().parent.parent
     include_untracked = "--include-untracked" in argv
     commits = 50
+    msg_file = None
     for i, a in enumerate(argv):
         if a == "--commits" and i + 1 < len(argv):
             commits = int(argv[i + 1])
+        if a == "--message-file" and i + 1 < len(argv):
+            msg_file = Path(argv[i + 1])
+
+    if msg_file is not None:
+        return _main_message(root, msg_file)
+    if "--staged" in argv:
+        return _main_staged(root)
 
     file_hits = scan_repo(root, include_untracked)
     msg_hits = scan_commit_messages(root, commits)

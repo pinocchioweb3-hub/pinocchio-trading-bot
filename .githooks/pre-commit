@@ -1,0 +1,25 @@
+#!/bin/sh
+# 公開 repo 洩漏閘（v174 / 監督員 r72）——掃 index，髒了就擋下 commit。
+#
+# 為什麼要有這個 hook：
+#   閘（tools/secret_leak_scan.py）與測試在 v161 就都有了，然後在 2026-07-31
+#   被跳過一次，真實出口 IP 就這樣進了 PUBLIC repo 的歷史。「記得跑」不是機制。
+#
+# 放在 .githooks/ 而非 .git/hooks/ 是刻意的：.git/hooks 不進版控、re-clone 不會
+# 跟著。代價是 clone 後要手動接上一次：
+#   git config core.hooksPath .githooks
+#
+# 掃不到不等於乾淨——它只認 UUID 形狀的 key-id 與可路由 IPv4（見掃描器 docstring）。
+
+ROOT=$(git rev-parse --show-toplevel)
+PY=$(command -v python 2>/dev/null)
+if [ -z "$PY" ]; then
+  PY="C:/Users/user/AppData/Local/Python/pythoncore-3.14-64/python.exe"
+fi
+if [ ! -x "$PY" ] && ! command -v "$PY" >/dev/null 2>&1; then
+  echo "[secret-leak] ⛔ 找不到 python，無法執行洩漏掃描——fail-closed 擋下這次 commit。"
+  echo "             修法：讓 python 進 PATH，或改本檔的 PY 後援路徑。"
+  exit 1
+fi
+
+PYTHONIOENCODING=utf-8 "$PY" -X utf8 "$ROOT/tools/secret_leak_scan.py" --staged
