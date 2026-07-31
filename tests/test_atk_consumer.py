@@ -755,3 +755,66 @@ def test_no_print_echoes_raw_okx_body_unredacted():
                 and "redact_secrets" not in seg):
             bad.append(seg[:100])
     assert not bad, f"未遮蔽就回顯 OKX 原文的 print：{bad}"
+
+
+# ── v164（r55）健康檔「讀失敗 ≠ 沒有故障史」 ──────────────────────────
+def _arm_health(tmp_path, monkeypatch, primary=None, backup=None):
+    """把健康檔導到 tmp；primary/backup 給 str 就原樣寫入（可寫壞檔）。"""
+    h = tmp_path / "health.json"
+    monkeypatch.setattr(ci, "HEALTH", h)
+    if primary is not None:
+        h.write_text(primary, encoding="utf-8")
+    if backup is not None:
+        h.with_name(h.name + ".bak").write_text(backup, encoding="utf-8")
+    return h
+
+
+def test_corrupt_health_does_not_reset_streak_into_alert_blindness(tmp_path, monkeypatch):
+    """半截 JSON（非原子寫被中斷）讓 _load_health 讀失敗時，舊版回 {} ⇒ 連續故障
+    每輪歸零 ⇒ 永遠到不了門檻 ⇒ 告警層自己無聲死掉（正是 v143 要治的物種）。
+    讀不到＝**未知**，不可當成「沒有故障史」。"""
+    _arm_health(tmp_path, monkeypatch, primary='{"consecutive_fail_rounds": 4')
+    h = ci.finish_round({"auth_ip_whitelist": "401"}, 1000.0, dry=True)
+    assert h.get("consecutive_fail_rounds", 0) >= ci.FAIL_ALERT_AFTER
+    assert h.get("last_alert_ts") == 1000.0, "健康檔壞掉時故障輪必須仍能告警"
+
+
+def test_corrupt_health_falls_back_to_backup_and_keeps_counting(tmp_path, monkeypatch):
+    """主檔壞掉但備份好的 ⇒ 從備份續算，而不是從零重數（否則 401 這種長斷流
+    每次檔案抖動就把『已持續多久』重置，使用者看到的時數會被低報）。"""
+    _arm_health(tmp_path, monkeypatch, primary="{oops",
+                backup=json.dumps({"consecutive_fail_rounds": 9,
+                                   "first_fail_ts": 100.0,
+                                   "last_alert_ts": 200.0,
+                                   "last_alert_class": "auth_ip_whitelist",
+                                   "last_fail_class": "auth_ip_whitelist"}))
+    h = ci.finish_round({"auth_ip_whitelist": "401"}, 1000.0, dry=True)
+    assert h["consecutive_fail_rounds"] == 10
+    assert h["first_fail_ts"] == 100.0, "備份裡的起始時間要留著＝持續時長不被低報"
+
+
+def test_health_save_is_atomic_and_mirrors_a_backup(tmp_path, monkeypatch):
+    """先截斷再寫的非原子寫是壞檔來源本身 ⇒ 改暫存檔＋os.replace，並留一份
+    last-known-good 備份（兩次分開的原子寫，被砍時最多壞掉其中一個）。"""
+    h = _arm_health(tmp_path, monkeypatch)
+    assert ci._save_health({"consecutive_fail_rounds": 2}) is True
+    bak = h.with_name(h.name + ".bak")
+    assert json.loads(h.read_text(encoding="utf-8"))["consecutive_fail_rounds"] == 2
+    assert json.loads(bak.read_text(encoding="utf-8"))["consecutive_fail_rounds"] == 2
+    assert not h.with_name(h.name + ".tmp").exists(), "暫存檔不可留下"
+
+
+def test_missing_health_file_is_still_a_legitimate_first_run(tmp_path, monkeypatch):
+    """首跑（檔案不存在）是真的沒有故障史 ⇒ 不可被當成『未知』而誤報。"""
+    _arm_health(tmp_path, monkeypatch)
+    h = ci.finish_round({}, 1000.0, dry=True, oks=1)
+    assert h.get("consecutive_fail_rounds", 0) == 0
+    assert not h.get("last_alert_ts")
+
+
+def test_corrupt_health_never_fabricates_a_recovery_notice(tmp_path, monkeypatch):
+    """讀不到故障史時，乾淨輪不可以反過來變成『✅已恢復』——
+    r33 假痊癒的同一個坑（沒有證據時只能維持原判，不能報好消息）。"""
+    _arm_health(tmp_path, monkeypatch, primary="}}not json{{")
+    h = ci.finish_round({}, 1000.0, dry=True, oks=1)
+    assert not h.get("recovered_from")

@@ -69,7 +69,10 @@ _BENIGN_MARKERS = ("51603", "doesn't exist", "does not exist")
 # 不可能被斷流洗掉；修法也完全不同（要人去看那個檔案，不是等網路好）。
 _CLASS_PRIORITY = ("orphan_position", "pos_state_unreadable", "pos_state_write_fail",
                    "cli_missing", "auth_ip_whitelist", "auth",
-                   "rate_limit", "timeout", "leverage_fail", "query_fail", "other")
+                   "rate_limit", "timeout", "leverage_fail", "query_fail",
+                   # v164：健康檔壞掉排在最後——它是告警層自己的內傷，永遠不該蓋掉
+                   # 同輪真正的交易故障當代表（否則使用者看到的主因會被換掉）
+                   "health_state_unreadable", "other")
 _ROUND_FAILS: dict[str, str] = {}   # 本輪故障 {類別: 樣本}；每輪開頭清空
 # v151：本輪「成功呼叫數」；每輪開頭歸零。沒有它就無法分辨「全部呼叫都成功」
 # 與「這輪根本沒呼叫」——後者被當成乾淨輪會蓋出假痊癒（見 update_health）。
@@ -165,19 +168,56 @@ def verify_demo_profile() -> bool:
 
 
 # ── 健康狀態／告警（v143） ────────────────────────────────────────────
-def _load_health() -> dict:
-    try:
-        return json.loads(HEALTH.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+def _load_health() -> dict | None:
+    """讀健康檔。回 None＝主檔與備份都讀不到／壞掉（**未知**）；⛔ 不可再回 {}。
+
+    v164（監督員 r55）：與 v163 的本地部位帳同一物種——舊版把任何例外壓成 {}，
+    等於宣告「沒有任何故障史」，於是 consecutive_fail_rounds 每輪從零重數、
+    永遠到不了 FAIL_ALERT_AFTER 門檻＝**告警層自己無聲死掉**（正是 v143 要治的東西）。
+    健康檔壞掉的機率不低：舊 _save_health 是「先截斷再寫」的非原子寫，行程被砍
+    （排程逾時／休眠／當機）就留半截 JSON。
+
+    「檔案不存在」＝首跑，是真的沒有故障史（合法）；壞 JSON／IO 錯／型別不對＝未知，
+    此時先退回 .bak（last-known-good）續算，備份也壞才回 None。"""
+    for path in (HEALTH, HEALTH.with_name(HEALTH.name + ".bak")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(raw, dict):
+            return raw
+    # 兩個都不存在＝首跑（真空帳）；存在但都壞掉＝未知
+    if not HEALTH.exists() and not HEALTH.with_name(HEALTH.name + ".bak").exists():
         return {}
+    return None
 
 
-def _save_health(h: dict) -> None:
+def _save_health(h: dict) -> bool:
+    """原子寫回健康檔＋鏡射一份 .bak。回 False＝沒寫成（呼叫端要出聲）。
+
+    v164（監督員 r55）：①暫存檔＋os.replace——非原子寫留下的半截 JSON 正是上面
+    _load_health 要防的壞檔來源本身。②另存 .bak：兩次分開的原子寫，行程被砍時
+    最多壞掉其中一個，另一個仍是 last-known-good。③失敗不再完全無聲（印出來）。
+    ⚠️ 已知殘留缺口：寫得進去與否只進日誌，寫不進去時連續故障計數會停在舊值
+    （凍結而非歸零，方向仍是保守的）——待後續輪次處理。"""
+    tmp = HEALTH.with_name(HEALTH.name + ".tmp")
+    body = json.dumps(h, ensure_ascii=False, indent=1)
+    ok = False
     try:
-        HEALTH.write_text(json.dumps(h, ensure_ascii=False, indent=1),
-                          encoding="utf-8")
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, HEALTH)
+        ok = True
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 健康檔寫入失敗（告警計數將停在舊值）：{type(e).__name__}: {e}")
+    try:
+        bak_tmp = HEALTH.with_name(HEALTH.name + ".bak.tmp")
+        bak_tmp.write_text(body, encoding="utf-8")
+        os.replace(bak_tmp, HEALTH.with_name(HEALTH.name + ".bak"))
     except Exception:  # noqa: BLE001
         pass
+    return ok
 
 
 def worst_class(classes) -> str | None:
@@ -268,6 +308,10 @@ _CLASS_HINT = {
                          "→ 到 OKX 後台把下方錯誤訊息中的 IP 加進白名單，"
                          "消費器每分鐘自動重試、不需重啟",
     "auth": "認證失敗（金鑰／簽章／權限）→ 檢查 ~/.okx/config.toml 與後台權限設定",
+    "health_state_unreadable": "告警層自己的健康檔（含備份）壞掉或讀不到 → 連續故障"
+                               "計數失去歷史，本輪已改為「有故障就直接告警」以免無聲。"
+                               "多半是寫到一半被中斷；執行器會自動重寫一份好的，"
+                               "下一輪起恢復正常冷卻。連續多輪出現才需人工看磁碟／權限",
     "cli_missing": "okx CLI 不存在 → npm install -g @okx_ai/okx-trade-cli",
     "rate_limit": "被限流 → 通常自癒；持續出現才需降頻",
     "timeout": "呼叫逾時 → 檢查網路；持續出現代表對外連線有問題",
@@ -353,7 +397,18 @@ def finish_round(fails: dict, now_s: float | None = None,
     oks＝本輪成功呼叫數；沒有它就分不出「空轉輪」與「乾淨輪」（見 update_health）。"""
     now_s = now_s or time.time()
     try:
-        h = update_health(_load_health(), fails, now_s, oks)
+        base, fails = _load_health(), dict(fails or {})
+        if base is None:
+            # v164：健康檔未知。⛔ 不可當成「零連續故障」——那等於每輪把告警計數
+            # 歸零。方向取 fail-closed：把基準設在門檻前一輪，這輪只要有故障就會
+            # 立刻告警一次（並把健康檔重新寫成好的＝自癒，之後恢復正常冷卻）。
+            fails.setdefault("health_state_unreadable",
+                             f"{HEALTH.name} 與 .bak 都讀不到／內容壞掉")
+            base = {"consecutive_fail_rounds": max(0, FAIL_ALERT_AFTER - 1),
+                    "health_unknown_at": now_s}
+            print(f"⚠️ 健康檔讀取失敗（{HEALTH.name}）——連續故障計數視為未知，"
+                  f"本輪若有故障即告警，不從零重數")
+        h = update_health(base, fails, now_s, oks)
         if h.get("recovered_from"):
             ch, err = send_alert(recovery_text(h), dry=dry)
             h["last_alert_channel"], h["last_alert_error"] = ch, err
