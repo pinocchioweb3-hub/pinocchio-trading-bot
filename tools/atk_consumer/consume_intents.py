@@ -449,6 +449,13 @@ def _day_key(ts: float | None = None) -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(ts or time.time()))
 
 
+def dup_open_same_side(open_map: dict, inst_id: str, pos_side: str) -> bool:
+    """同幣同向是否已在場（純函式）。open_map 以 intent_id 為鍵，
+    同 (inst_id, pos_side) 本來就能並存 → 這是下單前唯一的併倉防線。"""
+    return any(r.get("inst_id") == inst_id and r.get("pos_side") == pos_side
+               for r in (open_map or {}).values())
+
+
 def timed_out(placed_at_s: float, now_s: float,
               limit_h: float = TIMEOUT_HOURS) -> bool:
     """持倉逾時判定（純函式）。"""
@@ -471,8 +478,11 @@ def breaker_tripped(day_pnl: dict, now_s: float | None = None,
     return week_total <= -abs(week_stop_usd)
 
 
-def _realized_pnl_since(inst_id: str, since_s: float) -> float | None:
-    """粗算該 instId 自 since 起的已實現損益（fillPnl+fee 合計）。查失敗回 None。"""
+def _realized_pnl_since(inst_id: str,
+                        since_s: float) -> tuple[float, float | None] | None:
+    """粗算該 instId 自 since 起的已實現損益（fillPnl+fee 合計）。查失敗回 None。
+    v154（修B）：一併回傳最後一筆 fill 的秒級 ts（無 fill 則 None），
+    給呼叫端把損益記在「成交當下」那個 UTC 日、而非「對帳當下」那個日。"""
     code, out = _okx(["swap", "fills", "--instId", inst_id])
     if code != 0 or not out.strip().startswith(("[", "{")):
         return None
@@ -480,11 +490,14 @@ def _realized_pnl_since(inst_id: str, since_s: float) -> float | None:
         fills = json.loads(out)
         fills = fills if isinstance(fills, list) else fills.get("data", [])
         total = 0.0
+        last_ts: float | None = None
         for f in fills:
             ts = float(f.get("ts") or 0) / 1000.0
             if ts >= since_s:
                 total += float(f.get("fillPnl") or 0) + float(f.get("fee") or 0)
-        return total
+                if last_ts is None or ts > last_ts:
+                    last_ts = ts
+        return total, last_ts
     except Exception:  # noqa: BLE001
         return None
 
@@ -507,12 +520,21 @@ def manage_positions(dry: bool) -> None:
         key = (rec["inst_id"], rec["pos_side"])
         if live.get(key, 0.0) == 0.0:
             # 已了結（TP/SL/手動）→ 記日損益後移出
-            pnl = _realized_pnl_since(rec["inst_id"], rec["placed_at"])
-            if pnl is not None:
-                dk = _day_key()
+            res = _realized_pnl_since(rec["inst_id"], rec["placed_at"])
+            if res is not None:
+                pnl, last_ts = res
+                # v154（監督員 r44・修B）：熔斷記帳吃「成交當下」的 UTC 日，不吃
+                #   「對帳當下」。對帳可能晚很久才發生（本次 401 斷流 26.5h），
+                #   用對帳日記帳會把前一日的損益算到今天頭上→日虧熔斷口徑失真。
+                #   查不到 fill ts 就退回現行行為（寧可日期近似，也不要漏記）。
+                dk = _day_key(last_ts) if last_ts else _day_key()
+                # 下方只保留 14 天；回填比保留窗更舊的日期會在同一次呼叫裡被
+                # 立刻剪掉、損益無聲蒸發 → 先夾到窗邊界，讓它仍計入熔斷口徑。
+                dk = max(dk, _day_key(time.time() - 14 * 86400))
                 ps["day_pnl"][dk] = float(ps["day_pnl"].get(dk, 0.0)) + pnl
                 print(f"🏁 {rec['inst_id']} {rec['pos_side']} 已了結，"
-                      f"已實現≈{pnl:+.2f} USDT（今日累計 {ps['day_pnl'][dk]:+.2f}）")
+                      f"已實現≈{pnl:+.2f} USDT"
+                      f"（記入 {dk} UTC，該日累計 {ps['day_pnl'][dk]:+.2f}）")
             else:
                 print(f"🏁 {rec['inst_id']} {rec['pos_side']} 已了結（損益查詢失敗，"
                       "不計入熔斷口徑）")
@@ -732,6 +754,17 @@ def main() -> int:
                 continue
             if halted_today:
                 continue                     # 熔斷日不接新單；intent 未記 done，明日過期自清
+            # v154（監督員 r44・修A）：同幣同向已在場 → 本輪不接。
+            #   OKX hedge mode 會把同幣同向併成交易所側單一部位，一筆 realizedPnl
+            #   無法歸屬兩個 intent（v130 已在模擬盤實證：同筆 pnl 雙重記帳、
+            #   R 虛增 +1.30），且曝險會在逐單檢查下無聲翻倍。
+            #   反向不擋（hedge 雙向合法）。不記 done：比照熔斷日，
+            #   倉平掉後 intent 若還沒過期就自然接上。
+            if dup_open_same_side(_load_positions().get("open", {}),
+                                  intent["inst_id"], intent["pos_side"]):
+                print(f"⏸ {iid} {intent.get('symbol')} 同幣同向已在場——本輪不接"
+                      "（OKX hedge 併倉會使已實現損益無法歸屬兩單）")
+                continue
             sz = contracts_for(intent["inst_id"], intent["entry"], intent["stop"], ct_cache)
             if sz is None:
                 print(f"❌ {iid} 張數換算失敗——跳過（不猜）")

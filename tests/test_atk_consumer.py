@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """ATK 消費腳本純函式測試（v139 倉位管理迴圈）。零網路、零 OKX 呼叫。"""
+import json
 import sys
 import time
 from pathlib import Path
@@ -229,3 +230,96 @@ def test_note_fail_records_first_sample_and_redacts():
     ci._note_fail(None, "benign")                            # 良性不入帳
     assert list(ci._ROUND_FAILS) == ["auth_ip_whitelist"]
     ci._ROUND_FAILS.clear()
+
+
+# ── v154（監督員 r44）修A：同幣同向已在場閘 ─────────────────────────────
+def test_dup_gate_pure_blocks_same_side_allows_opposite():
+    open_map = {"i-1": {"inst_id": "BTC-USDT-SWAP", "pos_side": "long"}}
+    assert ci.dup_open_same_side(open_map, "BTC-USDT-SWAP", "long")
+    assert not ci.dup_open_same_side(open_map, "BTC-USDT-SWAP", "short")  # hedge 反向合法
+    assert not ci.dup_open_same_side(open_map, "ETH-USDT-SWAP", "long")
+    assert not ci.dup_open_same_side({}, "BTC-USDT-SWAP", "long")
+    assert not ci.dup_open_same_side(None, "BTC-USDT-SWAP", "long")
+
+
+def _arm_loop(tmp_path, monkeypatch, open_map, pos_side):
+    """把主迴圈接到臨時目錄上跑一輪 --once（零網路、零下單）。回 (下單清單, done)。"""
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    intent = {"intent_id": "i-new", "symbol": "BTC", "inst_id": "BTC-USDT-SWAP",
+              "pos_side": pos_side, "entry": 100.0, "stop": 95.0,
+              "execution_policy": "demo_only",
+              "expires_at": (time.time() + 3600) * 1000}
+    (outbox / "a.json").write_text(json.dumps(intent), encoding="utf-8")
+    (tmp_path / "pos.json").write_text(
+        json.dumps({"open": open_map, "day_pnl": {}}), encoding="utf-8")
+    placed: list = []
+    monkeypatch.setattr(ci, "OUTBOX", outbox)
+    monkeypatch.setattr(ci, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(ci, "POS_STATE", tmp_path / "pos.json")
+    monkeypatch.setattr(ci, "verify_demo_profile", lambda: True)
+    monkeypatch.setattr(ci, "manage_positions", lambda dry: None)
+    monkeypatch.setattr(ci, "finish_round", lambda *a, **k: {})
+    monkeypatch.setattr(ci, "contracts_for", lambda *a, **k: 1.0)
+    monkeypatch.setattr(ci, "place",
+                        lambda intent, sz, dry, spec=None: placed.append(intent["intent_id"]) or True)
+    monkeypatch.setattr(sys, "argv", ["consume_intents.py", "--once"])
+    assert ci.main() == 0
+    done = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))["done"]
+    return placed, done
+
+
+def test_loop_blocks_new_order_when_same_symbol_same_side_already_open(tmp_path, monkeypatch):
+    held = {"i-old": {"inst_id": "BTC-USDT-SWAP", "pos_side": "long",
+                      "contracts": 1.0, "placed_at": time.time() - 600}}
+    placed, done = _arm_loop(tmp_path, monkeypatch, held, "long")
+    assert placed == []                    # 併倉風險 → 不下單
+    assert "i-new" not in done             # 不記 done：倉平掉且未過期就自然接上
+
+
+def test_loop_still_places_opposite_side_on_same_symbol(tmp_path, monkeypatch):
+    held = {"i-old": {"inst_id": "BTC-USDT-SWAP", "pos_side": "long",
+                      "contracts": 1.0, "placed_at": time.time() - 600}}
+    placed, done = _arm_loop(tmp_path, monkeypatch, held, "short")
+    assert placed == ["i-new"]             # hedge 雙向合法，別擋過頭
+    assert "i-new" in done
+
+
+# ── v154（監督員 r44）修B：熔斷記帳吃成交日、且不被 14 天修剪吃掉 ────────
+def _arm_manage(tmp_path, monkeypatch, fill_ts_s, placed_at_s):
+    """在場倉在交易所已消失 → 走對帳記帳路徑。回 day_pnl。"""
+    (tmp_path / "pos.json").write_text(json.dumps({
+        "open": {"i-1": {"inst_id": "BTC-USDT-SWAP", "pos_side": "long",
+                         "symbol": "BTC", "contracts": 1.0,
+                         "placed_at": placed_at_s}},
+        "day_pnl": {}}), encoding="utf-8")
+    monkeypatch.setattr(ci, "POS_STATE", tmp_path / "pos.json")
+
+    def fake_okx(args, timeout=30):
+        if args[:2] == ["account", "positions"]:
+            return 0, "[]"                              # 交易所側已無倉＝已了結
+        if args[:2] == ["swap", "fills"]:
+            return 0, json.dumps([{"ts": str(int(fill_ts_s * 1000)),
+                                   "fillPnl": "-5.0", "fee": "-0.5"}])
+        return 1, "unexpected"
+    monkeypatch.setattr(ci, "_okx", fake_okx)
+    ci.manage_positions(dry=False)
+    return json.loads((tmp_path / "pos.json").read_text(encoding="utf-8"))["day_pnl"]
+
+
+def test_realized_pnl_recorded_on_fill_day_not_reconcile_day(tmp_path, monkeypatch):
+    now = time.time()
+    fill_ts = now - 26.5 * 3600            # 斷流 26.5h 後才對帳（本次 401 的真實跨度）
+    day_pnl = _arm_manage(tmp_path, monkeypatch, fill_ts, now - 30 * 3600)
+    assert day_pnl == {ci._day_key(fill_ts): -5.5}
+    if ci._day_key(fill_ts) != ci._day_key(now):
+        assert ci._day_key(now) not in day_pnl   # 不得算到對帳當天頭上
+
+
+def test_old_fill_is_clamped_into_retention_window_not_silently_pruned(tmp_path, monkeypatch):
+    now = time.time()
+    fill_ts = now - 15 * 86400             # 比 14 天保留窗更舊
+    day_pnl = _arm_manage(tmp_path, monkeypatch, fill_ts, now - 16 * 86400)
+    edge = ci._day_key(now - 14 * 86400)
+    assert day_pnl == {edge: -5.5}         # 夾到窗邊界：仍計入熔斷口徑，不無聲蒸發
+    assert sum(day_pnl.values()) == -5.5
