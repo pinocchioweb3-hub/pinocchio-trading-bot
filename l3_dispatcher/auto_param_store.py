@@ -26,11 +26,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
 
 from botpaths import data_dir
+
+_LOG = logging.getLogger("l3_dispatcher.auto_param_store")
 
 ACTIVE_NAME = "auto_params_active.json"   # 活躍覆寫表（只在 promote 時更新）
 AUDIT_NAME = "auto_params_audit.jsonl"    # append-only 稽核（promote/hold/rollback 全留痕）
@@ -88,23 +91,81 @@ def _norm_alloc(alloc) -> tuple[float, float, float] | None:
 
 
 # ── 檔案 I/O（fail-safe + 原子寫） ────────────────────────────────────
-def _load_active(path: str | Path | None = None) -> dict:
-    """讀活躍表；任何異常 → {}（fail-safe，等同無覆寫＝用 CONFIG 預設）。"""
+# 讀取三態（與 entry_policy_store 同規格）。⛔ 只有 MISSING 可以當「真·從來沒有任何覆寫」用；
+# UNREADABLE ＝檔在、但內容**未知**，任何「所以沒有覆寫」的推論在此都不成立。
+LOAD_OK = "ok"
+LOAD_MISSING = "missing"
+LOAD_UNREADABLE = "unreadable"
+
+# 熱路徑壞檔只出聲一次（依 路徑+mtime+大小 去重），避免每筆進場洗版。
+_WARNED_BAD: set = set()
+
+
+def _warn_unreadable_once(path: str | Path | None = None) -> None:
+    """壞檔在進場熱路徑上出聲一次。不寫檔、不擋進場（fail-safe 仍成立）。
+
+    ⚠️ 收「未解析的 path 參數」而非 Path：apply_verdict／rollback 的**參數名就叫 active_path**，
+       在那些函式裡模組層的 active_path() 被遮蔽，只有在這裡解析才叫得到。
+    """
+    p = active_path(path)
+    try:
+        st = p.stat()
+        key = (str(p), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (str(p), None, None)
+    if key in _WARNED_BAD:
+        return
+    _WARNED_BAD.add(key)
+    _LOG.warning(
+        "🚨 自動參數活躍表存在但讀不出來（%s）→ 本次進場退回 CONFIG 預設 TP 分配；"
+        "⛔ 這不代表『沒有覆寫』——覆寫內容未知，晉升與回退已自動停手，原檔保留待人工檢視。", p)
+
+
+def _load_active_status(path: str | Path | None = None) -> tuple[dict, str]:
+    """讀活躍表，回 (buckets, status)。status ∈ {ok, missing, unreadable}。
+
+    為何要三態：舊版把「檔不存在」與「檔在但解不開」都折成 {}，而 apply_verdict 會拿這個 {}
+    當**整張表**原子覆寫回去 → 一次讀失敗＝其餘所有已晉升桶不可逆消失（連半截檔都不留）。
+    """
     p = active_path(path)
     try:
         if not p.exists():
-            return {}
+            return {}, LOAD_MISSING
+    except OSError:
+        return {}, LOAD_UNREADABLE   # 連「在不在」都問不出來 → 未知，不可當沒有
+    try:
         with open(p, "r", encoding="utf-8") as f:
             obj = json.load(f)
-        buckets = obj.get("buckets")
-        return buckets if isinstance(buckets, dict) else {}
     except Exception:
-        return {}
+        return {}, LOAD_UNREADABLE
+    if not isinstance(obj, dict):
+        return {}, LOAD_UNREADABLE
+    buckets = obj.get("buckets")
+    if buckets is None or not isinstance(buckets, dict):
+        # 能解析但結構不符（缺 buckets／型別不對）＝仍是「內容未知」，不是「空表」
+        return {}, LOAD_UNREADABLE
+    return buckets, LOAD_OK
+
+
+def _load_active(path: str | Path | None = None) -> dict:
+    """讀活躍表；任何異常 → {}（fail-safe，等同無覆寫＝用 CONFIG 預設）。
+
+    ⚠️ 只給**進場熱路徑**用（壞檔絕不可讓進場崩）。寫入端／渲染端一律改用
+    _load_active_status，否則「讀不出來」會再次被折成「沒有覆寫」。
+    """
+    buckets, status = _load_active_status(path)
+    if status == LOAD_UNREADABLE:
+        _warn_unreadable_once(path)
+    return buckets
 
 
 def _atomic_write_active(buckets: dict, at_ms: int,
                          path: str | Path | None = None) -> None:
-    """原子寫活躍表（temp + os.replace）。失敗向上拋給 apply_verdict 收斂。"""
+    """原子寫活躍表（temp + fsync + os.replace）。失敗向上拋給 apply_verdict 收斂。
+
+    fsync 不可省：只有 os.replace 的話，內容可能還在作業系統快取裡就換名，斷電後目的地
+    會留下零長度／半截檔——那正是上面 UNREADABLE 的自產來源（本機有斷電事件史）。
+    """
     p = active_path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {"version": 1, "updated_at_ms": int(at_ms), "buckets": buckets}
@@ -112,6 +173,8 @@ def _atomic_write_active(buckets: dict, at_ms: int,
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, p)
     except Exception:
         try:
@@ -180,7 +243,8 @@ def apply_verdict(verdict, *, symbol: str, quadrant: str,
     norm_chal = _norm_alloc(challenger_alloc)
     norm_champ = _norm_alloc(champion_alloc)
 
-    buckets = _load_active(active_path)
+    buckets, load_status = _load_active_status(active_path)
+    unreadable = load_status == LOAD_UNREADABLE
     prev = buckets.get(bkey) or {}
     prev_alloc = prev.get("tp_alloc")
 
@@ -188,7 +252,16 @@ def apply_verdict(verdict, *, symbol: str, quadrant: str,
     to_alloc = prev_alloc
     note = ""
 
-    if promote and norm_chal is not None:
+    if unreadable:
+        # ⛔ 讀不出來時**絕不寫**：舊碼會拿空 buckets 當整張表覆寫回去，把其餘所有已晉升桶
+        # 原子地、乾淨地抹掉（不可逆）。停手＝維持現狀，原檔原封不動留給人工檢視。
+        _warn_unreadable_once(active_path)
+        action = "blocked_unreadable_active"
+        to_alloc = None
+        note = ("活躍覆寫表存在但讀不出來 → 本次裁決停手不寫（原檔未動）。"
+                "⛔ 若照舊寫入會把整張表抹成只剩這一桶，其餘已晉升桶不可逆消失。"
+                "請人工檢視該檔後再讓優化器續行。")
+    elif promote and norm_chal is not None:
         action = "promote"
         to_alloc = list(norm_chal)
         buckets[bkey] = {
@@ -217,6 +290,10 @@ def apply_verdict(verdict, *, symbol: str, quadrant: str,
         "l2_bucket_key": getattr(verdict, "bucket_key", bkey),
         "promote": promote,
         "from_alloc": list(prev_alloc) if prev_alloc else None,
+        # ⛔ 讀不出來時 from_alloc 的 None 是「未知」不是「本來就沒有」——用旗標把兩者分開，
+        # 否則錯誤宣稱會沉進 append-only 稽核軌跡，事後再也分不出來。
+        "from_kind_known": not unreadable,
+        "active_unreadable": unreadable,
         "to_alloc": list(to_alloc) if to_alloc else None,
         "challenger_alloc": list(norm_chal) if norm_chal else None,
         "champion_alloc": list(norm_champ) if norm_champ else None,
@@ -234,9 +311,25 @@ def apply_verdict(verdict, *, symbol: str, quadrant: str,
 def rollback(symbol: str, quadrant: str, *, at_ms: int, reason: str = "",
              active_path: str | Path | None = None,
              audit_path: str | Path | None = None) -> dict:
-    """移除某桶覆寫 → 回退 CONFIG 預設（事後人工/CEO 可逆）。一律寫稽核。"""
+    """移除某桶覆寫 → 回退 CONFIG 預設（事後人工/CEO 可逆）。一律寫稽核。
+
+    ⛔ 活躍表讀不出來時**不得回報回退成功**：舊碼會因 buckets={} 判 existed=False，回一句
+    「本來就沒有可移除的覆寫」——但檔裡的覆寫可能原封不動還在生效，等於安全閥在最需要它的
+    時候假裝自己動過。改為明確擋下並留痕，讓人看得到「回退沒有發生」。
+    """
     bkey = bucket_key(symbol, quadrant)
-    buckets = _load_active(active_path)
+    buckets, load_status = _load_active_status(active_path)
+    if load_status == LOAD_UNREADABLE:
+        _warn_unreadable_once(active_path)
+        note = ("活躍覆寫表存在但讀不出來 → 回退**未執行**（原檔未動）。"
+                "⛔ 不可讀成『本來就沒有覆寫』：內容未知，覆寫可能仍在生效。")
+        _append_audit({"at_ms": int(at_ms), "action": "rollback_blocked_unreadable",
+                       "bucket": bkey, "existed": None, "from_alloc": None,
+                       "from_kind_known": False, "active_unreadable": True,
+                       "to_alloc": None, "reason": reason or "manual",
+                       "note": note}, audit_path)
+        return {"action": "rollback_blocked_unreadable", "bucket": bkey,
+                "existed": None, "note": note}
     prev = buckets.get(bkey) or {}
     prev_alloc = prev.get("tp_alloc")
     existed = bkey in buckets
@@ -258,8 +351,16 @@ def rollback(symbol: str, quadrant: str, *, at_ms: int, reason: str = "",
 
 # ── 繁中渲染（CEO 報告透明化） ────────────────────────────────────────
 def render_active(active_path: str | Path | None = None) -> str:
-    """活躍覆寫表摘要（給 CEO/調參報告）。空表 → 明確說「無覆寫，全用預設」。"""
-    buckets = _load_active(active_path)
+    """活躍覆寫表摘要（給 CEO/調參報告）。空表 → 明確說「無覆寫，全用預設」。
+
+    ⛔ 讀不出來 ≠ 空表：舊版會把壞檔渲染成「目前 0 桶有覆寫……這是預期的誠實狀態」，
+    在報告裡把一個未知狀態講成一句正面保證。
+    """
+    buckets, load_status = _load_active_status(active_path)
+    if load_status == LOAD_UNREADABLE:
+        return ("🚨 <b>自動參數庫</b>：活躍表<b>存在但讀不出來</b>（內容未知）。\n"
+                "<i>⛔ 這不是「0 桶覆寫」——進場已 fail-safe 退回 CONFIG 預設 TP 分配，"
+                "但晉升與回退已自動停手，原檔保留待人工檢視。</i>")
     if not buckets:
         return ("🎛️ <b>自動參數庫</b>：目前 <b>0</b> 桶有覆寫（全用 CONFIG 預設 TP 分配）。\n"
                 "<i>樣本未達 L2 統計門檻前不會有任何覆寫 — 這是預期的誠實狀態。</i>")
