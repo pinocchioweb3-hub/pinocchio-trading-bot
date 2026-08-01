@@ -259,6 +259,15 @@ async def _handle_deepdive_intent_callback(tg: TelegramClient, cq: dict) -> None
     if not paper:
         await tg.answer_callback_query(cq_id, "找不到此標的的深度分析計畫", show_alert=True)
         return
+    if paper.get("entry_zone_status") == "unreadable":
+        # v205：⛔ 這不是「找不到計畫」，也不是「它是市價單」——計畫在，但進場階梯讀不出來。
+        #   使用者是照這份 JSON 手下真錢單的人，寧可不給，也不可給一份看起來很確定的市價計畫。
+        await tg.answer_callback_query(
+            cq_id,
+            "這筆計畫的進場階梯讀不出來（entry_splits 壞檔）——這不等於它是市價單，"
+            "已拒絕產生可執行 JSON。請改看卡片文字內容人工判讀。",
+            show_alert=True)
+        return
     try:
         intent = intent_from_deepdive_paper(paper, asset_class=_intent_asset_class(sym))
     except Exception as e:
@@ -717,7 +726,16 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
             #   ⛔ 只讀模擬盤 paper_trades（紅線①）。
             from l3_dispatcher.paper_journal import get_latest_deepdive_plan
             paper = get_latest_deepdive_plan(symbol=sym_arg)
-            if paper:
+            if paper and paper.get("entry_zone_status") == "unreadable":
+                # v205：計畫在，但進場階梯讀不出來 ⇒ fail-closed，且**要出聲**。
+                #   ⛔ 不可沿用下面那句「找不到近期訊號快照」——那是對讀失敗說謊。
+                who = f"「{sym_arg}」" if sym_arg else ""
+                reply = (f"找到了{who}最近一筆深度分析計畫，但它的<b>進場階梯讀不出來</b>"
+                         "（entry_splits 壞檔）。\n"
+                         "⛔ 這<b>不等於</b>它是市價單，也不等於沒有這筆計畫——"
+                         "因為分不出來，已拒絕產生可執行 JSON。\n"
+                         "請改看該幣的深度分析卡片文字，人工判讀進場區。")
+            elif paper:
                 try:
                     from telegram_bot.plan import intent_from_deepdive_paper
                     intent = intent_from_deepdive_paper(
@@ -726,10 +744,11 @@ async def _handle_command(tg: TelegramClient, msg: dict) -> None:
                 except Exception as e:
                     print(f"[callbacks] deepdive intent error: {type(e).__name__}: {e}")
                 return
-            who = f"「{sym_arg}」的" if sym_arg else ""
-            reply = (f"找不到{who}近期訊號快照。\n"
-                     "FIRE 訊號發出後即可用 <code>/intent</code> 取得它的可執行 JSON，"
-                     "或直接點訊號卡片上的「📋 複製 JSON」按鈕。")
+            else:
+                who = f"「{sym_arg}」的" if sym_arg else ""
+                reply = (f"找不到{who}近期訊號快照。\n"
+                         "FIRE 訊號發出後即可用 <code>/intent</code> 取得它的可執行 JSON，"
+                         "或直接點訊號卡片上的「📋 複製 JSON」按鈕。")
         else:
             try:
                 await _send_intent_json(tg, decision, thread_id, intro=_INTENT_INTRO)

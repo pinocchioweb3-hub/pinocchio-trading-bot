@@ -338,6 +338,13 @@ def intent_from_deepdive_paper(paper: dict[str, Any], *,
 
     ⛔ 紅線①：輸入只來自 paper_trades 重建的 plan dict（呼叫端保證），永不碰真錢帳本 trades。
     """
+    # v205：進場階梯讀不出來的計畫，永遠不得編成可執行 intent。呼叫端各自都有攔截，
+    #   這裡是第二道（防未來新增的呼叫端漏掉）——canonical_from_deepdive 會把
+    #   entry_type 非 limit 的計畫退化成單點市價，那正是要避免的假確定。
+    if paper.get("entry_zone_status") == "unreadable":
+        raise ValueError(
+            "deepdive plan 的進場階梯讀不出來（entry_splits 壞檔）——這不等於它是市價單，"
+            f"拒絕產生可執行 JSON：{paper.get('entry_zone_error')}")
     sym = paper.get("symbol")
     canonical = canonical_from_deepdive(sym, paper)
     snap = {

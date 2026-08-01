@@ -536,6 +536,12 @@ def get_latest_deepdive_plan(symbol: str | None = None,
     限價區間從 entry_splits 的 price min/max 還原；entry_type 由 entry_splits 有無判定。
     找不到（無 deepdive 列 / symbol/direction 不符）→ None，呼叫端安全降級。
 
+    v205：另回 entry_zone_status（ok|unreadable）與 entry_zone_error。entry_splits 存在
+    但解不開（或解得開卻取不到任何 price）時＝**區間不可還原**，此時
+    actionable=False、entry_type=None（⛔ 不填 "market"：那是「不知道」不是「市價單」），
+    呼叫端一律 fail-closed 不得產出可執行 JSON。⛔ 這與「entry_splits 本來就空＝真的是
+    市價進場」是兩種不同的事實，永遠不可折成同一個答案。
+
     ⛔ 紅線①：只讀 paper_trades（模擬盤帳），永不碰真錢帳本 `trades`。
     """
     init_db()
@@ -557,18 +563,34 @@ def get_latest_deepdive_plan(symbol: str | None = None,
         sym, dirn, entry_price, stop_price, tp1, tp2, tp3, entry_at, splits_json = row
         zone_lo = zone_hi = None
         entry_type = "market"
+        zone_status = "ok"                       # ok | unreadable
+        zone_error = None
         if splits_json:
+            # v205：進場階梯「讀不出來」≠「這筆本來就是市價單」。舊碼 except 直接退回
+            #   entry_type="market"，把兩件事折成同一個答案——而這份 dict 正是使用者按
+            #   「📋 複製 JSON」後**照著手下真錢單**的那一份：限定語（這是一段限價階梯、
+            #   區間我還原不出來）會整個消失，下游 canonical_from_deepdive 再把進場區
+            #   退化成單點，最後長得跟一筆正常的市價計畫一模一樣。
             try:
                 prices = [s["price"] for s in json.loads(splits_json)
                           if s.get("price") is not None]
-                if prices:
-                    zone_lo, zone_hi = min(prices), max(prices)
-                    entry_type = "limit"
-            except Exception:
-                zone_lo = zone_hi = None
-                entry_type = "market"
+            except Exception as exc:
+                prices = None
+                zone_status = "unreadable"
+                zone_error = f"{type(exc).__name__}: {exc}"
+            if prices:
+                zone_lo, zone_hi = min(prices), max(prices)
+                entry_type = "limit"
+            elif prices is not None:
+                # 階梯在、但一個可用 price 都取不到：區間同樣不可還原，不可當市價單
+                zone_status = "unreadable"
+                zone_error = "entry_splits 無任何可用 price"
+            if zone_status == "unreadable":
+                entry_type = None                # ⛔ 不填 market：那是「不知道」不是「市價」
         return {
-            "actionable": True,
+            # 讀不出進場區的計畫不是可執行計畫；呼叫端必須據此拒絕產生可執行 JSON。
+            # ⛔ 仍回 dict（非 None）：它跟「根本沒有這筆 deepdive」是兩件事。
+            "actionable": zone_status == "ok",
             "symbol": sym,
             "direction": dirn,
             "entry_type": entry_type,
@@ -578,6 +600,8 @@ def get_latest_deepdive_plan(symbol: str | None = None,
             "stop": stop_price,
             "tp1": tp1, "tp2": tp2, "tp3": tp3,
             "entry_at": entry_at,
+            "entry_zone_status": zone_status,
+            "entry_zone_error": zone_error,
         }
     finally:
         conn.close()
