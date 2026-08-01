@@ -158,7 +158,8 @@ def test_cp950_output_survives_utf8_locale(monkeypatch):
     monkeypatch.setattr(wd, "_CONSOLE_ENCODINGS", ("utf-8", "cp950"))
 
     got = wd._stale_claude_runners()
-    assert got == [(4242, 7200.0)], f"cp950 輸出在 UTF-8 locale 下被吞成 {got!r}"
+    # v189：第三欄=啟動分鐘（模擬輸出無 Min 欄→-1=未知）；本測試意圖=cp950 解碼存活
+    assert got == [(4242, 7200.0, -1)], f"cp950 輸出在 UTF-8 locale 下被吞成 {got!r}"
 
 
 def test_decode_never_raises_on_garbage():
