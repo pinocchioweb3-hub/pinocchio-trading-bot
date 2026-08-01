@@ -149,13 +149,15 @@ async def _send_intent_json(tg: TelegramClient, decision: dict, thread_id,
     """把 decision_dict 編成 trade-intent JSON 後送出（跨所通用、宣告式、永不自動下實盤）。"""
     from .intent_format import to_trade_intent
 
+    unreadable = (decision or {}).get("snapshot_unreadable")
     try:
         intent = to_trade_intent(decision)
     except Exception as e:
-        await tg.send_message(f"⚠️ 無法產生 intent：{type(e).__name__}: {e}",
+        why = f"（此訊號的決策快照本來就讀不出來：{unreadable}）" if unreadable else ""
+        await tg.send_message(f"⚠️ 無法產生 intent：{type(e).__name__}: {e}{why}",
                               parse_mode="HTML", message_thread_id=thread_id)
         return
-    await _emit_intent(tg, intent, thread_id, intro=intro)
+    await _emit_intent(tg, intent, thread_id, intro=_intent_intro_for(decision, intro))
 
 
 _INTENT_INTRO = (
@@ -163,6 +165,22 @@ _INTENT_INTRO = (
     "<i>宣告式、跨所通用——任何支援的交易所 AI agent 都讀得懂這份意圖（進場區／失效價／"
     "風險%／R 目標）。⛔ 永不自動下實盤，需由你或你的 agent 人工執行。</i>"
 )
+
+
+def _intent_intro_for(decision: dict, intro: str = "") -> str:
+    """v204：快照讀不出來時，在 intent JSON 前面加限定語（純函式，好測）。
+
+    ⛔ 只有 trade_journal 明確標出「解不開」才加；欄位本來就是 NULL 的舊訊號不加，
+       否則是反向誤報。價位/方向仍取自帳本真實欄位，所以不是「不要用」，
+       而是「缺了當下的判斷脈絡，請自行複核再決定要不要照做」。
+    """
+    reason = (decision or {}).get("snapshot_unreadable")
+    if not reason:
+        return intro
+    return ("⚠️ <b>這筆訊號的決策快照讀不出來</b>（不是「本來就沒存」——是資料損壞）\n"
+            f"<i>原因：{reason}。下面 JSON 的方向／進場區／止損取自帳本欄位，仍是真實紀錄；"
+            "但當下的綜合分與確認項已經缺失，顯示為空不代表當時沒有。"
+            "⛔ 請自行複核後再決定是否執行。</i>\n\n") + intro
 
 
 async def _handle_intent_callback(tg: TelegramClient, cq: dict) -> None:

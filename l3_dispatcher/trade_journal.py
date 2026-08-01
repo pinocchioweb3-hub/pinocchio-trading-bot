@@ -255,11 +255,23 @@ def get_signal_for_intent(fire_id: int | None = None,
         snap_json, sym, setup, direction, entry_price, stop_price, entry_at = row
 
         blob = None
+        # v204：快照「解不開」與「這筆本來就沒存快照」是兩件事，不可折成同一個 None。
+        #   兩者都會掉進下面的退化重建路徑，回一個脈絡很薄的 decision；不標出來的話，
+        #   使用者在 Telegram／信任頁看到的是「一筆較舊的訊號」，而真相是「資料損壞」。
+        #   他是照這份 JSON 用手下真錢單的人——該不該先複核，兩種情況答案不同。
+        #   ⚠️ 價位/方向不受影響：那些取自 trades 的真實欄位，不是壞掉的 blob。
+        snapshot_unreadable: str | None = None
         if snap_json:
             try:
                 blob = json.loads(snap_json)
-            except Exception:
+            except Exception as e:
                 blob = None
+                snapshot_unreadable = f"decision_snapshot 解不開（{type(e).__name__}）"
+            else:
+                if not isinstance(blob, dict):
+                    snapshot_unreadable = (
+                        f"decision_snapshot 解出來不是 dict（{type(blob).__name__}）")
+                    blob = None
 
         # 完整 decision（v45 起）：忠實照用
         if (isinstance(blob, dict) and blob.get("direction") and blob.get("setup_name")
@@ -273,13 +285,18 @@ def get_signal_for_intent(fire_id: int | None = None,
         snap.setdefault("symbol", sym)
         snap.setdefault("price", entry_price)
         snap.setdefault("ts", entry_at)
-        return {
+        out = {
             "direction": direction,
             "setup_name": setup,
             "composite_score": None,
             "confirmed": [],
             "snapshot": snap,
         }
+        if snapshot_unreadable:
+            # 只有「壞掉」才帶這個鍵；欄位是 NULL（早於 v45 的舊訊號）維持乾淨，
+            # 否則就變成反向誤報：把「本來就沒有」講成「壞掉」。
+            out["snapshot_unreadable"] = snapshot_unreadable
+        return out
     finally:
         conn.close()
 
