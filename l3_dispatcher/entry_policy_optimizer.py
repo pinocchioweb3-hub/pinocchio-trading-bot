@@ -153,11 +153,15 @@ def _signal_idx(ts_list: list[int], entry_at: int) -> int:
 
 async def load_plans_and_candles(rows: list[dict], *, get_ohlc=None
                                  ) -> tuple[list[EntryPlan], dict[str, str],
-                                            dict[str, list[dict]]]:
-    """把資料列轉成 (plans, quadrant_by_pid, candles_by_pid)。
+                                            dict[str, list[dict]], dict]:
+    """把資料列轉成 (plans, quadrant_by_pid, candles_by_pid, candles_diag)。
 
     效率：每個 symbol 只抓**一段**涵蓋其所有訊號的 K 線序列，所有該 symbol 的計畫共用同一 list
     （以絕對 signal_idx 索引）。完整重放需訊號後 _FORWARD_BARS 根；不足（如太新）者誠實略過。
+
+    v206：第四個回傳值 candles_diag 記「整個 symbol 被丟掉」的成因與筆數——舊碼把取用**失敗**
+    折成「這個 symbol 本來就沒源」，兩者都只是靜默 continue，於是資料壞掉的那天長得跟
+    「這批本來就沒這些標的」一模一樣，而樣本數正是本優化器唯一的瓶頸。
     """
     if get_ohlc is None:
         from backtest.data_loader import get_ohlc as _g
@@ -178,6 +182,12 @@ async def load_plans_and_candles(rows: list[dict], *, get_ohlc=None
     quad_by_pid: dict[str, str] = {}
     candles_by_pid: dict[str, list[dict]] = {}
     fwd_ms = _FORWARD_BARS * _STEP_MS
+    # v206：兩種「整 symbol 掉出樣本」不可折成同一件事
+    #   fetch_error＝取 K 線丟例外（**確定**是資料/網路問題）
+    #   empty      ＝回空清單。⚠️ 成因分不出來：可能真的無源（美股/黃金 OKX 無永續），
+    #                也可能是 data_loader.get_ohlc 自己把取用失敗吞成 []。不得單方面
+    #                宣稱是前者——那正是把「讀不出來」講成「本來就沒有」。
+    diag: dict = {"fetch_error": {}, "empty": [], "n_rows_dropped": 0}
 
     for sym, items in by_symbol.items():
         entries = [int(r["entry_at"]) for r, _ in items]
@@ -186,10 +196,14 @@ async def load_plans_and_candles(rows: list[dict], *, get_ohlc=None
         days = max(1, (end_ms - start_desired) // 86_400_000 + 1)
         try:
             bars = await get_ohlc(sym, TF, int(days), end_ms=end_ms)
-        except Exception:
-            bars = []
+        except Exception as e:
+            diag["fetch_error"][sym] = f"{type(e).__name__}: {e}"
+            diag["n_rows_dropped"] += len(items)
+            continue
         if not bars:
-            continue                          # 無源（如美股/黃金 OKX 無永續）→ 整 symbol 略過
+            diag["empty"].append(sym)
+            diag["n_rows_dropped"] += len(items)
+            continue                          # 成因未知（無源／取用失敗）→ 整 symbol 略過
         ts_list = [int(b["ts"]) for b in bars]
         n = len(bars)
         for row, (direction, limit_px, stop_px, tp_px) in items:
@@ -205,7 +219,7 @@ async def load_plans_and_candles(rows: list[dict], *, get_ohlc=None
                                    tp_px=tp_px, reality_filled=reality_filled))
             quad_by_pid[pid] = _quadrant_of(row)
             candles_by_pid[pid] = bars        # 共用參照（同 symbol 同序列）
-    return plans, quad_by_pid, candles_by_pid
+    return plans, quad_by_pid, candles_by_pid, diag
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -346,7 +360,8 @@ async def run_entry_optimization(*, days: int = 120, at_ms: int | None = None,
         from backtest.l2_stat_gates import TrialLedger, default_ledger_path
         ledger = TrialLedger(default_ledger_path())
 
-    plans, quad_by_pid, candles_by_pid = await load_plans_and_candles(rows, get_ohlc=get_ohlc)
+    plans, quad_by_pid, candles_by_pid, _cdiag = await load_plans_and_candles(
+        rows, get_ohlc=get_ohlc)
     # v130（獵捕workflow）：optimize_entry=119桶×逐根重放+trial_ledger全檔re-parse，實測
     #   72.5s 純同步——v129 只包了 auto_tuner 的 3 段、漏了這段（它在 await 皮下面）。
     #   丟 thread 讓事件迴圈/心跳照轉（async 取 K 線段留在迴圈上）。
@@ -358,6 +373,11 @@ async def run_entry_optimization(*, days: int = 120, at_ms: int | None = None,
     # v202：被「快照讀不出來」擋掉的筆數要單獨可見——混進 n_eligible 的落差裡
     #   會跟「太新／窗不足」等合法略過長得一樣，看不出是資料壞了。
     res["n_excluded_unreadable_snapshot"] = sum(1 for r in rows if _quadrant_of(r) is None)
+    # v206：取不到 K 線而**整個 symbol 掉出樣本**的筆數要單獨可見。
+    #   舊碼靜默 continue ⇒ 「今天 Binance/OKX 取不到料」與「這批本來就沒這些標的」
+    #   在報告上完全同形，而 n_aligned 差門檻幾筆正是每輪唯一被讀的數字。
+    res["candles_diag"] = _cdiag
+    res["n_excluded_no_candles"] = int(_cdiag.get("n_rows_dropped") or 0)
     res["cohort"] = {"active_generation": _cohort_gen, "mix": _cohort_mix,
                      "n_in": _n_in, "n_kept": len(rows),
                      "n_excluded_other_generation": _n_in - len(rows)}
@@ -374,6 +394,30 @@ def _render_unreadable_line(result: dict) -> str:
         return ""
     return (f"⛔ 另有 <b>{n}</b> 筆進場快照讀不出來（壞檔／型別不對）＝regime 與凍結計畫皆未知，"
             f"已排除於重放之外（不併入 unknown 桶、不計入 minTRL 樣本）")
+
+
+def _render_no_candles_line(result: dict) -> str:
+    """v206：取不到 K 線而整個 symbol 掉出樣本者必須出聲，且**不得**替它斷言成因。
+
+    ⛔ 不可寫成「無源」——回空清單分不出「真的沒這個永續」與「取用失敗被吞成空」；
+    寫死前者就是本專案獵捕了 26 次的同一個物種（把讀不出來折成本來就沒有）。
+    """
+    d = (result or {}).get("candles_diag") or {}
+    n_rows = int(d.get("n_rows_dropped") or 0)
+    if not n_rows:
+        return ""
+    err, empty = d.get("fetch_error") or {}, d.get("empty") or []
+    parts = []
+    if err:
+        parts.append(f"取 K 線丟例外 {len(err)} 檔（{'、'.join(sorted(err)[:5])}"
+                     f"{'…' if len(err) > 5 else ''}）＝確定是資料/網路問題")
+    if empty:
+        parts.append(f"回空序列 {len(empty)} 檔（{'、'.join(sorted(empty)[:5])}"
+                     f"{'…' if len(empty) > 5 else ''}）＝**成因不明**：可能真的無源"
+                     f"（美股/黃金無永續），也可能是取用失敗被吞成空")
+    return (f"⛔ 另有 <b>{n_rows}</b> 筆因整個標的取不到 K 線而未進重放："
+            + "；".join(parts)
+            + "——⚠️ 這會直接縮小 n_aligned，不可讀成『樣本天生就這麼少』")
 
 
 def _render_cohort_line(result: dict) -> str:
@@ -397,8 +441,18 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
             return ("🎚️ <b>入場積極度自動優化器</b>\n"
                     f"掃 {result.get('n_rows', '?')} 筆，但**可用桶數為 0**：\n"
                     + _render_unreadable_line(result) + "\n"
-                    "<i>這不是『今天沒樣本』——是樣本讀不出來。請查 paper_trades."
+                    + (_render_no_candles_line(result) + "\n"
+                       if result.get("n_excluded_no_candles") else "")
+                    + "<i>這不是『今天沒樣本』——是樣本讀不出來。請查 paper_trades."
                     "plan_snapshot 欄位是否被寫壞。</i>")
+        # v206：0 桶的第二種「不是沒樣本」——樣本都在，但整批標的取不到 K 線。
+        #   舊碼在這裡回 None（靜音），與「今天真的沒單」同形。
+        if result.get("n_excluded_no_candles"):
+            return ("🎚️ <b>入場積極度自動優化器</b>\n"
+                    f"掃 {result.get('n_rows', '?')} 筆，但**可用桶數為 0**：\n"
+                    + _render_no_candles_line(result) + "\n"
+                    "<i>這不是『今天沒樣本』——是取不到 K 線。請查 backtest/data_loader "
+                    "的 Binance 補檔與 OKX 備援是否雙雙失敗（ohlc 快取亦無涵蓋）。</i>")
         return None
     # v82：0 晉升日（常態）每桶皆「⏸️維持」零資訊 → 收斂為結論一行＋收斂進度，
     #   把每日 ~4800 字洗版牆壓成可掃讀的一則；全文明細仍可由 active 覆寫表/帳本回溯。
@@ -415,6 +469,8 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
                 + _render_cohort_line(result) + "\n"
                 + (_render_unreadable_line(result) + "\n"
                    if _render_unreadable_line(result) else "")
+                + (_render_no_candles_line(result) + "\n"
+                   if _render_no_candles_line(result) else "")
                 + eps.render_active(active_path) + "\n"
                 "<i>純驅動模擬盤 paper／demo，真錢執行層永不讀（紅線①）；"
                 "覆寫表恆空＝零行為變更，透明可事後 rollback。</i>")
@@ -425,7 +481,8 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
              f"分 {result['n_buckets']} 桶（per-symbol×regime + 象限池 + 全域池，"
              f"其中池化桶 {result.get('n_pooled', '?')}）｜本輪晉升 {result['n_promoted']} 桶",
              _render_cohort_line(result),
-             _render_unreadable_line(result)]
+             _render_unreadable_line(result),
+             _render_no_candles_line(result)]
     for b in result["buckets"]:
         ck = eps._KIND_ZH.get(b["champion_kind"], b["champion_kind"])
         head = f"<b>[{eps._bucket_label(b['bucket'])}]</b> {b['n_plans']} 筆｜champion {ck}"
@@ -514,7 +571,8 @@ def _selftest() -> bool:
         # (a) 配接器：PULL 的限價會成交、TREND 永不回踩 → 建計畫＋定位 signal_idx
         rows = ([_row(i, "PULL", "tp1") for i in range(6)]            # 現實真成交
                 + [_row(100 + i, "TREND", "entry_expired") for i in range(6)])  # 逾時未成交
-        plans, quad, cbp = asyncio.run(load_plans_and_candles(rows, get_ohlc=_fake_ohlc))
+        plans, quad, cbp, _dg = asyncio.run(load_plans_and_candles(rows, get_ohlc=_fake_ohlc))
+        assert _dg["n_rows_dropped"] == 0, "K 線正常時不得憑空記掉樣本"
         assert len(plans) == 12, f"應建 12 計畫，實得 {len(plans)}"
         assert all(p.signal_idx == 0 for p in plans), "entry_at=ts0 → signal_idx 應為 0"
         # 現實真成交者 reality_filled=True；entry_expired 者 False
@@ -572,15 +630,28 @@ def _selftest() -> bool:
         late_ts = ts0 + (len(series_pull) - 5) * _STEP_MS
         row_late = dict(_row(999, "PULL", "tp1"))
         row_late["entry_at"] = late_ts
-        plans2, _, _ = asyncio.run(load_plans_and_candles([row_late], get_ohlc=_fake_ohlc))
+        plans2, _, _, _ = asyncio.run(load_plans_and_candles([row_late], get_ohlc=_fake_ohlc))
         assert plans2 == [], "訊號後完整窗不足者應誠實略過"
 
-        # (i) 無 K 線源（如美股）→ 整 symbol 略過，不崩
+        # (i) 取不到 K 線（回空）→ 整 symbol 略過，不崩；v206：且必須被記下來，
+        #     成因歸「不明」而非「無源」——回空分不出真無源與取用失敗被吞成空。
         async def _empty_ohlc(symbol, tf, days, end_ms=None):
             return []
-        plans3, _, _ = asyncio.run(
+        plans3, _, _, dg3 = asyncio.run(
             load_plans_and_candles([_row(1, "MU", "tp1")], get_ohlc=_empty_ohlc))
         assert plans3 == []
+        assert dg3["empty"] == ["MU"] and dg3["n_rows_dropped"] == 1
+        assert dg3["fetch_error"] == {}
+
+        # (j) v206：取 K 線丟例外＝**確定**是資料/網路問題，不得與 (i) 同格
+        async def _boom_ohlc(symbol, tf, days, end_ms=None):
+            raise RuntimeError("binance 503")
+        plans4, _, _, dg4 = asyncio.run(
+            load_plans_and_candles([_row(1, "MU", "tp1")], get_ohlc=_boom_ohlc))
+        assert plans4 == [] and dg4["empty"] == []
+        assert "MU" in dg4["fetch_error"] and dg4["n_rows_dropped"] == 1
+        _line = _render_no_candles_line({"candles_diag": dg4})
+        assert "確定是資料/網路問題" in _line and "n_aligned" in _line
 
     print("  自測通過：配接器(定位/略過太新/無源) + 優化(小樣本0晉升/涵蓋率回補/self-check) "
           "+ task#62階層分桶(per-symbol+象限池+全域池/由一般到具體/池化inert) + L2鏈 + 報告 ✅")

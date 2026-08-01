@@ -145,7 +145,12 @@ async def get_ohlc(symbol: str, tf: str = "1h", days: int = 365,
             finally:
                 await okx.close()
             return d.get("candles", []) if isinstance(d, dict) else []
-        except Exception:
+        except Exception as e2:
+            # v206：兩路都失敗仍回 []（回填迴圈要能略過單一 symbol 繼續跑，不可整輪炸掉），
+            #   但**必須留痕**——舊碼靜默回 []，於是「取不到料」在下游長得跟
+            #   「這個 symbol 本來就沒源」一模一樣（消費端見 entry_policy_optimizer v206）。
+            print(f"[data_loader] okx fallback also failed for {symbol} {tf}: "
+                  f"{type(e2).__name__}: {e2}; 回空序列（⚠️ 這不是『無源』，是取不到）")
             return []
 
 
