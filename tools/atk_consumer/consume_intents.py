@@ -92,6 +92,11 @@ _CLASS_PRIORITY = ("orphan_position", "pnl_unaccounted",
                    # 使用者該先去動的主因，⛔ 不可被這一類擠掉。排在 intent_unreadable
                    # 之前：它是對外回應的問題，比純本地檔的問題更接近斷流主因。
                    "exchange_rows_unreadable",
+                   # v209（r104）：合約規格（market instruments）這輪讀不出來。緊接在
+                   # exchange_rows_unreadable 之後：同樣是「對外查詢的回應讀不到」，
+                   # 同樣不可擠掉連線類主因；後果比它輕（只有那一筆 intent 本輪不接，
+                   # 既有倉照常管理），故排它之後。
+                   "instrument_spec_unreadable",
                    # v192（r86）：讀本地 intent 檔失敗——⛔ 必須排在連線類**之後**。
                    # 理由同本表開頭：它是純本地失敗，斷流輪照樣會被記到；排前面會把
                    # 「對外連不上」這個真正主因從代表類別擠掉，使用者拿到的處置建議
@@ -479,6 +484,16 @@ _CLASS_HINT = {
                          "%LOCALAPPDATA%\\TradingBot\\intent_outbox 找日誌指名的那個檔"
                          "（檔名＝intent_id），確認內容確實壞掉後刪除即可"
                          "（原始訊號在 trade_journal.db 仍有紀錄）",
+    "instrument_spec_unreadable": "算張數要用的合約規格（ctVal／lotSz／minSz）這一輪"
+                                  "讀不出來（呼叫沒回 0，或回了 0 但輸出解不開／形狀"
+                                  "認不得）→ 那一筆訊號本輪不接，**下輪自動重試**到"
+                                  "expires_at 為止。⛔ 這條**不是**「這筆單不該下」——"
+                                  "單子本身沒問題，是規格沒讀到。管線其餘部分照常，"
+                                  "既有倉的止損仍掛在交易所。處置：若同時段有認證／"
+                                  "限流／逾時類別，先修那個；只有這一類時手動跑一次 "
+                                  "`okx --profile <profile> market instruments "
+                                  "--instType SWAP --instId <instId> --json` 看實際"
+                                  "輸出長什麼樣（CLI 剛升級過就回報這個新形狀）",
     "cli_missing": "okx CLI 不存在 → npm install -g @okx_ai/okx-trade-cli",
     "rate_limit": "被限流 → 通常自癒；持續出現才需降頻",
     "timeout": "呼叫逾時 → 檢查網路；持續出現代表對外連線有問題",
@@ -673,38 +688,70 @@ def finish_round(fails: dict, now_s: float | None = None,
         return {}
 
 
-def contracts_for(inst_id: str, entry: float, stop: float, ct_val_cache: dict) -> float | None:
-    """風險預算→張數。sz=風險USD÷|entry−stop|÷ctVal，向下取整到 lotSz。錯→None 不下單。"""
+# v209（監督員 r104）：張數換算失敗的兩種來源必須分得開。
+# 「終局」＝再讀一百次也是同一個答案，因為不成立的是**這筆單本身**。
+_SIZING_TERMINAL = ("bad_distance", "below_min_size", "below_min_after_cap",
+                    "spec_not_found")
+
+
+def sizing_retryable(reason: str | None) -> bool:
+    """張數換算失敗該不該留給下輪重試（純函式，永不 raise）。
+
+    ⛔ 未知（含未分類的 None）一律回 True。把「這輪讀不出合約規格」折成「這筆單
+    本來就不該下」＝永久丟掉一筆真錢訊號，而且連「過期丟棄」的統計都算不到它
+    （那個計數只數活到 expires_at 的 intent）。日後新增失敗來源時的安全預設，
+    也必須落在重試側——忘了登記只會多重試幾輪，登記錯邊會靜靜吃掉單子。"""
+    return reason not in _SIZING_TERMINAL
+
+
+def contracts_for(inst_id: str, entry: float, stop: float, ct_val_cache: dict,
+                  *, out: dict | None = None) -> float | None:
+    """風險預算→張數。sz=風險USD÷|entry−stop|÷ctVal，向下取整到 lotSz。錯→None 不下單。
+
+    v209（r104）：回 None 時把原因寫進 out["reason"]，呼叫端據此決定「下輪重試」
+    還是「永久跳過」（見 sizing_retryable）。⛔ out 沒被填到時呼叫端一律當未知。"""
+    def _fail(reason: str) -> None:
+        if out is not None:
+            out["reason"] = reason
+        return None
+
     spec = ct_val_cache.get(inst_id)
     if spec is None:
-        code, out = _okx(["market", "instruments", "--instType", "SWAP",
-                          "--instId", inst_id])
+        code, cli_out = _okx(["market", "instruments", "--instType", "SWAP",
+                              "--instId", inst_id])
         if code != 0:
-            return None
+            return _fail("spec_cli_failed")   # _okx 那層已記了連線類故障
         try:
-            raw = json.loads(out)
-            # CLI --json 頂層可能是 list（實測 v1.4.2）或 {"data":[...]}，兩者都容
-            items = raw.get("data") if isinstance(raw, dict) else raw
+            # CLI --json 頂層可能是 list（實測 v1.4.2）或 {"data":[...]}，兩者都容；
+            # v209：其餘形狀＝認不得＝未知（舊碼的 raw.get("data") 會回 None，
+            # 接著 None[0] 拋 TypeError，與「這筆單不成立」得到同一個答案）
+            items = parse_okx_rows(json.loads(cli_out))
+            if items is None:
+                return _fail("spec_unreadable")
+            if not items:
+                # {"data": []}＝交易所**確認**沒有這個 instId（v208 的邊界線）：
+                # 重試一百次也不會長出來 ⇒ 終局，不可當未知每輪重試
+                return _fail("spec_not_found")
             item = items[0]
             spec = {"ctVal": float(item["ctVal"]), "lotSz": float(item["lotSz"]),
                     "minSz": float(item["minSz"])}
             ct_val_cache[inst_id] = spec
         except Exception:  # noqa: BLE001
-            return None
+            return _fail("spec_unreadable")
     risk = min(RISK_USD, RISK_USD_CAP)
     dist = abs(entry - stop)
     if dist <= 0 or spec["ctVal"] <= 0:
-        return None
+        return _fail("bad_distance")
     units = risk / dist                      # 標的單位數
     sz = units / spec["ctVal"]               # 合約張數
     lot = spec["lotSz"]
     sz = int(sz / lot) * lot                 # 向下取整到 lotSz
     if sz < spec["minSz"]:
-        return None
+        return _fail("below_min_size")
     if sz * spec["ctVal"] * entry > NOTIONAL_CAP_USD:   # 名義值夾層
         sz = int(NOTIONAL_CAP_USD / (spec["ctVal"] * entry) / lot) * lot
         if sz < spec["minSz"]:
-            return None
+            return _fail("below_min_after_cap")
     return round(sz, 8)
 
 
@@ -1539,10 +1586,25 @@ def main() -> int:
                 print(f"⏸ {iid} {intent.get('symbol')} 本輪查不到交易所部位——"
                       "無法確認有無孤兒，不接新單（下輪重試）")
                 continue
-            sz = contracts_for(intent["inst_id"], intent["entry"], intent["stop"], ct_cache)
+            # v209（監督員 r104）：張數換算失敗分兩態。舊碼一律 done.add＝**永久**
+            #   丟棄，與下面那行「只在成功時記已處理：失敗留給下輪重試」自相矛盾——
+            #   規格這輪讀不出來（CLI 沒回 0／輸出解不開／形狀認不得）本是最典型的
+            #   暫時性故障，卻讓一筆真錢訊號在第一次讀取失敗時就消失，連 expires_at
+            #   的重試窗都用不到，也算不進「過期丟棄」的統計。
+            sz_why: dict = {}
+            sz = contracts_for(intent["inst_id"], intent["entry"], intent["stop"],
+                               ct_cache, out=sz_why)
             if sz is None:
-                print(f"❌ {iid} 張數換算失敗——跳過（不猜）")
-                done.add(iid)
+                why = sz_why.get("reason")
+                if sizing_retryable(why):
+                    print(f"⏸ {iid} 這輪讀不出合約規格（{why or '未分類'}）——"
+                          "本輪不接，下輪重試（不記 done）")
+                    _note_fail("instrument_spec_unreadable",
+                               f"{iid} {intent['inst_id']} 合約規格讀不出來"
+                               f"（{why or '未分類'}）")
+                else:
+                    print(f"❌ {iid} 張數換算不成立（{why}）——跳過（不猜）")
+                    done.add(iid)
                 continue
             # 只在成功時記已處理：失敗留給下輪重試（OKX clOrdId 冪等擋重複成交，
             # intent 過期窗兜底——永久性錯誤最多重試到 expires_at）
