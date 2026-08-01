@@ -166,6 +166,52 @@ def _overlay(keys: tuple[str, ...], provided) -> dict:
     return out
 
 
+# ════════════════════════════════════════════════════════════════════════
+#  讀取側（v202）：DB 的 plan_snapshot 欄位 → 三態
+# ════════════════════════════════════════════════════════════════════════
+#  為什麼要三態（同物種第 22 次「把讀不出來講成沒有」）：
+#    舊碼四處各自 `json.loads(raw or "") or {}` + except → {}，於是
+#      (a)「這筆單本來就沒有快照」（#47 之前的舊單，合法、可預期）與
+#      (b)「快照在，但解不開／型別不對」（＝**讀失敗**，我們其實不知道當時的 regime）
+#    折成同一個 quadrant='unknown' 桶。unknown 不是垃圾桶——它會被拿去分桶、
+#    湊 minTRL≥30 的樣本數、進覆寫表晉升判定；把「讀壞的」混進去＝拿不知道當已知。
+#    另外 (b) 之中「合法 JSON 但不是 dict」在舊碼會直接 .get() 炸 AttributeError
+#    （lessons_store 早已擋、兩支優化器沒擋），實測會讓整輪 run_optimization 掛掉。
+SNAP_OK = "ok"
+SNAP_MISSING = "missing"          # 欄位 NULL/空 ＝ 本來就沒有快照（合法舊單）
+SNAP_UNREADABLE = "unreadable"    # 欄位有內容但解不開／不是 dict ＝ 讀失敗，**不等於沒有**
+
+
+def read_plan_snapshot(raw) -> tuple[dict | None, str]:
+    """把 DB 的 plan_snapshot 欄位讀成 (快照dict|None, 狀態)。唯一正解，四處共用。
+
+    回傳狀態 SNAP_OK / SNAP_MISSING / SNAP_UNREADABLE。呼叫端**必須**分辨後兩者：
+    missing 可照舊歸 'unknown'；unreadable 一律不得混進任何統計桶（誠實排除並出聲）。
+    """
+    if raw is None:
+        return None, SNAP_MISSING
+    if isinstance(raw, dict):        # 已經是 dict（記帳路徑直接傳物件）
+        return raw, SNAP_OK
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except Exception:
+            return None, SNAP_UNREADABLE
+    if not isinstance(raw, str):
+        # 非字串型別（int/list/…）不是「沒有」，是欄位被寫壞了
+        return None, SNAP_UNREADABLE
+    if not raw.strip():
+        return None, SNAP_MISSING     # 空字串＝沒存過快照，與 NULL 同義
+    try:
+        v = json.loads(raw)
+    except Exception:
+        return None, SNAP_UNREADABLE
+    if not isinstance(v, dict):
+        # 合法 JSON 但型別不對（list/int/str/None）：舊碼會讓下游 .get() 炸
+        return None, SNAP_UNREADABLE
+    return v, SNAP_OK
+
+
 def build_plan_snapshot(*, source: str, direction: str,
                         entry_price, planned_stop,
                         tp1, tp2, tp3,

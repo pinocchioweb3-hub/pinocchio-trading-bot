@@ -28,6 +28,7 @@ import time
 from botpaths import db_path as _db_path
 from l3_dispatcher import auto_param_store as aps
 from l3_dispatcher.champion_challenger import AllocPolicy, champion_alloc, compare_allocation
+from l3_dispatcher.plan_snapshot import SNAP_UNREADABLE, read_plan_snapshot
 
 DB_PATH = _db_path("trade_journal.db")
 
@@ -117,13 +118,21 @@ def _render_cohort_line(result: dict) -> str:
             f"全窗分佈 {mix or '—'}）")
 
 
+def _render_unreadable_line(result: dict) -> str:
+    """v202：被排除的『快照讀不出來』筆數必須出聲——靜默排除會讓報告看起來像全掃過了。"""
+    n = (result or {}).get("n_excluded_unreadable_snapshot") or 0
+    if not n:
+        return ""
+    return (f"⛔ 另有 <b>{n}</b> 筆進場快照讀不出來（壞檔／型別不對）＝當時 regime 未知，"
+            f"已排除於分桶之外（不併入 unknown 桶、不計入 minTRL 樣本）")
+
+
 def _quadrant_of(row: dict) -> str:
-    """與 lessons_store.distill 同規則：plan_snapshot.regime_at_entry.oi_price_quadrant。"""
-    import json
-    try:
-        snap = json.loads(row.get("plan_snapshot") or "") or {}
-    except Exception:
-        snap = {}
+    """與 lessons_store.distill 同規則：plan_snapshot.regime_at_entry.oi_price_quadrant。
+    ⚠️ 讀不出快照者回 None（不是 'unknown'）——呼叫端必須把它排除在分桶之外。"""
+    snap, status = read_plan_snapshot(row.get("plan_snapshot"))
+    if status == SNAP_UNREADABLE:
+        return None
     regime = (snap or {}).get("regime_at_entry") or {}
     return regime.get("oi_price_quadrant") or "unknown"
 
@@ -191,8 +200,15 @@ def run_optimization(*, days: int = 120, at_ms: int | None = None,
     #   全域池(跨一切)。讓碎裂的 per-symbol 桶湊不到 n≥30 時，較一般的池仍可合法達門檻過 L2。
     #   不降門檻（只合法匯集樣本；FDR 多重比較隨桶數變更嚴）；無覆寫時 resolve 階梯恆回 None。
     groups: dict[tuple[str, str], list[dict]] = {}
+    n_unreadable = 0
     for r in rows:
         sym, q = r.get("symbol"), _quadrant_of(r)
+        if q is None:
+            # v202：快照讀不出來＝我們不知道這筆單當時的 regime。放進 unknown 桶等於
+            #   拿「不知道」去墊高樣本數，而樣本數正是 minTRL≥30 晉升閘的判準 ⇒ 誠實排除。
+            #   ⛔ 不可靜默丟棄：計數並在報告出聲（掃了幾筆 vs 用了幾筆要對得起來）。
+            n_unreadable += 1
+            continue
         groups.setdefault((sym, q), []).append(r)               # per-symbol × regime（最具體）
         groups.setdefault((aps.POOL, q), []).append(r)          # 象限池（跨 symbol、同 regime）
         groups.setdefault((aps.POOL, aps.POOL), []).append(r)   # 全域池（跨一切）
@@ -212,7 +228,8 @@ def run_optimization(*, days: int = 120, at_ms: int | None = None,
     n_pooled = sum(1 for b in buckets if b["symbol"] == aps.POOL)
     return {"at_ms": at_ms, "n_buckets": len(buckets), "n_trades": len(rows),
             "n_pooled": n_pooled, "n_promoted": n_promoted, "buckets": buckets,
-            "cohort": cohort}
+            "cohort": cohort,
+            "n_excluded_unreadable_snapshot": n_unreadable}
 
 
 # ── 繁中報告（CEO/調參 Session 透明化） ──────────────────────────────
@@ -221,6 +238,15 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
     if result is None:
         result = run_optimization(active_path=active_path)
     if not result["buckets"]:
+        # v202：「一桶都沒有」有兩種成因，不可折成同一個 None（靜音）：
+        #   真的沒樣本 → 照舊安靜；全部樣本的快照都讀不出來 → 必須出聲，否則
+        #   優化器整輪空轉會長得跟「今天沒單」一模一樣。
+        if result.get("n_excluded_unreadable_snapshot"):
+            return ("🤖 <b>自動優化器</b>（TP 分配）\n"
+                    f"掃 {result['n_trades']} 筆，但**可用桶數為 0**：\n"
+                    + _render_unreadable_line(result) + "\n"
+                    "<i>這不是『今天沒樣本』——是樣本讀不出來。請查 paper_trades."
+                    "plan_snapshot 欄位是否被寫壞。</i>")
         return None
     # v82：0 晉升日（常態）每桶皆「⏸️維持」零資訊 → 收斂為結論一行＋收斂進度，
     #   把每日 ~4800 字洗版牆壓成可掃讀的一則；全文明細仍可由 active 覆寫表/帳本回溯。
@@ -236,13 +262,16 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
                 f"掃 {result['n_trades']} 筆／{result['n_buckets']} 桶｜"
                 f"本輪晉升 <b>0</b> 桶（皆未過 L2{prog}）\n"
                 + _render_cohort_line(result) + "\n"
+                + (_render_unreadable_line(result) + "\n"
+                   if _render_unreadable_line(result) else "")
                 + aps.render_active(active_path) + "\n"
                 "<i>只驅動模擬盤（紅線①）；覆寫表恆空＝零行為變更，可事後 rollback。</i>")
     lines = ["🤖 <b>自動優化器</b>（step8：過 L2 後直接寫模擬盤 TP 分配，即時生效）",
              "━━━━━━━━━━━━━━━━",
              f"掃 {result['n_trades']} 筆已平倉紙上單，分 {result['n_buckets']} 桶"
              f"（symbol×regime）｜本輪晉升 {result['n_promoted']} 桶",
-             _render_cohort_line(result)]
+             _render_cohort_line(result),
+             _render_unreadable_line(result)]
     for b in result["buckets"]:
         champ = "/".join(f"{x*100:.0f}%" for x in b["champion_alloc"])
         head = f"<b>[{b['bucket']}]</b> {b['n_trades']} 筆｜champion {champ}"

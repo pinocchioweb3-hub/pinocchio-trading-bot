@@ -37,6 +37,7 @@ import time
 
 from botpaths import db_path as _db_path
 from l3_dispatcher import entry_policy_store as eps
+from l3_dispatcher.plan_snapshot import SNAP_UNREADABLE, read_plan_snapshot
 from l3_dispatcher.entry_policy_cc import (
     CHAMPION, CHALLENGER_CONVERT, CHALLENGER_MARKET,
     EntryPlan, EntryPolicy, bucket_key as cc_bucket_key, compare_entry_policy,
@@ -91,22 +92,26 @@ def _load_paper_for_entry(days: int = 120, db=None) -> list[dict]:
     return [dict(zip(_COLS, r)) for r in rows]
 
 
-def _quadrant_of(row: dict) -> str:
-    """plan_snapshot.regime_at_entry.oi_price_quadrant（與 lessons_store/auto_optimizer 同切面）。"""
-    try:
-        snap = json.loads(row.get("plan_snapshot") or "") or {}
-    except Exception:
-        snap = {}
+def _quadrant_of(row: dict) -> str | None:
+    """plan_snapshot.regime_at_entry.oi_price_quadrant（與 lessons_store/auto_optimizer 同切面）。
+    ⚠️ v202：讀不出快照者回 None（不是 'unknown'）——呼叫端必須排除，不得併入 unknown 桶。"""
+    snap, status = read_plan_snapshot(row.get("plan_snapshot"))
+    if status == SNAP_UNREADABLE:
+        return None
     return ((snap or {}).get("regime_at_entry") or {}).get("oi_price_quadrant") or "unknown"
 
 
 def _plan_prices(row: dict) -> tuple[str, float, float, float] | None:
     """從 plan_snapshot（優先，凍結於訊號當下）抽 (direction, limit_px, stop_px, tp_px)；
-    缺則退回欄位。任何缺值/退化 → None（誠實略過，不臆造）。"""
-    try:
-        snap = json.loads(row.get("plan_snapshot") or "") or {}
-    except Exception:
-        snap = {}
+    缺則退回欄位。任何缺值/退化 → None（誠實略過，不臆造）。
+
+    v202：「快照讀不出來」**不可**走退回欄位那條路。退回欄位的前提是『這筆單本來就沒
+    凍結快照』（合法舊單）；快照存在卻解不開時退回欄位＝用未凍結的值冒充凍結計畫重放，
+    正是 v114 修掉的忠實度問題再犯一次。⇒ unreadable 一律誠實回 None（略過該筆）。"""
+    snap, _status = read_plan_snapshot(row.get("plan_snapshot"))
+    if _status == SNAP_UNREADABLE:
+        return None
+    snap = snap or {}
     direction = (snap.get("direction") or row.get("direction") or "").strip()
     limit_px = snap.get("planned_entry", row.get("entry_price"))
     # v114(稽核rank1治本)：champion 重放的限價必須忠實於「實際首格」——紙上掛的是
@@ -161,6 +166,9 @@ async def load_plans_and_candles(rows: list[dict], *, get_ohlc=None
     # 先解析價格/象限/方向，按 symbol 分組（只留可建計畫者）
     by_symbol: dict[str, list[tuple[dict, tuple]]] = {}
     for row in rows:
+        if _quadrant_of(row) is None:
+            # v202：快照讀不出來＝regime 與凍結計畫皆未知 → 不建計畫（呼叫端另行計數出聲）。
+            continue
         prices = _plan_prices(row)
         if prices is None:
             continue
@@ -347,6 +355,9 @@ async def run_entry_optimization(*, days: int = 120, at_ms: int | None = None,
         active_path=active_path, audit_path=audit_path)
     res["n_rows"] = len(rows)
     res["n_eligible"] = len(plans)
+    # v202：被「快照讀不出來」擋掉的筆數要單獨可見——混進 n_eligible 的落差裡
+    #   會跟「太新／窗不足」等合法略過長得一樣，看不出是資料壞了。
+    res["n_excluded_unreadable_snapshot"] = sum(1 for r in rows if _quadrant_of(r) is None)
     res["cohort"] = {"active_generation": _cohort_gen, "mix": _cohort_mix,
                      "n_in": _n_in, "n_kept": len(rows),
                      "n_excluded_other_generation": _n_in - len(rows)}
@@ -356,6 +367,15 @@ async def run_entry_optimization(*, days: int = 120, at_ms: int | None = None,
 # ════════════════════════════════════════════════════════════════════════
 #  繁中報告（CEO/復盤 Session 透明化）
 # ════════════════════════════════════════════════════════════════════════
+def _render_unreadable_line(result: dict) -> str:
+    """v202：被排除的『快照讀不出來』筆數必須出聲——靜默排除會讓報告看起來像全掃過了。"""
+    n = (result or {}).get("n_excluded_unreadable_snapshot") or 0
+    if not n:
+        return ""
+    return (f"⛔ 另有 <b>{n}</b> 筆進場快照讀不出來（壞檔／型別不對）＝regime 與凍結計畫皆未知，"
+            f"已排除於重放之外（不併入 unknown 桶、不計入 minTRL 樣本）")
+
+
 def _render_cohort_line(result: dict) -> str:
     """報告用一行：本批統計樣本屬哪一代宇宙、排除幾筆別代（誠實揭露樣本被縮小）。"""
     c = (result or {}).get("cohort") or {}
@@ -371,6 +391,14 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
     if result is None:
         result = asyncio.run(run_entry_optimization(active_path=active_path))
     if not result["buckets"]:
+        # v202：「一桶都沒有」有兩種成因，不可折成同一個 None（靜音）：真的沒樣本 → 照舊
+        #   安靜；全部樣本快照都讀不出來 → 必須出聲，否則整輪空轉長得跟「今天沒單」一樣。
+        if result.get("n_excluded_unreadable_snapshot"):
+            return ("🎚️ <b>入場積極度自動優化器</b>\n"
+                    f"掃 {result.get('n_rows', '?')} 筆，但**可用桶數為 0**：\n"
+                    + _render_unreadable_line(result) + "\n"
+                    "<i>這不是『今天沒樣本』——是樣本讀不出來。請查 paper_trades."
+                    "plan_snapshot 欄位是否被寫壞。</i>")
         return None
     # v82：0 晉升日（常態）每桶皆「⏸️維持」零資訊 → 收斂為結論一行＋收斂進度，
     #   把每日 ~4800 字洗版牆壓成可掃讀的一則；全文明細仍可由 active 覆寫表/帳本回溯。
@@ -385,6 +413,8 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
                 f"掃 {result.get('n_rows', '?')} 筆／{result['n_buckets']} 桶｜"
                 f"本輪晉升 <b>0</b> 桶（最佳挑戰者皆未過 L2{prog}）\n"
                 + _render_cohort_line(result) + "\n"
+                + (_render_unreadable_line(result) + "\n"
+                   if _render_unreadable_line(result) else "")
                 + eps.render_active(active_path) + "\n"
                 "<i>純驅動模擬盤 paper／demo，真錢執行層永不讀（紅線①）；"
                 "覆寫表恆空＝零行為變更，透明可事後 rollback。</i>")
@@ -394,7 +424,8 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
              f"（含 entry_expired 缺料樣本），符合完整重放窗 {result.get('n_eligible', '?')} 筆，"
              f"分 {result['n_buckets']} 桶（per-symbol×regime + 象限池 + 全域池，"
              f"其中池化桶 {result.get('n_pooled', '?')}）｜本輪晉升 {result['n_promoted']} 桶",
-             _render_cohort_line(result)]
+             _render_cohort_line(result),
+             _render_unreadable_line(result)]
     for b in result["buckets"]:
         ck = eps._KIND_ZH.get(b["champion_kind"], b["champion_kind"])
         head = f"<b>[{eps._bucket_label(b['bucket'])}]</b> {b['n_plans']} 筆｜champion {ck}"

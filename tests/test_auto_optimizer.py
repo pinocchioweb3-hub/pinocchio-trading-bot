@@ -88,8 +88,11 @@ def test_grouping_by_symbol_and_quadrant():
 def test_quadrant_parsing():
     assert ao._quadrant_of(_mk(1, 0.0, q="price_up_oi_up")) == "price_up_oi_up"
     assert ao._quadrant_of(_mk(2, 0.0, snapshot=False)) == "unknown"
-    assert ao._quadrant_of({"plan_snapshot": "{bad json"}) == "unknown"
-    assert ao._quadrant_of({}) == "unknown"
+    # v202 校正：快照壞掉回 None（＝我不知道當時的 regime），呼叫端據此把該筆排除；
+    # ⛔ 不可回 'unknown'——那個桶是給「本來就沒快照」的合法舊單，混進去＝拿不知道充樣本。
+    assert ao._quadrant_of({"plan_snapshot": "{bad json"}) is None
+    assert ao._quadrant_of({"plan_snapshot": "[1,2,3]"}) is None
+    assert ao._quadrant_of({}) == "unknown"          # 欄位缺席＝舊單，行為不變
 
 
 def test_ledger_idempotent_across_runs():

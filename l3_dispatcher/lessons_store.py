@@ -45,6 +45,12 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 from backtest.review_attribution import _classify_exit  # 出場劇本分類（plan_worked 等）
 from botpaths import data_dir, db_path
+from l3_dispatcher.plan_snapshot import (SNAP_MISSING, SNAP_OK, SNAP_UNREADABLE,
+                                         read_plan_snapshot)
+
+# 讀不出快照的單獨立成桶，**不與 'unknown'（本來就沒快照的合法舊單）混用**——
+# 混用等於把「不知道」寫成「已知沒有」，且會讓壞列悄悄墊高 unknown 桶的樣本數。
+QUAD_UNREADABLE = "snapshot_unreadable"
 
 SCHEMA_VER = 1
 _R_EPS = 1e-6
@@ -118,30 +124,35 @@ def _load_rows(days: int = 365) -> list[dict]:
 
 
 def _parse_snap(raw):
-    if not raw:
-        return None
-    try:
-        v = json.loads(raw)
-    except Exception:
-        return None
-    # 只接受 dict 快照；合法 JSON 但型別不對（list/int/str/None）一律降級為「無快照」，
-    # 否則 distill 對 list/int 呼叫 .get() 會炸 → 整檔重建掛掉（紅線③：壞資料誠實降級而非崩潰）。
-    return v if isinstance(v, dict) else None
+    """（保留給既有呼叫端）只回快照本體；要分辨『沒有』與『讀不出來』請用 _parse_snap_status。"""
+    return _parse_snap_status(raw)[0]
+
+
+def _parse_snap_status(raw) -> tuple[dict | None, str]:
+    """v202：三態讀取。委派給 plan_snapshot.read_plan_snapshot（schema 擁有者＝唯一正解）。
+    只接受 dict 快照；合法 JSON 但型別不對（list/int/str）一律判 unreadable，
+    否則 distill 對 list/int 呼叫 .get() 會炸 → 整檔重建掛掉（紅線③：壞資料誠實降級而非崩潰）。"""
+    return read_plan_snapshot(raw)
 
 
 def distill(row: dict) -> dict:
     """把一筆 DB 列蒸餾成教訓卡（套 learning invariant）。"""
-    snap = _parse_snap(row.get("plan_snapshot"))
+    snap, snap_status = _parse_snap_status(row.get("plan_snapshot"))
     regime = (snap or {}).get("regime_at_entry") or {}
     ctx = (snap or {}).get("context_at_entry") or {}
 
     quadrant = regime.get("oi_price_quadrant") or "unknown"
+    if snap_status == SNAP_UNREADABLE:
+        quadrant = QUAD_UNREADABLE
     funding_state = regime.get("funding_state")
     cvd_state = regime.get("cvd_state")
     vol_trend = regime.get("vol_trend")
     htf_aligned = ctx.get("htf_aligned")  # True / False / None
     expected_r = (snap or {}).get("expected_r")
-    missing = (snap or {}).get("missing_context_keys") or []
+    # ⛔ 讀不出快照時**不可**回 []：[] 是在正面宣稱「當初什麼數據都沒缺」，
+    #    而第③問（缺哪個數據最容易誤判）正是靠這個欄位算的。回 None＝誠實的「不知道」。
+    missing = (None if snap_status == SNAP_UNREADABLE
+               else ((snap or {}).get("missing_context_keys") or []))
 
     realized_r = float(row.get("realized_r") or 0.0)
     exit_class = _classify_exit(row.get("exit_reason"))
@@ -172,6 +183,7 @@ def distill(row: dict) -> dict:
         "counts_as_positive_evidence": positive,
         "negative_evidence": negative,
         "missing_context_keys": missing,
+        "snapshot_status": snap_status,   # ok / missing / unreadable（v202：讀不出來要看得見）
         "exit_at_ms": row.get("exit_at"),
         "has_snapshot": snap is not None,
         "source": "paper_journal",
@@ -271,7 +283,10 @@ def summarize_by_quadrant(path: Path | None = None) -> dict:
         b["sample_sufficient"] = b["n"] >= MIN_BUCKET_HONEST
         b["honesty"] = ("樣本足（≥%d）" % MIN_BUCKET_HONEST if b["sample_sufficient"]
                         else "⚠️ 樣本不足（<%d），僅供觀察、未達統計顯著" % MIN_BUCKET_HONEST)
-    return {"total": len(rows), "by_quadrant": buckets}
+    # v202：快照讀不出來的筆數要獨立可見（不是 unknown、也不是 0）。
+    n_unreadable = sum(1 for ls in rows if ls.get("snapshot_status") == SNAP_UNREADABLE)
+    return {"total": len(rows), "by_quadrant": buckets,
+            "n_unreadable_snapshot": n_unreadable}
 
 
 def render_summary(path: Path | None = None) -> str:
@@ -281,6 +296,10 @@ def render_summary(path: Path | None = None) -> str:
          "═" * 62,
          "⚠️ 全為『模擬盤』樣本；僥倖單已排除於正向集（learning invariant）。",
          f"   總筆數 = {s['total']}", ""]
+    if s.get("n_unreadable_snapshot"):
+        L.append(f"⛔ 其中 {s['n_unreadable_snapshot']} 筆的進場快照**讀不出來**（壞檔／型別不對）："
+                 f"已單獨歸 [{QUAD_UNREADABLE}] 桶、不混進 unknown，"
+                 f"其 regime 與『當初缺哪些數據』一律未知，不可當作『沒缺』。")
     if not s["by_quadrant"]:
         L.append("（尚無教訓卡，先 --rebuild）")
     for q, b in sorted(s["by_quadrant"].items(), key=lambda kv: -kv[1]["n"]):

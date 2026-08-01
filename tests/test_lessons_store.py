@@ -153,12 +153,16 @@ def test_parse_snap_rejects_non_dict():
     assert ls._parse_snap('{"a": 1}') == {"a": 1}
 
 
-def test_distill_non_dict_snapshot_degrades_to_unknown():
-    # 限價單若某天寫進結構異常的 plan_snapshot（list/int/str），distill 須誠實降級為
-    # 無快照（quadrant=unknown、has_snapshot=False），不得拋例外。
+def test_distill_non_dict_snapshot_degrades_without_crashing():
+    # 限價單若某天寫進結構異常的 plan_snapshot（list/int/str），distill 不得拋例外，
+    # 且無快照可用（has_snapshot=False、expected_r/delta_r=None）。
+    # v202 校正：⛔ 不再降級成 quadrant='unknown'——「讀不出來」與「本來就沒快照」
+    # 不是同一件事，混在一起會讓壞列去墊高 minTRL≥30 的樣本數。改歸自己的桶。
     for bad in ("[]", "42", '"oops"', "{truncated"):
         d = ls.distill(_row(id=99, plan_snapshot=bad, realized_r=1.2, exit_reason="tp1"))
-        assert d["quadrant"] == "unknown"
+        assert d["quadrant"] == ls.QUAD_UNREADABLE
+        assert d["quadrant"] != "unknown"
+        assert d["snapshot_status"] == "unreadable"
         assert d["has_snapshot"] is False
         assert d["expected_r"] is None and d["delta_r"] is None
 
