@@ -205,6 +205,14 @@ async def amain(args: argparse.Namespace) -> int:
                 parse_mode="HTML",
             )
             print(f"[liveness] offline-gap alert sent (gap={_gap['gap_sec']:.0f}s)")
+        elif _gap.get("unreadable"):
+            # v199: 戳記在但讀不出來 ＝ 時長不明的可能斷線。⛔ 不可沿用下面的靜默路徑：
+            # 舊版把它折成 no_prior_stamp（「第一次啟動」），而戳記壞掉最可能的成因正是
+            # 斷電／當機——本模組要抓的就是那件事。
+            liveness.record_gap(None, None, unknown=True)
+            await tg_sys.send_message(liveness.render_unknown_stamp_alert(),
+                                      parse_mode="HTML")
+            print("[liveness] stamp unreadable → unknown-duration alert sent")
         else:
             print(f"[liveness] no gap ({_gap['reason']})")
     except Exception as e:

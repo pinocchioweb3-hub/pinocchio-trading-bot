@@ -331,14 +331,23 @@ def _section_normal() -> str:
     #      把「引擎到底有沒有不間斷地跑」攤在日報，使用者不必翻 log。
     try:
         from . import liveness
-        last = liveness.read_last()
-        gaps = liveness.recent_gaps(86400)
-        if gaps:
-            worst = max(g.get("gap_sec", 0) for g in gaps)
-            gap_txt = f"過去24h 偵測到 {len(gaps)} 次離線缺口（最長 {liveness._fmt_duration(worst)}）"
+        # v199：兩個讀取端都改成三態。⛔ 讀不出來不得渲染成「無離線缺口／剛啟動」——
+        # 那是把未知講成正面保證（紅線③）。
+        last, last_status = liveness.read_last_status()
+        gaps, gaps_status = liveness.recent_gaps_status(86400)
+        if gaps_status == liveness.LOAD_UNREADABLE:
+            gap_txt = "⚠️ 離線缺口帳本讀不出來（≠ 沒有缺口）"
+        elif gaps:
+            known = [float(g["gap_sec"]) for g in gaps if g.get("gap_sec") is not None]
+            unknown_n = len(gaps) - len(known)
+            worst_txt = (f"（最長 {liveness._fmt_duration(max(known))}）" if known else "")
+            tail = f"，其中 {unknown_n} 次時長不明" if unknown_n else ""
+            gap_txt = f"過去24h 偵測到 {len(gaps)} 次離線缺口{worst_txt}{tail}"
         else:
             gap_txt = "過去24h 無離線缺口"
-        if last and last.get("ts"):
+        if last_status == liveness.LOAD_UNREADABLE:
+            lines.append(f"🔌 連續性：⚠️ 存活戳記讀不出來（≠ 剛啟動；無法判斷心跳新鮮度）｜{gap_txt}")
+        elif last and last.get("ts"):
             age_min = (time.time() - float(last["ts"])) / 60
             fresh = "正常" if age_min <= 20 else f"⚠️已 {age_min:.0f} 分未更新"
             lines.append(f"🔌 連續性：心跳 {age_min:.0f} 分前（{fresh}）｜{gap_txt}")
