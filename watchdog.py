@@ -152,7 +152,8 @@ def _stale_claude_runners() -> list[tuple[int, float]]:
     """
     ps = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
           "Select-Object ProcessId,CommandLine,"
-          "@{N='Age';E={[int]((Get-Date)-$_.CreationDate).TotalSeconds}} | "
+          "@{N='Age';E={[int]((Get-Date)-$_.CreationDate).TotalSeconds}},"
+          "@{N='Min';E={$_.CreationDate.Minute}} | "
           "ConvertTo-Json -Compress")
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
@@ -180,10 +181,18 @@ def _stale_claude_runners() -> list[tuple[int, float]]:
         cmd = p.get("CommandLine") or ""
         if _RUNNER_MARK.lower() in cmd.lower():
             try:
-                out.append((int(p["ProcessId"]), float(p.get("Age") or 0)))
+                out.append((int(p["ProcessId"]), float(p.get("Age") or 0),
+                            int(p.get("Min") if p.get("Min") is not None else -1)))
             except Exception as exc:              # 單筆壞掉≠整批未知，但也不許靜音
                 raise _RunnerProbeError(f"欄位解析失敗: {exc}") from exc
     return out
+
+
+def _is_cadence_spawn(minute: int) -> bool:
+    """排程殭屍的啟動指紋：整點 :03-:07 / :33-:37（排程+抖動窗）。
+    使用者的互動/Remote Control session 啟動分鐘是隨機的——2026-08-02 事故：
+    常態清掃沒看指紋,把使用者整晚閒置的 RC 宿主進程當殭屍殺了。"""
+    return 3 <= minute <= 7 or 33 <= minute <= 37
 
 
 def _probe_runners_or_log(pct: float) -> list[tuple[int, float]] | None:
@@ -255,7 +264,7 @@ def _kill_all(victims, *, stop_at_target: bool = False) -> tuple[list[int], list
     """
     killed: list[int] = []
     failed: list[str] = []
-    for pid, _age in victims:
+    for pid, _age, *_rest in victims:   # v189：容 3 元組（啟動分鐘欄）
         ok, why = _taskkill(pid)
         if not ok:
             failed.append(why)
@@ -288,7 +297,11 @@ def memory_guard() -> None:
         runners = _probe_runners_or_log(pct)
         if runners is None:                       # 未知：不動作（已留痕）
             return
-        stale = [v for v in runners if v[1] >= MEM_MIN_AGE_MIN * 60]
+        # v188：常態清掃只殺「排程指紋」進程（:03-:07/:33-:37 生成）——使用者的
+        # 互動/Remote Control session 啟動分鐘隨機,不再被當殭屍誤殺（2026-08-02 事故）。
+        # 緊急線（②）不受此限:整機要凍死時保命優先。
+        stale = [v for v in runners
+                 if v[1] >= MEM_MIN_AGE_MIN * 60 and _is_cadence_spawn(v[2])]
         if len(stale) < 4:
             return
         state, serr = read_state()
