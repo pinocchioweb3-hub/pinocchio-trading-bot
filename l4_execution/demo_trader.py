@@ -758,26 +758,102 @@ def convert_gate(direction: str, orig_entry: float, orig_stop: float,
     return True, "ok"
 
 
-async def cancel_algos_for_symbol(ex, symbol: str) -> int:
+def parse_algo_rows(raw):
+    """把 OKX 演算法委託查詢的回應解成清單；**認不得的形狀回 None ＝未知**。
+
+    ⛔ 邊界線（沿用 v208 parse_okx_rows 的同一條）：`{"data": []}` 與裸空清單是
+    「交易所確認沒有掛單」，仍回 []；只有連形狀都認不得才回 None。為保險把空當未知
+    會讓每一次正常清理都變告警＝慢性假警報。
+    """
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        rows = raw.get("data")
+        if isinstance(rows, list):
+            return rows
+    return None
+
+
+def parse_cancel_result(raw, attempted: int):
+    """把 cancel-algos 的回應解成「**確定**取消成功的筆數」；認不得回 None ＝未知。
+
+    OKX 語意：頂層 `code=="0"` ＝ 整批成功；`code!="0"` ＝ 有失敗，逐筆看 `sCode`
+    （"0" 才是那一筆成功）。舊碼無條件 `return len(body)` ⇒ 逐筆被打回也照樣記成
+    「取消了 N 筆」，而殘留的那些是**會成交的活單**。
+    """
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("code") == "0":
+        return attempted
+    rows = raw.get("data")
+    if not isinstance(rows, list) or not rows:
+        return None
+    ok = 0
+    for r in rows:
+        if not isinstance(r, dict) or "sCode" not in r:
+            return None          # 逐筆結果讀不出來 → 整批未知，⛔ 不准當成功
+        if str(r.get("sCode")) == "0":
+            ok += 1
+    return ok
+
+
+async def cancel_algos_for_symbol(ex, symbol: str, out: dict | None = None) -> int:
     """取消某標的所有 pending 演算法委託(TP/SL conditional)——倉位平倉後清理殘留掛單，
     治本『幽靈委託』(task#15：倉已平但 attachAlgoOrds 的未觸發 TP/SL 腿仍 live 殘留在 OKX)。
 
     ⚠️ 呼叫端須先確認『該標的已無任何持倉』再呼叫（否則會誤砍同標的活倉的 TP/SL 保護）。
-    先正向證明模擬盤。回實際取消的演算法委託筆數；任何失敗回 0（不拋例外、不拖垮監控輪）。"""
+    先正向證明模擬盤。回**確定取消成功**的筆數（不拋例外、不拖垮監控輪）。
+
+    v210（同物種第 30 次）：舊碼「任何失敗回 0」，而 0 同時也是「確認沒有殘留掛單」的
+    答案 ⇒ 查詢失敗／回應形狀認不得／取消被打回，三件事與「本來就乾淨」同形。這一步是
+    **一次性**的（intent 平倉結算後不再回訪，沒有下一輪重試），清不掉就是永久幽靈委託。
+    ⛔ 安全行為一行未改：失敗仍回 0、仍不拋例外；補的只有出聲——`out` 帶回本次結果：
+      outcome ∈ {confirmed_none, cancelled, partial, query_failed, rows_unreadable,
+                 cancel_failed, cancel_result_unreadable}，unresolved=True 代表
+      「這輪不知道交易所端到底乾不乾淨」，呼叫端必須讓它出聲。
+    """
     from l4_execution.demo_guard import confirm_okx_demo
     await confirm_okx_demo(ex)
+
+    def _fin(outcome: str, n: int = 0, attempted: int = 0, detail=None) -> int:
+        if out is not None:
+            out["symbol"] = symbol
+            out["outcome"] = outcome
+            out["cancelled"] = n
+            out["attempted"] = attempted
+            out["detail"] = detail
+            out["unresolved"] = outcome not in ("confirmed_none", "cancelled")
+        return n
+
     try:
         res = await ex.private_get_trade_orders_algo_pending(
             {"instType": "SWAP", "ordType": "conditional"})
-        algos = [a for a in (res.get("data") or [])
-                 if (a.get("instId") or "").split("-")[0] == symbol]
-        if not algos:
-            return 0
-        body = [{"algoId": a.get("algoId"), "instId": a.get("instId")} for a in algos]
-        await ex.private_post_trade_cancel_algos(body)
-        return len(body)
-    except Exception:  # noqa: BLE001
-        return 0
+    except Exception as e:  # noqa: BLE001
+        return _fin("query_failed", detail=f"{type(e).__name__}: {e}")
+
+    rows = parse_algo_rows(res)
+    if rows is None:
+        return _fin("rows_unreadable", detail=f"回應形狀認不得：{type(res).__name__}")
+
+    algos = [a for a in rows
+             if isinstance(a, dict) and (a.get("instId") or "").split("-")[0] == symbol]
+    if not algos:
+        return _fin("confirmed_none")
+
+    body = [{"algoId": a.get("algoId"), "instId": a.get("instId")} for a in algos]
+    try:
+        cres = await ex.private_post_trade_cancel_algos(body)
+    except Exception as e:  # noqa: BLE001
+        return _fin("cancel_failed", attempted=len(body), detail=f"{type(e).__name__}: {e}")
+
+    n_ok = parse_cancel_result(cres, len(body))
+    if n_ok is None:
+        return _fin("cancel_result_unreadable", attempted=len(body),
+                    detail=f"取消回應形狀認不得：{type(cres).__name__}")
+    if n_ok < len(body):
+        return _fin("partial", n=n_ok, attempted=len(body),
+                    detail=f"交易所打回 {len(body) - n_ok} 筆")
+    return _fin("cancelled", n=n_ok, attempted=len(body))
 
 
 async def market_close_demo(ex, symbol: str, pos_side: str, contracts: float) -> dict:

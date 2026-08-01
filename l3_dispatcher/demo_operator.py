@@ -599,12 +599,27 @@ async def _monitor(ex, *, now_ms, tg=None) -> dict:
                         #   (attachAlgoOrds 的其餘腿不會隨倉自動取消＝幽靈委託)。僅在該標的
                         #   已無任何持倉時清，避免誤砍同標的另一活倉的保護單。
                         if not any(k[0] == t["symbol"] for k in okx_map):
+                            #   v210：清不掉要出聲——這是**一次性**路徑（本 iid 結算後不再
+                            #   回訪、沒有下一輪重試），而舊碼查不到/被打回都回 0，與「本來就
+                            #   乾淨」同形 ⇒ 幽靈 TP/SL 會無聲永久殘留在交易所端。
+                            cxl: dict = {}
                             try:
-                                n_cxl = await dt.cancel_algos_for_symbol(ex, t["symbol"])
+                                n_cxl = await dt.cancel_algos_for_symbol(
+                                    ex, t["symbol"], out=cxl)
                                 if n_cxl:
                                     summary["algos_cancelled"] = summary.get("algos_cancelled", 0) + n_cxl
-                            except Exception:  # noqa: BLE001
-                                pass
+                            except Exception as e:  # noqa: BLE001
+                                cxl = {"unresolved": True, "outcome": "raised",
+                                       "detail": f"{type(e).__name__}: {e}"}
+                            if cxl.get("unresolved"):
+                                summary["algos_cleanup_unresolved"] = \
+                                    summary.get("algos_cleanup_unresolved", 0) + 1
+                                print(f"[demo_op] ⚠️ 幽靈委託清理未確認（不再重試，"
+                                      f"可能有殘留 TP/SL 掛在 OKX）：{t['symbol']} "
+                                      f"outcome={cxl.get('outcome')} "
+                                      f"attempted={cxl.get('attempted')} "
+                                      f"cancelled={cxl.get('cancelled')} "
+                                      f"detail={cxl.get('detail')}")
                     else:
                         dj.touch_synced(iid)   # history 未回填 → 保守等待，下輪重試
                         summary["await_pnl"] += 1
