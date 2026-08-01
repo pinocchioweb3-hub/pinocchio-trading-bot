@@ -291,7 +291,12 @@ def memory_guard() -> None:
         stale = [v for v in runners if v[1] >= MEM_MIN_AGE_MIN * 60]
         if len(stale) < 4:
             return
-        state = read_json(STATE)
+        state, serr = read_state()
+        if serr and serr != "missing":
+            # ⛔ 冷卻戳記讀不出來≠「冷卻已過」。在沒有冷卻保證的情況下清理行程，
+            #    就是每 3 分鐘殺一輪。純衛生的動作，跳過一輪毫無代價。
+            log(f"[memguard] 狀態檔讀不出來（{serr}）——冷卻戳記未知，本輪不清掃")
+            return
         now = time.time()
         if now - float(state.get("memguard_last_ts", 0) or 0) < MEM_COOLDOWN_SEC:
             return
@@ -309,7 +314,13 @@ def memory_guard() -> None:
         state["memguard_last_ts"] = now
         write_state(state)
         return
-    state = read_json(STATE)
+    state, serr = read_state()
+    if serr and serr != "missing":
+        # 緊急線上也一樣不賭：告警節流戳記同樣讀不出來，硬做會變成每 3 分鐘
+        # 又殺又吵。狀態檔的隔離重建由 main() 負責，下一輪就會回到正常路徑。
+        log(f"[memguard] commit {pct:.0f}% 超緊急線，但狀態檔讀不出來（{serr}）"
+            "——冷卻與告警節流皆未知，本輪不動作")
+        return
     now = time.time()
     if now - float(state.get("memguard_last_ts", 0) or 0) < MEM_COOLDOWN_SEC:
         return
@@ -370,17 +381,94 @@ def log(msg: str) -> None:
 
 
 def read_json(p: Path) -> dict:
-    try:
-        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-    except Exception:
+    """寬鬆讀（給 liveness 用）。壞檔→{}，方向上會被判成「心跳很舊」＝偏向重啟，
+    對 daemon 健康而言是保守的一邊；但**不可無聲**，否則 liveness 永久壞掉時
+    watchdog 會每輪重啟卻沒人知道為什麼。⛔ 狀態檔請改用 read_state()。"""
+    if not p.exists():
         return {}
-
-
-def write_state(state: dict) -> None:
     try:
-        STATE.write_text(json.dumps(state), encoding="utf-8")
-    except Exception:
-        pass
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log(f"[read] {p.name} 存在但讀不出來（{type(exc).__name__}）"
+            "——本輪視為心跳過舊（偏保守），已留痕")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_state() -> tuple[dict, str | None]:
+    """讀 watchdog 自己的狀態檔，回 (state, err)。
+
+    v195（監督員 r89）：⛔ 這裡**不可**把兩種狀態折成同一個 {}——
+      * 檔案**不存在** → err="missing"：那是合法的第一次啟動（新機器、剛清過資料
+        目錄），必須保持安靜，否則變成每台新機都收到的假告警。
+      * 檔案**在**、卻讀不出來（半截 JSON／權限／編碼／被寫成 list）→ 那是**故障**。
+        舊碼一律回 {}，於是 main() 讀到
+            last_restart = 0   ⇒ GRACE_SEC 暖機窗直接跳過
+            restarts     = []  ⇒ MAX_RESTARTS_HOUR「停手交人工」的煞車失效
+        兩道煞車同時解除，而且畫面上與「乾淨的第一次啟動」一模一樣。同物種第 15 次
+        （未知被折成確認沒有），這次挖空的是 watchdog 自己的最後一道人工介入閘。
+    """
+    if not STATE.exists():
+        return {}, "missing"
+    try:
+        data = json.loads(STATE.read_text(encoding="utf-8"))
+    except Exception as exc:                 # 半截檔／權限／編碼：檔在但讀不出來＝故障
+        return {}, type(exc).__name__
+    if not isinstance(data, dict):           # 合法 JSON 但不是 dict（例如被寫成 list）
+        return {}, "NotADict"
+    return data, None
+
+
+def write_state(state: dict) -> bool:
+    """原子寫（tmp + os.replace）並回報成敗。
+
+    ⛔ 舊碼用 STATE.write_text() 直接覆蓋＝非原子：斷電／被殺在寫到一半，留下的就是
+    read_state() 讀不出來的半截檔。也就是說 watchdog **有能力親手做出**那個壞檔，
+    再自己誤讀成「第一次啟動」（v157/v162-v166 同一根因）。回傳值是給呼叫端據以
+    fail-closed 用的——寫不回去代表重啟次數永遠累計不起來。
+    """
+    tmp = STATE.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(tmp, STATE)
+        return True
+    except Exception as exc:
+        log(f"[state] 狀態檔寫入失敗（{type(exc).__name__}: {exc}）")
+        try:
+            tmp.unlink(missing_ok=True)      # 不留半截 tmp 給下輪誤會
+        except Exception:
+            pass
+        return False
+
+
+def recover_corrupt_state(err: str, *, now: float) -> dict | None:
+    """狀態檔壞掉時：隔離壞檔 → 出聲 → 重建。回 {} 代表已可繼續；None 代表修不好。
+
+    ⛔ 不可「安靜地重建」：那等於把「煞車曾經失效」這件事藏起來，正是本物種每次
+    的真正傷害。也⛔不可憑空填一個重啟次數（那是捏造）——誠實的說法是「這小時的
+    重啟史已遺失，預算從現在重新起算」。
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+    quarantine = DATA_DIR / f"watchdog_state.corrupt-{stamp}.json"
+    try:
+        os.replace(STATE, quarantine)
+        kept = quarantine.name
+    except Exception as exc:
+        kept = f"（隔離失敗：{type(exc).__name__}）"
+    log(f"[state] 狀態檔存在但讀不出來（{err}）→ 已隔離為 {kept}，重建中")
+    if not write_state({}):
+        log("[state] ⛔ 重建也失敗＝重啟次數無法累計＝1 小時 5 次的煞車形同永久失效，"
+            "本輪起停止自動重啟，交人工")
+        return None
+    telegram_alert(
+        "⚠️ <b>watchdog 狀態檔損毀（已自動重建）</b>\n"
+        f"<code>watchdog_state.json</code> 存在但讀不出來（{err}），已隔離為 "
+        f"<code>{kept}</code> 並重建。\n"
+        "影響：<b>這一小時的自動重啟次數紀錄已遺失</b>，防無限重啟的煞車（1 小時 5 次）"
+        "從現在重新起算——若這段期間 daemon 一直起不來，實際重啟次數會比告警看到的多。\n"
+        "<i>常見成因是斷電／行程被殺在寫檔途中。若反覆出現，請人工檢視 watchdog.log。</i>"
+    )
+    return {}
 
 
 def _read_env_value(key: str) -> str | None:
@@ -480,6 +568,15 @@ def main() -> int:
         log("[skip] 偵測到 watchdog.disabled → 暫停自動重啟（這是刻意的）")
         return 0
 
+    # v195：狀態檔健檢擺在最前面——memory_guard 與下面的重啟煞車都吃這個檔，
+    # 壞檔要在任何人讀它之前就處理掉（隔離+重建+出聲），而不是各自折成 {}。
+    _state0, _serr = read_state()
+    if _serr and _serr != "missing":
+        if recover_corrupt_state(_serr, now=now) is None:
+            # ⛔ 修不好＝重啟預算永遠是「零次」＝可無限重啟且無人得知。
+            #    寧可這輪不自癒（人工還救得回來），也不要開一場無聲的重啟風暴。
+            return 3
+
     # 記憶體防衛（獨立於 daemon 健康檢查；緊急線才動手，內建冷卻與留痕）
     try:
         memory_guard()
@@ -491,7 +588,11 @@ def main() -> int:
     last_ts = float(live.get("ts", 0) or 0)
     age = now - last_ts if last_ts else 1e9   # 無戳記＝視為很舊
 
-    state = read_json(STATE)
+    state, serr = read_state()
+    if serr and serr != "missing":
+        # 上面才剛重建過還是壞的（例如另一個行程正在寫）：同樣不賭煞車。
+        log(f"[state] 重建後仍讀不出來（{serr}）——本輪不自動重啟")
+        return 3
     last_restart = float(state.get("last_restart_ts", 0) or 0)
     restarts = [t for t in state.get("restart_times", []) if now - float(t) < 3600]
 
