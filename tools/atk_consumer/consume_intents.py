@@ -92,6 +92,12 @@ _CLASS_PRIORITY = ("orphan_position", "pnl_unaccounted",
                    # 「對外連不上」這個真正主因從代表類別擠掉，使用者拿到的處置建議
                    # 就會變成「去刪一個檔」，而不是「去補白名單」。
                    "intent_unreadable",
+                   # v207（r102）：已確認手動倉檔壞掉——排在此處的理由同 intent_unreadable
+                   # （純本地失敗,不可把斷流主因擠掉）,且**必須**在 orphan_position 之後：
+                   # 它談的正是孤兒倉,若反過來當代表,使用者拿到的處置建議會從
+                   # 「去 OKX 看那個真錢倉」變成「去修一個檔」。它讀壞時走的是比較嚴格的
+                   # 那一邊（全部當孤兒）,不會讓任何風險閘失效 ⇒ 不需排到前段。
+                   "acked_state_unreadable",
                    # v164/v166：健康檔壞掉（讀不到／寫不進去）排在最後——它是告警層
                    # 自己的內傷，永遠不該蓋掉同輪真正的交易故障當代表（否則使用者
                    # 看到的主因會被換掉）
@@ -429,6 +435,14 @@ _CLASS_HINT = {
     "done_state_write_fail": "已處理 intent 清單寫不進去 → 本輪處理過的 intent 沒有落地，"
                              "行程重啟後會重跑（clOrdId 冪等擋重複成交，但仍應修）。"
                              "請確認磁碟空間／檔案沒被鎖住",
+    "acked_state_unreadable": "「已確認手動倉」清單檔存在、但一筆也讀不出來（解不開／"
+                              "頂層不是清單／鍵名不對）→ 你在聊天室確認過的那些倉,"
+                              "系統這邊等於沒收到:它們仍會被當成孤兒部位每輪告警。"
+                              "⚠️ 這不會讓任何風險閘失效（讀壞一律走比較嚴格的那一邊）,"
+                              "管線其餘部分照常。處置：檢查 "
+                              "%LOCALAPPDATA%\\TradingBot\\atk_acknowledged_positions.json,"
+                              "格式是一個清單、每筆要有 inst_id 與 pos_side，例如 "
+                              '[{"inst_id":"XXX-USDT-SWAP","pos_side":"long"}]',
     "auth_ip_whitelist": "呼叫端 IP 不在 API key 白名單（住宅浮動 IP 換掉會復發）"
                          "→ 到 OKX 後台把下方錯誤訊息中的 IP 加進白名單，"
                          "消費器每分鐘自動重試、不需重啟",
@@ -862,17 +876,58 @@ ACKED_POS = Path(os.path.expandvars(
     r"%LOCALAPPDATA%\TradingBot\atk_acknowledged_positions.json"))
 
 
+def parse_acked(data) -> tuple[set, str | None]:
+    """把已解析的 ack 內容拆成 (可用的鍵集合, 問題描述或 None)（純函式）。
+
+    v207（監督員 r102）：問題描述就是本次補上的東西——原本「檔在但一筆都讀不出來」
+    與「檔根本不存在」回一樣的空集合,兩者的處置天差地遠。"""
+    if not isinstance(data, list):
+        return set(), f"頂層不是清單（是 {type(data).__name__}）"
+    keys, bad = set(), 0
+    for e in data:
+        if isinstance(e, dict) and e.get("inst_id"):
+            keys.add((e.get("inst_id"), e.get("pos_side")))
+        else:
+            bad += 1
+    if bad:
+        return keys, (f"{len(data)} 筆裡有 {bad} 筆沒有可用的 inst_id"
+                      "（鍵名須為 inst_id / pos_side）")
+    return keys, None
+
+
 def load_acked_keys() -> set:
     """v189：使用者已確認的手動倉 {(inst_id, pos_side)}。
     用途：使用者親口確認「這筆是我自己開的」後,孤兒偵測不再對它記故障/告警,
     但**同幣同向新單照樣擋**（防自動單疊在手動倉上）、依然不自動管理它。
-    檔案只在使用者於聊天室確認後由 CEO 寫入;讀壞/缺檔=空集合（安全預設:全部當孤兒）。"""
+    檔案只在使用者於聊天室確認後由 CEO 寫入;讀壞/缺檔=空集合（安全預設:全部當孤兒）。
+
+    v207（監督員 r102,同物種第 27 次）：安全預設不變,補的是**出聲**。舊碼把三件事
+    壓成同一個空集合——①檔案不存在（正常:還沒確認過）②檔在但解不開／頂層不是清單
+    ③檔在、是清單、但鍵名不對（連例外都不丟,最無聲的一種）。②③代表使用者已經在
+    聊天室確認過、CEO 也寫了檔,卻被無聲丟掉:孤兒告警會永遠繼續響,而畫面上沒有任何
+    線索指向那個檔。落點要緊是因為這個檔正是**目前唯一**那條真錢阻塞（WLFI 孤兒倉）
+    的解除機制,靜默失敗等於使用者做了動作卻看不到任何反應。
+    ⛔ 讀壞仍回空集合（全部當孤兒）＝比較嚴格的那一邊,不因為出聲就放寬。"""
     try:
-        data = json.loads(ACKED_POS.read_text(encoding="utf-8"))
-        return {(e.get("inst_id"), e.get("pos_side"))
-                for e in data if isinstance(e, dict) and e.get("inst_id")}
-    except Exception:  # noqa: BLE001
+        raw = ACKED_POS.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()                      # 還沒確認過任何倉＝常態,不是故障
+    except Exception as e:  # noqa: BLE001
+        _note_fail("acked_state_unreadable",
+                   f"{ACKED_POS.name} 讀取失敗：{type(e).__name__}: {e}")
         return set()
+    try:
+        data = json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        _note_fail("acked_state_unreadable",
+                   f"{ACKED_POS.name} 解不開：{type(e).__name__}: {e}")
+        return set()
+    keys, problem = parse_acked(data)
+    if problem:
+        print(f"⚠️ 已確認手動倉檔 {ACKED_POS.name} {problem}"
+              "——這些倉仍一律當孤兒處理（安全預設）")
+        _note_fail("acked_state_unreadable", f"{ACKED_POS.name} {problem}")
+    return keys
 
 
 def partition_orphans(orphans: list, acked: set) -> tuple[list, list]:
