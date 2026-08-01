@@ -226,6 +226,55 @@ def _memguard_notify(state: dict, pct: float, text: str, now: float) -> None:
     state["memguard_alert_suppressed"] = 0
 
 
+def _taskkill(pid: int) -> tuple[bool, str]:
+    """殺一個行程。回 (真的殺掉了嗎, 失敗原因)。
+
+    ⛔ taskkill 非零退出**不會**拋例外（subprocess.run 沒帶 check=True），而非零
+    正是它回報「沒殺成」的正常方式：rc=128 行程根本不在、rc=1 存取被拒。舊碼因此
+    把「送出過 taskkill」當成「殭屍已清」，log 與 Telegram 會宣稱清了 N 個而實際
+    可能 0 個——同物種第 9 次（未驗證的結果被當成已完成的事實）。
+    """
+    try:
+        r = subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True, timeout=15)
+    except Exception as exc:                      # 逾時／找不到 taskkill
+        return False, f"{pid}:{type(exc).__name__}"
+    if r.returncode == 0:
+        return True, ""
+    err = _decode_console(r.stderr or r.stdout).strip().replace("\n", " ")[:60]
+    return False, f"{pid}:rc={r.returncode} {err}".strip()
+
+
+def _kill_all(victims, *, stop_at_target: bool = False) -> tuple[list[int], list[str], bool]:
+    """依序清 victims，回 (真的殺掉的 pid, 失敗描述, 是否提早收手)。
+
+    ⛔ 只有 rc=0 才計入 killed——這一行就是本函式存在的全部理由。
+    stop_at_target 只給緊急線用：每殺成 2 個回頭量一次 commit%，降到目標線就收手
+    （殺夠了就別多殺）。⛔ 常態清掃**不可**帶這個旗標：它是純衛生清掃，觸發時
+    commit 本來就在緊急線以下，帶了會變成「殺 2 個就收工」而放生其餘殭屍。
+    """
+    killed: list[int] = []
+    failed: list[str] = []
+    for pid, _age in victims:
+        ok, why = _taskkill(pid)
+        if not ok:
+            failed.append(why)
+            continue
+        killed.append(pid)
+        if stop_at_target and len(killed) % 2 == 0:
+            cur = _commit_pct()
+            if cur is not None and cur <= MEM_TARGET_PCT:
+                return killed, failed, True
+    return killed, failed, False
+
+
+def _fail_tail(failed: list[str], limit: int = 160) -> str:
+    """把失敗清單接成一句可讀的尾巴；沒有失敗就回空字串。"""
+    if not failed:
+        return ""
+    return f"；另 {len(failed)} 個殺不掉（{'; '.join(failed)[:limit]}）"
+
+
 def memory_guard() -> None:
     """兩段式：①常態清掃——殭屍 runner ≥4 個且皆老於 90 分鐘就清（不等記憶體告急，
     治「離開一天越來越卡」）②緊急線——commit ≥88% 強制清到目標線。每次動作必留痕。"""
@@ -246,16 +295,17 @@ def memory_guard() -> None:
         now = time.time()
         if now - float(state.get("memguard_last_ts", 0) or 0) < MEM_COOLDOWN_SEC:
             return
-        killed = []
-        for pid, _age in sorted(stale, key=lambda v: -v[1]):
-            try:
-                subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                               capture_output=True, text=True, timeout=15)
-                killed.append(pid)
-            except Exception:
-                continue
-        log(f"[memguard] 常態清掃：清 {len(killed)} 個殭屍 runner"
-            f"（commit {pct:.0f}%,未達緊急線,純衛生）")
+        killed, failed, _early = _kill_all(sorted(stale, key=lambda v: -v[1]))
+        if not killed:
+            # ⛔ 一個都沒殺成≠清掃過了：不寫冷卻戳記，下一輪（3 分鐘後）還要再試。
+            #    沿用「量測失敗不吃掉重試機會」的同一原則（見 _probe_runners_or_log）。
+            log(f"[memguard] 常態清掃：{len(stale)} 個殭屍**一個都沒殺成**"
+                f"（{'; '.join(failed)[:200]}）——本輪不算清掃過，下輪重試")
+            return
+        # PID 一定要印：只寫個數字的話，事後沒有任何辦法回頭驗證它到底殺了誰
+        # （2026-08-01 07:34 那筆「清 4 個」就是因為沒印 PID 而無從查證）。
+        log(f"[memguard] 常態清掃：清 {len(killed)} 個殭屍 runner（PID {killed}）"
+            f"（commit {pct:.0f}%,未達緊急線,純衛生）" + _fail_tail(failed))
         state["memguard_last_ts"] = now
         write_state(state)
         return
@@ -283,25 +333,27 @@ def memory_guard() -> None:
         state["memguard_last_ts"] = now
         write_state(state)
         return
-    killed = []
-    for pid, age_s in victims[:12]:
-        try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                           capture_output=True, text=True, timeout=15)
-            killed.append(pid)
-        except Exception:
-            continue
-        if len(killed) % 2 == 0:
-            cur = _commit_pct()
-            if cur is not None and cur <= MEM_TARGET_PCT:
-                break
+    killed, failed, _early = _kill_all(victims[:12], stop_at_target=True)
     after = _commit_pct()
+    if not killed:
+        # 緊急線上有殭屍、卻一個都殺不掉＝最該出聲的組合之一：告警措辭必須與
+        # 「清成功了」不同，且不寫清理冷卻（沒發生的動作不該換來 10 分鐘失明）。
+        log(f"[memguard] commit {pct:.0f}% 超緊急線，{len(victims)} 個殭屍"
+            f"**一個都沒殺成**（{'; '.join(failed)[:200]}）——本輪未清理，下輪重試")
+        _memguard_notify(state, pct,
+                         f"🚨 記憶體 commit {pct:.0f}% 超緊急線，watchdog 找到 "
+                         f"{len(victims)} 個殭屍但<b>一個都殺不掉</b>"
+                         "（權限不足或行程已消失）——本輪未清理，請人工檢視 "
+                         "watchdog.log", now)
+        write_state(state)                          # 只存告警節流戳記，不寫清理冷卻
+        return
     log(f"[memguard] commit {pct:.0f}%→{(after or 0):.0f}%，"
-        f"清理殭屍 runner {len(killed)} 個（PID {killed}）")
+        f"清理殭屍 runner {len(killed)} 個（PID {killed}）" + _fail_tail(failed))
     _memguard_notify(state, pct,
                      f"🧹 <b>watchdog 記憶體防衛</b>\ncommit {pct:.0f}% → {(after or 0):.0f}%，"
                      f"自動清理 {len(killed)} 個殭屍 AI 排程進程。\n"
-                     "（交易 daemon 不受影響；若頻繁出現請每日重啟 Claude App）", now)
+                     + (f"（另有 {len(failed)} 個殺不掉）\n" if failed else "")
+                     + "（交易 daemon 不受影響；若頻繁出現請每日重啟 Claude App）", now)
     state["memguard_last_ts"] = now
     write_state(state)
 
