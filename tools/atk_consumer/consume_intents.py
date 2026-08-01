@@ -87,6 +87,11 @@ _CLASS_PRIORITY = ("orphan_position", "pnl_unaccounted",
                    "done_state_unreadable", "done_state_write_fail",
                    "cli_missing", "auth_ip_whitelist", "auth",
                    "rate_limit", "timeout", "leverage_fail", "query_fail",
+                   # v208（r103）：查詢通了、回應形狀認不得。排在 query_fail **之後**：
+                   # 兩者處置相近，但連線類故障（401／限流／逾時）若同輪也發生，那才是
+                   # 使用者該先去動的主因，⛔ 不可被這一類擠掉。排在 intent_unreadable
+                   # 之前：它是對外回應的問題，比純本地檔的問題更接近斷流主因。
+                   "exchange_rows_unreadable",
                    # v192（r86）：讀本地 intent 檔失敗——⛔ 必須排在連線類**之後**。
                    # 理由同本表開頭：它是純本地失敗，斷流輪照樣會被記到；排前面會把
                    # 「對外連不上」這個真正主因從代表類別擠掉，使用者拿到的處置建議
@@ -443,6 +448,14 @@ _CLASS_HINT = {
                               "%LOCALAPPDATA%\\TradingBot\\atk_acknowledged_positions.json,"
                               "格式是一個清單、每筆要有 inst_id 與 pos_side，例如 "
                               '[{"inst_id":"XXX-USDT-SWAP","pos_side":"long"}]',
+    "exchange_rows_unreadable": "交易所查詢通了、也回了合法 JSON，但那個形狀認不得"
+                                "（不是清單，也沒有 data 清單）→ 最可能是 okx CLI 換版"
+                                "改了輸出格式。執行器已自動停手：本輪不對帳、不平倉、"
+                                "不接新單（既有倉的止損仍掛在交易所）。⛔ 這條**不是**"
+                                "「交易所上沒有倉」——真正的倉況本輪等於沒讀到。"
+                                "處置：手動跑一次 `okx --profile <profile> account "
+                                "positions --json` 看實際輸出長什麼樣；若 CLI 剛升級過，"
+                                "回報這個新形狀以便補進解析器",
     "auth_ip_whitelist": "呼叫端 IP 不在 API key 白名單（住宅浮動 IP 換掉會復發）"
                          "→ 到 OKX 後台把下方錯誤訊息中的 IP 加進白名單，"
                          "消費器每分鐘自動重試、不需重啟",
@@ -973,6 +986,27 @@ def orphan_positions(exchange_positions, open_map: dict) -> list:
     return sorted(out)
 
 
+def parse_okx_rows(raw):
+    """把 okx CLI 的 JSON 回應解析成「一列一筆」的清單（純函式）。三態：
+
+        list  ＝**確認**讀到了這些筆（空清單＝確認沒有任何一筆）
+        None  ＝認不得這個形狀＝**未知**（呼叫端一律走 fail-closed 分支）
+
+    v208（監督員 r103）：舊碼兩處都寫成 `raw if isinstance(raw, list) else
+    raw.get("data", [])`——`.get(..., [])` 讓「認得的空清單」與「根本不認得的
+    形狀」得到同一個答案。CLI 換版、換包裝鍵，或回一個 {"code":..,"msg":..}
+    的錯誤信封，就會被讀成「交易所上確認沒有」。⛔ 只認兩種形狀，其餘一律未知；
+    ⛔ 也**不可**因為保險就把 {"data": []} 一起打成未知——那是確認沒有，
+    打成未知會讓正常空倉輪每輪擋單（見 test_okx_rows_unreadable_v208.py）。"""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        data = raw.get("data")
+        if isinstance(data, list):
+            return data
+    return None
+
+
 WEEKLY_STOP_USD = 750.0          # 週虧熔斷（≈7.5R）：近 7 日合計虧損達此值→停接新單
 
 
@@ -998,8 +1032,13 @@ def _realized_pnl_since(inst_id: str,
     if code != 0 or not out.strip().startswith(("[", "{")):
         return None
     try:
-        fills = json.loads(out)
-        fills = fills if isinstance(fills, list) else fills.get("data", [])
+        fills = parse_okx_rows(json.loads(out))
+        if fills is None:
+            # v208（r103）：認不得的形狀曾在這裡折成空清單 → 回 (0.0, None)＝一個
+            #   **看起來成功**的答案，把那筆真錢的已實現損益以 0.00 記進 day_pnl
+            #   （日/週熔斷唯一的輸入），而且繞過 v170 才補上的重試——重試只在
+            #   回 None 時啟動。回 None 讓它走既有的重試／漏記記帳路徑。
+            return None
         total = 0.0
         last_ts: float | None = None
         for f in fills:
@@ -1036,10 +1075,22 @@ def manage_positions(dry: bool) -> list | None:
     if code != 0 or not out.strip().startswith(("[", "{")):
         return None                              # 查不到就不動，別誤判平倉（未知）
     try:
-        plist = json.loads(out)
-        plist = plist if isinstance(plist, list) else plist.get("data", [])
+        plist = parse_okx_rows(json.loads(out))
     except Exception:  # noqa: BLE001
         return None                              # 解析不了＝等同查不到（fail-closed）
+    if plist is None:
+        # v208（監督員 r103）：解得開、但認不得形狀。舊碼在這裡折成空清單，後果兩層
+        #   且都落在真錢上：①孤兒偵測回 []＝「**確認**沒有孤兒」⇒ 目前唯一那條真錢
+        #   阻塞被無聲解除、擋同幣同向新單的閘一起消失（v162/r53 堵的正是這個洞，
+        #   只是那次的入口是「查詢失敗」、這次是「查詢成功但看不懂」）；②本地帳上每
+        #   一筆在場倉都會被判成「交易所上已消失＝已了結」⇒ 整批走結算路徑被移出部位
+        #   帳。一次看不懂的回應換來一次全倉假平倉。⇒ 回 None（未知）並記帳出聲。
+        msg = ("交易所部位查詢回了一個認不得的形狀（解得開、但讀不出任何一筆）——"
+               "本輪不對帳、不平倉、不接新單（下輪重試）。"
+               f"樣本：{redact_secrets(out.strip())[:200]}")
+        print(f"⛔ {msg}")
+        _note_fail("exchange_rows_unreadable", msg)
+        return None
     # 反向對帳：⛔ 不自動平倉、⛔ 不自動收編進本地帳（理由見規格 §4.2）——
     # 只記健康帳（讓既有的連續輪告警機制自然接手）＋擋同幣同向新單。
     orphans = orphan_positions(plist, ps.get("open") or {})
