@@ -18,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import os
 import sqlite3
+import tempfile
 import time
 
 from botpaths import data_dir, db_path as _db_path
@@ -47,25 +49,82 @@ def _review_state_path():
     return data_dir() / _REVIEW_STATE_NAME
 
 
-def _load_last_review_date() -> str | None:
-    """回傳上次每日復盤執行的 UTC 日期字串（YYYY-MM-DD），無則 None。讀失敗→None（保守＝會補跑）。"""
+# v200（監督員 r94）：讀取三態。⛔ 勿再折回單一 None。
+LOAD_OK = "ok"
+LOAD_MISSING = "missing"          # 真的沒有檔＝真·從未復盤過，唯一可當「沒有歷史」用的一態
+LOAD_UNREADABLE = "unreadable"    # 檔在但讀不出／壞檔／形狀不對＝上次跑的日期**未知**
+
+
+def _atomic_write(p, text: str) -> None:
+    """temp + flush + fsync + os.replace。失敗向上拋，由呼叫端決定怎麼收斂。
+
+    fsync 不可省：少了它，內容可能還在作業系統快取裡就換了名，斷電後目的地留下零長度／
+    半截檔——那正是「壞掉的戳記檔」的自產來源（本機有斷電事件史，v177 才補電力哨兵）。
+    """
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".auto_tuner_", suffix=".tmp")
     try:
-        d = json.loads(_review_state_path().read_text(encoding="utf-8"))
-        v = d.get("last_review_date")
-        return v if isinstance(v, str) else None
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
     except Exception:
-        return None
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
-def _stamp_review_date(date_str: str) -> None:
-    """戳記今日已跑（UTC 日期）。寫失敗只印警告、不擋流程（最壞情況＝重啟後多補跑一次，冪等安全）。"""
+def _preserve_bad(p, err: Exception) -> None:
+    """壞檔留一份鑑識副本（原檔下一輪就會被蓋掉）並出聲。⛔ 不刪不改原檔。"""
+    kept = ""
     try:
-        p = _review_state_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"last_review_date": date_str},
-                                ensure_ascii=False), encoding="utf-8")
-    except Exception as e:
-        print(f"[auto_tuner] 警告：寫入 review 狀態失敗（不影響執行）：{type(e).__name__}: {e}")
+        bad = p.with_suffix(".bad")
+        if not bad.exists():           # 只留最早那一份（後續覆蓋會沖掉第一現場）
+            bad.write_bytes(p.read_bytes())
+        kept = f"；壞檔已留證於 {bad.name}"
+    except Exception:  # noqa: BLE001 留證是 best-effort，不可反過來壓掉主訊息
+        kept = "；（留證失敗）"
+    print(f"🚨 [auto_tuner] 每日復盤戳記檔存在但讀不出來（{type(err).__name__}: {err}）{kept}"
+          "——⛔ 不當成『從未復盤過』")
+
+
+def _load_last_review_status() -> tuple[str | None, str]:
+    """讀上次復盤日期，回 (date, status)，status ∈ {ok, missing, unreadable}。
+
+    為何要三態：舊版把「沒有檔（真·從未復盤）」與「檔在但壞掉」折成同一個 None，迴圈把
+    None 一律讀成「今日尚未跑」。單看一輪這是保守的（多跑一次冪等安全），但它與下方
+    `continue` 分支相乘之後就不是了——見 run_auto_tuner_loop 的熱迴圈說明。
+    """
+    p = _review_state_path()
+    try:
+        if not p.exists():
+            return None, LOAD_MISSING
+    except OSError:
+        return None, LOAD_UNREADABLE      # 連「在不在」都問不出來 → 未知，不可當沒有
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 壞檔／權限／編碼一律歸「未知」
+        _preserve_bad(p, e)
+        return None, LOAD_UNREADABLE
+    if not isinstance(d, dict) or not isinstance(d.get("last_review_date"), str):
+        _preserve_bad(p, ValueError("形狀不對：缺 last_review_date 字串"))
+        return None, LOAD_UNREADABLE
+    return d["last_review_date"], LOAD_OK
+
+
+def _stamp_review_date(date_str: str) -> bool:
+    """戳記今日已跑（UTC 日期），原子寫。回傳是否寫成功——⛔ 呼叫端不可假設一定成功。"""
+    try:
+        _atomic_write(_review_state_path(),
+                      json.dumps({"last_review_date": date_str}, ensure_ascii=False))
+        return True
+    except Exception as e:  # noqa: BLE001 寫不進去不可拖垮迴圈，但必須回報失敗
+        print(f"[auto_tuner] 警告：寫入 review 狀態失敗（改用行程內記憶去重）："
+              f"{type(e).__name__}: {e}")
+        return False
 
 
 def _conn() -> sqlite3.Connection:
@@ -265,19 +324,35 @@ async def run_auto_tuner_loop(tg, interval_seconds: int = 86400,
       3. 否則睡到下一個 target_hour_utc，醒來執行、戳記當日，無限循環。
     冪等：以 data_dir/auto_tuner_state.json 的 last_review_date(UTC) 去重；即使狀態檔遺失而多補跑
     一次，優化器用固定 trial epoch（不灌水 n_trials）＋樣本<30→0 晉升→零行為變更，安全。
+
+    v200（監督員 r94）——去重不可只靠持久化：
+      補跑分支結尾是 `continue`，中間**沒有任何 sleep**；唯一擋住熱迴圈的是戳記有寫成功。
+      但寫入失敗（唯讀檔／ACL／磁碟滿）是被吞掉的，而讀不出來（壞檔）同樣回「今天沒跑過」。
+      兩者任一成立，迴圈就會以最快速度無限重跑整份每日復盤（DB 全掃 + lessons rebuild +
+      優化器 + 每輪一則 Telegram）。已在改動前的碼上實證：50 次復盤、0 次睡眠。
+      治法＝**行程內記憶** ran_in_process：本行程今天確實跑過就算跑過，與持久化成敗脫鉤。
+      ⛔ 不可改用「讀不出來就跳過復盤」來擋——復盤是模型變強的唯一回路，跳掉比多跑一次糟得多。
     """
     print("[auto_tuner] loop online（每日調參分析；含啟動補跑 task#78）")
     if warmup_seconds:
         await asyncio.sleep(warmup_seconds)
+    ran_in_process: str | None = None   # 本行程內確定已完成復盤的 UTC 日期（熱迴圈的真正煞車）
+    warned_unreadable: str | None = None
     while True:
         now = _now_utc()
         today = now.date().isoformat()
-        ran_today = (_load_last_review_date() == today)
+        last_date, status = _load_last_review_status()
+        if status == LOAD_UNREADABLE and warned_unreadable != today:
+            warned_unreadable = today
+            print(f"🚨 [auto_tuner] 復盤戳記讀不出來 → 今天({today})跑過沒有＝**未知**"
+                  "（⛔ 不等於『沒跑過』）；本輪照跑一次，並改用行程內記憶去重")
+        ran_today = (last_date == today) or (ran_in_process == today)
         past_fire = now.hour >= target_hour_utc
         if past_fire and not ran_today:
             # 啟動補跑：今日已過觸發點但尚未執行（多因 daemon 在 02:00 UTC 後才起／剛重啟）
             print(f"[auto_tuner] 啟動補跑：{today} 今日尚未執行每日復盤（已過 {target_hour_utc:02d}:00 UTC）")
             await _run_daily_review(tg)
+            ran_in_process = today      # ⛔ 必須先於戳記且與其成敗脫鉤，否則寫失敗＝熱迴圈
             _stamp_review_date(today)
             continue  # 重算下一觸發點（此時 ran_today 已 True → 走排程睡眠分支）
         # 排程睡眠到下一個 target_hour_utc
@@ -286,7 +361,8 @@ async def run_auto_tuner_loop(tg, interval_seconds: int = 86400,
             nxt += dt.timedelta(days=1)
         await asyncio.sleep((nxt - now).total_seconds())
         await _run_daily_review(tg)
-        _stamp_review_date(_now_utc().date().isoformat())
+        ran_in_process = _now_utc().date().isoformat()   # 同上：先記，再嘗試持久化
+        _stamp_review_date(ran_in_process)
 
 
 if __name__ == "__main__":

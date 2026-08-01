@@ -42,8 +42,12 @@ def _drive(monkeypatch, *, now_dt, last_date, max_sleeps,
            target_hour_utc=2, warmup_seconds=0):
     """驅動 run_auto_tuner_loop，回傳 (reviews, stamped, sleeps)。
 
-    now_dt 固定；last_date＝持久化的上次執行 UTC 日期（None＝讀失敗/從未跑）；
+    now_dt 固定；last_date＝持久化的上次執行 UTC 日期（None＝沒有狀態檔＝真·從未跑）；
     max_sleeps＝第幾次 sleep 拋 _StopLoop 終止。
+
+    v200 起讀取改三態（見 test_auto_tuner_state_honesty.py）：本檔只驅動「檔案讀得出來」
+    的正常路徑（None→missing、有值→ok）；「壞檔讀不出來」與「戳記寫不進去」的熱迴圈防護
+    在該新檔驗。
     """
     state = {"last": last_date}
     reviews = []
@@ -58,10 +62,18 @@ def _drive(monkeypatch, *, now_dt, last_date, max_sleeps,
         if len(sleeps) >= max_sleeps:
             raise _StopLoop
 
+    def fake_load():
+        v = state["last"]
+        return (v, at.LOAD_OK) if v is not None else (None, at.LOAD_MISSING)
+
+    def fake_stamp(d):
+        state["last"] = d
+        stamped.append(d)
+        return True
+
     monkeypatch.setattr(at, "_run_daily_review", fake_review)
-    monkeypatch.setattr(at, "_load_last_review_date", lambda: state["last"])
-    monkeypatch.setattr(at, "_stamp_review_date",
-                        lambda d: (state.__setitem__("last", d), stamped.append(d)))
+    monkeypatch.setattr(at, "_load_last_review_status", fake_load)
+    monkeypatch.setattr(at, "_stamp_review_date", fake_stamp)
     monkeypatch.setattr(at, "_now_utc", lambda: now_dt)
     monkeypatch.setattr(at, "asyncio", _AsyncioShim(fake_sleep))
 
@@ -110,8 +122,9 @@ def test_scheduled_run_fires_after_sleep(monkeypatch):
     assert len(sleeps) == 2
 
 
-def test_load_failure_is_conservative_catchup(monkeypatch):
-    # 狀態讀失敗（None）＋已過觸發點 → 保守補跑（寧可多跑一次，冪等安全）
+def test_no_state_file_is_conservative_catchup(monkeypatch):
+    # 沒有狀態檔（真·從未復盤）＋已過觸發點 → 保守補跑（寧可多跑一次，冪等安全）
+    # ⚠️ v200 起「讀失敗」不再走這條：那是 unreadable，另在 test_auto_tuner_state_honesty.py 驗
     reviews, stamped, _ = _drive(
         monkeypatch, now_dt=_utc(2026, 6, 21, 5), last_date=None,
         max_sleeps=1)
