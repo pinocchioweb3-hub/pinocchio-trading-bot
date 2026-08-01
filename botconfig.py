@@ -33,15 +33,137 @@ except Exception:
 
 _OVERRIDES: dict = {}
 
+# v196（監督員 r90）：覆寫層的讀取狀態。⛔ 三態必須分明，不可折成同一個 {}：
+#   None               → 讀到了，乾淨
+#   "missing"          → 檔案不存在＝**合法**的第一次（新機器／剛清過資料目錄），保持安靜
+#   "no_settings_file" → 連 data_dir 都取不到＝覆寫層整層不存在（自測亦走此路），無檔可毀
+#   其他（例外類別名／"NotADict"）→ **故障**：檔在、卻讀不出來
+_OVERRIDES_ERR: str | None = None
+_OVERRIDES_ERR_SEEN: set[str] = set()   # 同一個故障每行程只吵一次，避免洗版
+
+# 讀不出來時「合法、無檔可毀」的狀態；其餘一律視為故障
+_BENIGN_ERRS = frozenset({"missing", "no_settings_file"})
+
 
 def _load_overrides() -> None:
-    global _OVERRIDES
+    """讀取執行期覆寫檔。
+
+    v196（同物種第 16 次：未知被折成「確認沒有」）：舊碼把「檔不存在」與「檔在但讀不
+    出來」折成同一個 {}。這一處挖空的是**風險參數本身**——bot_settings.json 目前唯一
+    內容是 RISK_PER_TRADE_PCT / TOTAL_RISK_CAP_PCT / SIGNAL_MODE，而 .env 裡**沒有**
+    前兩把（實測）⇒ 這個檔是它們的唯一來源。壞掉時：
+
+      * RISK_PER_TRADE_PCT 消失 → _f 回 0.0 → 落 `elif _is_set("RISK_PER_TRADE_USD")`
+        ⇒ 1R **靜默**從「帳戶 %」切成 .env 的固定 USD。畫面上與「使用者從沒設過 %」
+        一模一樣，零警告。
+      * TOTAL_RISK_CAP_PCT 消失 → 落 tier 預設，總風險上限靜默改變。
+      * 而後任何一次 set_override 會把只剩一把鍵的 _OVERRIDES 整個覆寫回檔案
+        ⇒ 其餘覆寫**永久滅失**，稽核軌跡還記成 before=null＝謊稱「本來就沒設過」。
+
+    ⚠️ 方向選擇：這裡**不**在讀取端 fail-closed（拋例外會讓每個 import botconfig 的
+    行程當場死掉，含 watchdog 自己，代價遠大於病）。改為：照舊落回 env／預設讓行程活著，
+    但把故障**說出來**（留痕 + 公開 getter），並在**寫入端** fail-closed——因為寫入才是
+    會把損害從「暫時讀不到」變成「永久滅失」的那一步。
+    """
+    global _OVERRIDES, _OVERRIDES_ERR
     _OVERRIDES = {}
+    if not _SETTINGS_FILE:
+        _OVERRIDES_ERR = "no_settings_file"
+        return
     try:
-        if _SETTINGS_FILE and _SETTINGS_FILE.exists():
-            _OVERRIDES = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8")) or {}
+        exists = _SETTINGS_FILE.exists()
+    except Exception as exc:            # 權限／路徑異常：連「在不在」都不知道＝故障
+        _OVERRIDES_ERR = type(exc).__name__
+        _report_overrides_err()
+        return
+    if not exists:
+        _OVERRIDES_ERR = "missing"
+        return
+    try:
+        data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:            # 半截 JSON／編碼／權限：檔在但讀不出來＝故障
+        _OVERRIDES_ERR = type(exc).__name__
+        _report_overrides_err()
+        return
+    if not isinstance(data, dict):
+        # 合法 JSON 但不是物件（被寫成 list／null／數字）。寫入端只會 dump dict，
+        # 故這不是任何正常路徑產生得出來的東西 ⇒ 判故障，不當成「空的」。
+        _OVERRIDES_ERR = "NotADict"
+        _report_overrides_err()
+        return
+    _OVERRIDES = data
+    _OVERRIDES_ERR = None
+
+
+def _report_overrides_err() -> None:
+    """故障留痕：同一個故障每行程只吵一次（_load_overrides 會被反覆呼叫）。"""
+    err = _OVERRIDES_ERR
+    if not err or err in _OVERRIDES_ERR_SEEN:
+        return
+    _OVERRIDES_ERR_SEEN.add(err)
+    msg = (f"覆寫檔 {getattr(_SETTINGS_FILE, 'name', '?')} 存在但讀不出來（{err}）"
+           "——風險參數（1R%／總風險上限／訊號模式）本輪落回 env／預設，"
+           "⛔ 這**不是**「使用者沒設過」；設定寫入已 fail-closed 以免其餘覆寫被覆蓋滅失")
+    _WARNINGS.append(msg)
+    try:
+        print(f"[botconfig] ⚠️ {msg}")
     except Exception:
-        _OVERRIDES = {}
+        pass
+
+
+def overrides_load_error() -> str | None:
+    """覆寫檔最近一次讀取的原始狀態碼（None／"missing"／"no_settings_file"／故障名）。"""
+    return _OVERRIDES_ERR
+
+
+def overrides_unreadable() -> str | None:
+    """只回**故障**（檔在卻讀不出來）；合法的「不存在／無覆寫層」一律回 None。
+
+    供監督層／CEO 報告判斷「現在跑的風險參數是不是踩在讀不到的設定上」。
+    """
+    err = _OVERRIDES_ERR
+    return None if (err is None or err in _BENIGN_ERRS) else err
+
+
+def _persist_overrides() -> None:
+    """把 _OVERRIDES 原子落地（tmp + os.replace）。失敗一律拋，⛔ 不可靜默吞。
+
+    v196：舊碼 write_text 直接覆蓋＝非原子——斷電或被 watchdog/memguard 殺在寫到
+    一半，留下的就是讀不出來的半截檔 ⇒ 本模組有能力親手做出那個壞檔再自誤讀（與
+    v157/v162-v166/v195 同一支根因）。舊碼的 `except: pass` 另有一洞：寫失敗時呼叫端
+    以為成功、記憶體裡也真的有值，但重啟後設定不見＝又一次「未知折成沒事」。
+    """
+    if not _SETTINGS_FILE:
+        return                          # 無覆寫層（自測路徑）：僅記憶體生效，無檔可寫
+    tmp = _SETTINGS_FILE.with_suffix(_SETTINGS_FILE.suffix + ".tmp")
+    payload = json.dumps(_OVERRIDES, ensure_ascii=False, indent=2)
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, _SETTINGS_FILE)
+    except Exception as exc:
+        try:
+            tmp.unlink(missing_ok=True)     # 不留殘骸給下一輪誤讀
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"設定寫入失敗（{type(exc).__name__}: {exc}）——本次變更未落地，"
+            "重啟後不會生效；⛔ 不可當成已設定") from exc
+
+
+def _guard_overrides_writable(key: str, value, source: str) -> None:
+    """寫入端 fail-closed：覆寫檔讀不出來時，⛔ 絕不寫。
+
+    因為 set_override/revert_key 是「讀出整包 → 改一把 → 整包覆寫」。讀不出來時
+    整包＝{}，寫下去就等於把其餘覆寫（例如另外兩把風險參數）**永久刪掉**，而且稽核
+    軌跡會記成 before=null＝謊稱本來就沒設過。暫時讀不到還有救，覆蓋下去就沒救了。
+    """
+    err = overrides_unreadable()
+    if not err:
+        return
+    _audit_write(key, "<unreadable>", value, f"blocked:{err}")
+    raise RuntimeError(
+        f"覆寫檔存在但讀不出來（{err}）——已拒絕寫入 {key}，以免其餘設定被覆蓋滅失。"
+        f"請人工檢查 {getattr(_SETTINGS_FILE, 'name', '?')}（修好或移走後即可再設定）")
 
 
 def _raw(key: str):
@@ -111,16 +233,27 @@ def set_override(key: str, value, *, source: str = "auto") -> None:
       人工手動執行（okx-trade-mcp 全庫零呼叫＋黑名單），自動端 config 只驅動訊號／paper／
       OKX-demo 模擬盤，活鍵物理上到不了真錢執行層（三票對抗驗證 refuted=0、confidence
       high）。活鍵仍受 BotConfig.from_env 的範圍夾擠（如 leverage∈[1,50]、risk_pct≤20）
-      保護——那是『範圍安全』非『寫入鎖』，保留。"""
+      保護——那是『範圍安全』非『寫入鎖』，保留。
+
+    v196（監督員 r90）：覆寫檔讀不出來時**拒寫**（fail-closed）並拋 RuntimeError。
+      這不是新的政策鎖——寫入鎖仍是移除的；擋的只有「在讀不到既有覆寫的狀態下整包
+      覆寫」這一種會造成**永久滅失**的寫法。Telegram /settings 端已有 try/except，
+      使用者會看到「設定失敗：RuntimeError」而非以為改好了。"""
     _load_overrides()
+    _guard_overrides_writable(key, value, source)
+    had_before = key in _OVERRIDES
     before = _OVERRIDES.get(key)
     _OVERRIDES[key] = value
-    if _SETTINGS_FILE:
-        try:
-            _SETTINGS_FILE.write_text(json.dumps(_OVERRIDES, ensure_ascii=False,
-                                                 indent=2), encoding="utf-8")
-        except Exception:
-            pass
+    try:
+        _persist_overrides()
+    except Exception:
+        # 沒落地就不能讓記憶體裡假裝成功——回捲，並把失敗記進稽核軌跡後往上拋
+        if had_before:
+            _OVERRIDES[key] = before
+        else:
+            _OVERRIDES.pop(key, None)
+        _audit_write(key, before, value, f"failed:{source}")
+        raise
     _audit_write(key, before, value, source)
     reload()
 
@@ -161,16 +294,14 @@ def revert_key(key: str, *, source: str = "human") -> bool:
     if not found:
         return False
     _load_overrides()
+    # v196：與 set_override 同理——讀不出來就別整包覆寫，否則「回滾一把鍵」會順手
+    #       把其餘覆寫刪光。回滾是可以等的，永久滅失不能。
+    _guard_overrides_writable(key, last_before, "revert")
     if last_before is None:
         _OVERRIDES.pop(key, None)
     else:
         _OVERRIDES[key] = last_before
-    if _SETTINGS_FILE:
-        try:
-            _SETTINGS_FILE.write_text(json.dumps(_OVERRIDES, ensure_ascii=False,
-                                                 indent=2), encoding="utf-8")
-        except Exception:
-            pass
+    _persist_overrides()
     _audit_write(key, "<revert>", last_before, "revert")
     reload()
     return True
