@@ -35,7 +35,10 @@ async def main():
             continue
         cfg["topics"][key] = tid
         print(f"{key} 建立: thread_id={tid}")
-    save_topics_config(cfg["group_chat_id"], cfg["topics"])
+    if not save_topics_config(cfg["group_chat_id"], cfg["topics"]):
+        # v197：主題已建在群組裡，只是沒記下來 ⇒ ⛔ 不可回報成功（重跑會再建一輪）
+        print("⛔ 主題已建但設定檔寫不進去——請人工補進 topics 後再重跑：", cfg["topics"])
+        return 1
     print("topics:", cfg["topics"])
     return 0
 

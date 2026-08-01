@@ -32,7 +32,10 @@ async def main():
         print(f"ERROR: create failed: {str(r)[:200]}")
         return 1
     cfg["topics"]["pulse"] = tid
-    save_topics_config(cfg["group_chat_id"], cfg["topics"])
+    if not save_topics_config(cfg["group_chat_id"], cfg["topics"]):
+        # v197：主題已建在群組裡，只是沒記下來 ⇒ ⛔ 不可回報成功（重跑會再建一個）
+        print(f"⛔ 主題已建（thread_id={tid}）但設定檔寫不進去——請人工補進 topics 後再重跑")
+        return 1
     print(f"pulse topic created: thread_id={tid}")
     return 0
 

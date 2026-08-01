@@ -54,24 +54,106 @@ RETIRED_TOPIC_KEYS_V36 = {
 }
 
 
-def load_topics_config() -> dict | None:
-    if not TOPICS_FILE.exists():
-        return None
+_NO_SETUP = ("⛔ 不要跑 setup_telegram_group.py：它同樣把這種情形讀成「還沒設定過」，"
+             "會在同一個群組把主題**全部再建一次**、再用新的 thread_id 整包覆寫設定檔——"
+             "原 thread_id 永久滅失、歷史訊息留在孤兒主題裡（Telegram 無法合併主題）。"
+             "請人工檢視 telegram_topics.bad 後把原檔修回來。")
+
+
+def _preserve_bad_config(text: str) -> str:
+    """壞掉的設定檔留一份鑑識副本——原檔隨時可能被下一次 save 蓋掉。⛔ 不刪不改原檔。"""
+    bad = TOPICS_FILE.with_suffix(".bad")
     try:
-        cfg = json.loads(TOPICS_FILE.read_text(encoding="utf-8"))
-        if cfg.get("group_chat_id") and isinstance(cfg.get("topics"), dict):
-            return cfg
-    except Exception as e:
-        print(f"[topics] config parse error: {e}")
-    return None
+        if not bad.exists():        # 只留最早那一份（後續覆蓋會沖掉第一現場）
+            bad.write_text(text, encoding="utf-8")
+        return f"；壞檔已留證於 {bad.name}"
+    except Exception:  # noqa: BLE001
+        return "；（留證失敗）"      # 留證是 best-effort，⛔ 不可反過來壓掉主訊息
 
 
-def save_topics_config(group_chat_id: str, topics: dict[str, int]) -> None:
-    TOPICS_FILE.write_text(
-        json.dumps({"group_chat_id": str(group_chat_id), "topics": topics},
-                   ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+def load_topics_config_status() -> tuple[dict | None, str]:
+    """讀主題路由設定。回 (cfg, status)。
+
+    status ∈ {"ok", "missing", "unreadable", "corrupt", "invalid"}。
+
+    v197（監督員 r91）：同物種第 17 次——**未知被折成確認沒有**。舊版把「沒有檔」「讀不到」
+    「壞檔」「形狀不對」四種情形折成同一個 None，而 TopicRouter 把 None 讀成「還沒設定過
+    forum」→ 9 個已 provision 的主題全部塌回單一聊天室。使用者看不懂程式碼、也開不了本機
+    檔案，Telegram 就是他唯一的介面。
+
+    ⛔ 最貴的不是塌成單一聊天室，是舊碼接著印的那句「run setup_telegram_group.py to
+    enable」：該腳本第 97 行同樣吃這個 None ⇒ 判定「還沒設定過」⇒ 在同群組把 TOPIC_DEFS
+    全部重建、並用新 thread_id 整包覆寫設定檔。一個讀取端的靜默降級，被一行善意的指示
+    兌現成不可逆的破壞。
+
+    ⛔ 讀取端**故意不** fail-closed（在這裡拋，會讓每個 import topics 的行程當場死掉）；
+    fail-closed 放在寫入端 save_topics_config。⛔ 勿改回單一回傳值。"""
+    try:
+        text = TOPICS_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "missing"          # 唯一該走單一聊天室 fallback 的情形
+    except Exception as e:  # noqa: BLE001 權限／被鎖住／IO 錯——檔可能在，只是讀不到
+        print(f"🚨 [topics] 設定檔讀不到（{type(e).__name__}: {e}）——"
+              f"⛔ 不當成「從來沒設過」。{_NO_SETUP}")
+        return None, "unreadable"
+
+    try:
+        cfg = json.loads(text)
+        if not isinstance(cfg, dict):
+            raise ValueError(f"頂層是 {type(cfg).__name__} 不是物件")
+    except Exception as e:  # noqa: BLE001
+        print(f"🚨 [topics] 設定檔壞了（{type(e).__name__}: {e}）{_preserve_bad_config(text)}"
+              f"——⛔ 不當成「從來沒設過」。{_NO_SETUP}")
+        return None, "corrupt"
+
+    if not (cfg.get("group_chat_id") and isinstance(cfg.get("topics"), dict)):
+        # 舊碼這條路徑 100% 靜默：一個字都不印，路由已塌而畫面上毫無跡象。
+        print(f"🚨 [topics] 設定檔解得開、但少了 group_chat_id 或 topics 不是物件"
+              f"{_preserve_bad_config(text)}——⛔ 不當成「從來沒設過」。{_NO_SETUP}")
+        return None, "invalid"
+    return cfg, "ok"
+
+
+def load_topics_config() -> dict | None:
+    """相容入口（callbacks／invite_gate／setup／add_* 共 6 處）：只回 cfg／None。
+
+    ⚠️ 需要分辨「沒設過 vs 讀不出來」一律改用 load_topics_config_status()——
+    把這兩者折在一起正是 v197 治的病。"""
+    return load_topics_config_status()[0]
+
+
+def save_topics_config(group_chat_id: str, topics: dict[str, int],
+                       *, force: bool = False) -> bool:
+    """原子寫設定。回 True/False——⛔ 勿改回直接 write_text，也勿改回回傳 None。
+
+    fail-closed：既有檔存在卻讀不出來時**拒絕覆寫**。呼叫端（add_pulse_topic.py／
+    add_us_topics.py）都是「讀出整包 → 改一把 → 整包寫回」，讀不到既有內容還寫回去，
+    等於把其餘主題永久抹掉（與 v196 botconfig _OVERRIDES 同型）。人工看過 .bad 之後
+    要強制修復，用 force=True。
+
+    非原子寫正是上面那些壞檔的來源：本機有實際斷電事件史（v177 才補電力哨兵），
+    寫到一半就是半截 JSON，下次啟動再自己誤讀＝自產自誤的閉環。"""
+    _, status = load_topics_config_status()
+    if status not in ("ok", "missing") and not force:
+        print(f"🚨 [topics] 拒絕覆寫設定檔：既有內容讀不出來（status={status}）。"
+              "呼叫端多是「讀出整包→改一把→整包寫回」，此時寫回去會把其餘主題永久抹掉。"
+              "請先人工檢視 telegram_topics.bad；確認要覆寫請帶 force=True")
+        return False
+
+    tmp = TOPICS_FILE.with_suffix(".tmp")
+    try:
+        tmp.write_text(
+            json.dumps({"group_chat_id": str(group_chat_id), "topics": topics},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(TOPICS_FILE)        # 原子改名：讀者永不讀到半寫檔
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"🚨 [topics] 設定存不進去（{type(e).__name__}: {e}）——"
+              "新建的主題不會被記住，下次啟動仍走舊設定（或塌回單一聊天室）；"
+              "請查磁碟空間／資料夾權限／同步軟體是否鎖檔")
+        return False
 
 
 class _AuditedClient:
@@ -106,13 +188,19 @@ class TopicRouter:
 
     def __init__(self, base: TelegramClient | None = None):
         self.base = base or TelegramClient()
-        self.cfg = load_topics_config()
+        self.cfg, self.config_status = load_topics_config_status()
         if self.cfg:
             print(f"[topics] forum mode: group={self.cfg['group_chat_id']} "
                   f"topics={self.cfg['topics']}")
-        else:
+        elif self.config_status == "missing":
             print("[topics] no forum config, single-chat fallback "
                   "(run setup_telegram_group.py to enable)")
+        else:
+            # v197：檔在、只是讀不出來。⛔ 這裡絕不能再印上面那句邀請——
+            # 照做的下場是主題被重建一次、原 thread_id 永久滅失。
+            print(f"🚨 [topics] 設定檔存在但讀不出來（{self.config_status}）——"
+                  "所有主題頻道本輪塌回單一聊天室（訊息仍會送達，但不再分流）。"
+                  f"{_NO_SETUP}")
 
     @property
     def forum_enabled(self) -> bool:

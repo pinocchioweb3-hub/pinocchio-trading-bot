@@ -21,7 +21,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from telegram_bot.client import TelegramClient
-from telegram_bot.topics import TOPIC_DEFS, TOPICS_FILE, load_topics_config, save_topics_config
+from telegram_bot.topics import (TOPIC_DEFS, TOPICS_FILE, load_topics_config_status,
+                                 save_topics_config)
 
 
 async def _find_group(tg: TelegramClient, minutes: float = 10) -> tuple[str, str] | None:
@@ -94,11 +95,22 @@ async def main() -> int:
         print("ERROR: TELEGRAM_BOT_TOKEN not set")
         return 1
 
-    existing = load_topics_config()
+    existing, status = load_topics_config_status()
     if existing:
         print(f"已有設定：group={existing['group_chat_id']} topics={existing['topics']}")
         print(f"（要重新設定請先刪除 {TOPICS_FILE}）")
         return 0
+    if status != "missing":
+        # v197：⛔ 這是本腳本唯一會造成**不可逆**破壞的入口。設定檔存在卻讀不出來時，
+        # 舊碼把它讀成「還沒設定過」，於是在同一個群組把 TOPIC_DEFS 全部再建一次，
+        # 再用新的 thread_id 整包覆寫設定檔——原 thread_id 永久滅失、歷史訊息留在
+        # 孤兒主題裡，而 Telegram 沒有「合併主題」這種操作。
+        print(f"⛔ 停止：{TOPICS_FILE} 存在但讀不出來（status={status}）。")
+        print("   若在這裡繼續，我會把所有主題在同一個群組**再建一次**，並用新的")
+        print("   thread_id 整包覆寫設定檔——原本的 thread_id 會永久滅失，")
+        print("   歷史訊息會留在沒人看的孤兒主題裡（Telegram 無法合併主題）。")
+        print(f"   請先人工檢視 {TOPICS_FILE.with_suffix('.bad')}，把設定檔修回來再重跑。")
+        return 1
 
     me = await tg.get_me()
     bot_name = me.get("result", {}).get("username", "?")
@@ -143,7 +155,14 @@ async def main() -> int:
             return 1
         await asyncio.sleep(0.5)
 
-    save_topics_config(final_id, topics)
+    if not save_topics_config(final_id, topics):
+        # v197：主題已經在群組裡建好了，只是沒記下來。⛔ 不可回報成功——下一次重跑
+        # 會判定「還沒設定過」而再建一輪重複主題。把 id 印出來讓人工補寫回去。
+        print(f"\n⛔ 主題已建好，但設定檔寫不進去（{TOPICS_FILE}）。")
+        print("   ⛔ 修好之前不要重跑本腳本——會再建一組重複的主題。")
+        print("   請人工把下面這份內容存成該檔案：")
+        print(f"   {{\"group_chat_id\": \"{final_id}\", \"topics\": {topics}}}")
+        return 1
     print(f"\n✅ 設定已存至 {TOPICS_FILE}")
 
     # 每個主題發測試訊息
