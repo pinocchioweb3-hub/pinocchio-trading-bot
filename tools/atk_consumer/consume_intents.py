@@ -858,6 +858,31 @@ def timed_out(placed_at_s: float, now_s: float,
     return (now_s - placed_at_s) > limit_h * 3600
 
 
+ACKED_POS = Path(os.path.expandvars(
+    r"%LOCALAPPDATA%\TradingBot\atk_acknowledged_positions.json"))
+
+
+def load_acked_keys() -> set:
+    """v189：使用者已確認的手動倉 {(inst_id, pos_side)}。
+    用途：使用者親口確認「這筆是我自己開的」後,孤兒偵測不再對它記故障/告警,
+    但**同幣同向新單照樣擋**（防自動單疊在手動倉上）、依然不自動管理它。
+    檔案只在使用者於聊天室確認後由 CEO 寫入;讀壞/缺檔=空集合（安全預設:全部當孤兒）。"""
+    try:
+        data = json.loads(ACKED_POS.read_text(encoding="utf-8"))
+        return {(e.get("inst_id"), e.get("pos_side"))
+                for e in data if isinstance(e, dict) and e.get("inst_id")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def partition_orphans(orphans: list, acked: set) -> tuple[list, list]:
+    """(未確認孤兒, 已確認手動倉)（純函式）。"""
+    un, ack = [], []
+    for o in orphans:
+        (ack if (o[0], o[1]) in acked else un).append(o)
+    return un, ack
+
+
 def orphan_positions(exchange_positions, open_map: dict) -> list:
     """反向對帳（純函式）：列出「交易所上真的有、但本地帳沒有」的部位。
 
@@ -963,8 +988,12 @@ def manage_positions(dry: bool) -> list | None:
     # 反向對帳：⛔ 不自動平倉、⛔ 不自動收編進本地帳（理由見規格 §4.2）——
     # 只記健康帳（讓既有的連續輪告警機制自然接手）＋擋同幣同向新單。
     orphans = orphan_positions(plist, ps.get("open") or {})
-    orphan_keys = [(i, s) for i, s, _ in orphans]
-    for _iid, _side, _sz in orphans:
+    # v189：使用者已確認的手動倉不記故障不告警（但同幣同向照擋、依然不代管）
+    _unacked, _acked = partition_orphans(orphans, load_acked_keys())
+    orphan_keys = [(i, s) for i, s, _ in orphans]   # 擋單鍵含已確認者（防疊倉）
+    for _iid, _side, _sz in _acked:
+        print(f"ℹ️ 已確認手動倉 {_iid} {_side} {_sz:g} 張（使用者自管,擋同幣同向自動單）")
+    for _iid, _side, _sz in _unacked:
         msg = (f"孤兒部位 {_iid} {_side} {_sz:g} 張：交易所上有、本地帳沒有。"
                "此倉不在自動管理之下（不會逾時平倉、了結損益不進日/週熔斷口徑），"
                "但它的止損仍掛在交易所。請人工確認後決定是否平倉；在它消失前，"
