@@ -622,16 +622,148 @@ async def compute_per_symbol_state(source, symbol: str) -> dict:
     return result
 
 
-def _mark_daily_macro_sent() -> None:
-    """v23-2: 記錄 daily macro 發送時間（重啟去重用）"""
+# v203（監督員 r98）：狀態檔讀取三態。⛔ 勿再折回單一 None／單一 except: pass。
+# 這兩個檔（daily_macro_state.json / pulse_state.json）過去都把「檔在但讀不出來」
+# 與「本來就沒有」折成同一條路，而兩者的正確處置**方向相反**：
+#   • 真的沒有  → 這是第一次，該發／該當基準
+#   • 讀不出來  → **未知**，任何「所以沒發過／所以沒有上一則」的推論都不成立
+STATE_OK = "ok"
+STATE_MISSING = "missing"          # 真的沒有檔＝唯一可當「沒有歷史」用的一態
+STATE_UNREADABLE = "unreadable"    # 檔在但讀不出／壞檔／形狀不對＝內容**未知**
+
+
+def _atomic_write_state(p, text: str) -> None:
+    """temp + flush + fsync + os.replace。失敗向上拋，由呼叫端收斂。
+
+    fsync 不可省：少了它，內容可能還在作業系統快取裡就換了名，斷電後目的地留下
+    零長度／半截檔——那正是上面 UNREADABLE 的自產來源（本機有斷電事件史）。
+    """
+    import os
+    import tempfile
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".macro_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _preserve_bad_state(p, err: Exception, label: str) -> None:
+    """壞檔留一份鑑識副本（原檔下一輪就會被蓋掉）並出聲。⛔ 不刪不改原檔。"""
+    kept = ""
+    try:
+        bad = p.with_suffix(".bad")
+        if not bad.exists():           # 只留最早那一份（後續覆蓋會沖掉第一現場）
+            bad.write_bytes(p.read_bytes())
+        kept = f"；壞檔已留證於 {bad.name}"
+    except Exception:  # noqa: BLE001 留證是 best-effort，不可反過來壓掉主訊息
+        kept = "；（留證失敗）"
+    print(f"🚨 [{label}] 狀態檔存在但讀不出來（{type(err).__name__}: {err}）{kept}"
+          "——⛔ 不當成『本來就沒有』")
+
+
+def _read_state_dict(p, label: str) -> tuple[dict | None, str]:
+    """讀狀態檔，回 (dict, status)，status ∈ {ok, missing, unreadable}。"""
+    import json as _json
+    try:
+        if not p.exists():
+            return None, STATE_MISSING
+    except OSError:
+        return None, STATE_UNREADABLE     # 連「在不在」都問不出來 → 未知，不可當沒有
+    try:
+        d = _json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 壞檔／權限／編碼一律歸「未知」
+        _preserve_bad_state(p, e, label)
+        return None, STATE_UNREADABLE
+    if not isinstance(d, dict):
+        _preserve_bad_state(p, ValueError(f"形狀不對：末層非 dict（{type(d).__name__}）"), label)
+        return None, STATE_UNREADABLE
+    return d, STATE_OK
+
+
+def _mark_daily_macro_sent() -> bool:
+    """v23-2: 記錄 daily macro 發送時間（重啟去重用）。
+
+    v203：改原子寫，且**回傳是否成功**——⛔ 呼叫端不可假設一定成功。舊版
+    `except: pass` 把寫失敗吞掉，於是「戳記沒寫進去」與「有寫進去」對外完全同形，
+    下次重啟就會再發一次完整 Daily Macro，而沒有任何人知道為什麼。
+    """
     import json as _json
     import time as _t
     from botpaths import data_dir
+    p = data_dir() / "daily_macro_state.json"
     try:
-        (data_dir() / "daily_macro_state.json").write_text(
-            _json.dumps({"last_sent_ts": _t.time()}), encoding="utf-8")
-    except Exception:
-        pass
+        _atomic_write_state(p, _json.dumps({"last_sent_ts": _t.time()}))
+        return True
+    except Exception as e:  # noqa: BLE001 寫不進去不可靜默
+        print(f"🚨 [daily-macro] 發送戳記寫入失敗（{type(e).__name__}: {e}）"
+              "——下次重啟可能重發一則完整 Daily Macro")
+        return False
+
+
+def _daily_macro_startup_skip(dedup_hours: float = 6.0) -> tuple[bool, str]:
+    """啟動時是否跳過那一則 Daily Macro，回 (skip, status)。
+
+    v23-2 的原意是「重啟頻繁時不再轟炸完整 Daily Macro」。舊版把讀失敗吞成
+    `except: pass` ⇒ run_on_startup 維持 True ⇒ 照發。也就是說壞檔期間**每一次重啟
+    都會再發一份**，而 watchdog 三層自癒本來就會重啟。
+
+    三態處置（⛔ 讀不出來與沒有檔的方向相反，不可再合併）：
+      • missing    → 不跳過。真的沒有檔＝真·第一次，本來就該發。
+      • ok 且夠新  → 跳過（既有行為）。
+      • unreadable → **保守跳過並出聲**。上次發送時間未知時，選擇少發一則而非可能重發：
+        少發最多是延後到主迴圈的每日 00:00 UTC 那班（不會永久遺失），
+        重發卻是每次重啟都來一份、且無上限。
+    """
+    import time as _t
+    from botpaths import data_dir
+    p = data_dir() / "daily_macro_state.json"
+    d, status = _read_state_dict(p, "daily-macro")
+    if status == STATE_MISSING:
+        return False, status
+    if status == STATE_UNREADABLE:
+        print("⚠️ [daily-macro] 上次發送時間未知 → 啟動版保守跳過（不當成『從來沒發過』）；"
+              "每日主迴圈不受影響，仍會在 00:00 UTC 正常推送")
+        return True, status
+    ts = (d or {}).get("last_sent_ts")
+    if not isinstance(ts, (int, float)):
+        # 合法 dict 但缺鍵／型別不對＝上次發送時間一樣是**未知**，比照 unreadable
+        print("⚠️ [daily-macro] 戳記檔缺 last_sent_ts（或型別不對）→ 上次發送時間未知，"
+              "啟動版保守跳過（不當成『從來沒發過』）")
+        return True, STATE_UNREADABLE
+    age_h = (_t.time() - float(ts)) / 3600
+    if age_h < dedup_hours:
+        print(f"[daily-macro] startup skip（{age_h:.1f}h 前已發過）")
+        return True, status
+    return False, status
+
+
+def _load_pulse_baseline() -> tuple[str | None, str | None, str]:
+    """讀每小時 pulse 的差分基準，回 (text, ts, status)。
+
+    pulse 是**差分式**報告：有基準才能「已講過且沒變的禁止再講」。舊版讀失敗吞成
+    last_text=None，而 None 在下游被當成「今日第一則」——於是壞檔期間每小時都送一份
+    全量基準描述，並且對使用者宣稱那是第一則。status 要一路傳到 synthesizer，
+    讓「讀不出來」講成讀不出來，而不是講成「沒有上一則」（紅線③）。
+    """
+    from botpaths import data_dir
+    p = data_dir() / "pulse_state.json"
+    d, status = _read_state_dict(p, "pulse")
+    if status != STATE_OK:
+        return None, None, status
+    text, ts = (d or {}).get("text"), (d or {}).get("ts")
+    if not isinstance(text, str) or not text:
+        # 檔在、形狀也對，但沒有可用的基準文字＝基準未知，不可當「沒有上一則」
+        return None, None, STATE_UNREADABLE
+    return text, (ts if isinstance(ts, str) else None), STATE_OK
 
 
 async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3600):
@@ -642,15 +774,9 @@ async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3
     from .synthesizer import synthesize_hourly_pulse
 
     # 上次報告持久化（重啟不失憶，差分基準連續）
+    # v203：三態讀取——「讀不出來」不再折成「沒有上一則」，狀態一路傳給 synthesizer
     state_file = data_dir() / "pulse_state.json"
-    last_text: str | None = None
-    last_ts: str | None = None
-    try:
-        if state_file.exists():
-            st = _json.loads(state_file.read_text(encoding="utf-8"))
-            last_text, last_ts = st.get("text"), st.get("ts")
-    except Exception:
-        pass
+    last_text, last_ts, baseline_status = _load_pulse_baseline()
 
     # 啟動延後（讓 daily macro 先跑，避免衝突）
     await asyncio.sleep(min(interval_seconds, 60))
@@ -659,7 +785,8 @@ async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3
         try:
             pulse_state = await compute_pulse_state(source, watchlist)
             text, meta = await synthesize_hourly_pulse(
-                pulse_state, last_pulse_text=last_text, last_pulse_ts=last_ts)
+                pulse_state, last_pulse_text=last_text, last_pulse_ts=last_ts,
+                baseline_status=baseline_status)
             if text:
                 # v18-E: pulse 頂部固定一行市場廣度（全市場 356 檔即時統計）
                 breadth_prefix = ""
@@ -672,15 +799,20 @@ async def run_hourly_pulse_loop(tg, source, watchlist, interval_seconds: int = 3
                     tg, text, prefix=f"⚡ <b>每小時即時動態</b>\n{breadth_prefix}")
                 print(f"[pulse] sent ({meta.get('output_chars')} chars)")
                 # v23-2: 存為下次的差分基準
+                # 基準文字一旦在記憶體裡就是有效基準（與能否落檔無關）
                 last_text = text
+                baseline_status = STATE_OK
                 last_ts = dt.datetime.now(tz=dt.timezone.utc).strftime("%m-%d %H:%M UTC")
+                # v203：原子寫 + 寫失敗要出聲。基準留在記憶體裡仍可續用，
+                # 但重啟後會失去——靜默吞掉的話沒有人知道基準是何時斷的。
                 try:
-                    state_file.write_text(
+                    _atomic_write_state(
+                        state_file,
                         _json.dumps({"text": last_text, "ts": last_ts},
-                                    ensure_ascii=False),
-                        encoding="utf-8")
-                except Exception:
-                    pass
+                                    ensure_ascii=False))
+                except Exception as e:  # noqa: BLE001 寫不進去不可靜默
+                    print(f"🚨 [pulse] 差分基準寫入失敗（{type(e).__name__}: {e}）"
+                          "——重啟後將失去基準")
             else:
                 print(f"[pulse] synth failed: {meta.get('error')}")
         except Exception as e:
@@ -1755,19 +1887,10 @@ async def run_daily_macro_loop(tg, source, watchlist, target_hour_utc: int = 0,
     # 啟動時可選跑一次（避免等到隔天）
     # v23-2: 6 小時內已發過就跳過 — 重啟頻繁時不再轟炸完整 Daily Macro
     if run_on_startup:
-        import json as _json
-        from botpaths import data_dir
-        dm_state = data_dir() / "daily_macro_state.json"
-        try:
-            if dm_state.exists():
-                st = _json.loads(dm_state.read_text(encoding="utf-8"))
-                age_h = (dt.datetime.now(tz=dt.timezone.utc).timestamp()
-                         - st.get("last_sent_ts", 0)) / 3600
-                if age_h < 6:
-                    print(f"[daily-macro] startup skip（{age_h:.1f}h 前已發過）")
-                    run_on_startup = False
-        except Exception:
-            pass
+        # v203：三態判定。⛔ 讀不出來 ≠ 從來沒發過（前者保守跳過並出聲，後者才該發）
+        skip, _status = _daily_macro_startup_skip()
+        if skip:
+            run_on_startup = False
     if run_on_startup:
         await asyncio.sleep(60)
         try:

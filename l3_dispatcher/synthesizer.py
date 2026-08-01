@@ -818,14 +818,24 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
 
 async def synthesize_hourly_pulse(pulse_state: dict, timeout_sec: int = 180,
                                   last_pulse_text: str | None = None,
-                                  last_pulse_ts: str | None = None
+                                  last_pulse_ts: str | None = None,
+                                  baseline_status: str = "ok"
                                   ) -> tuple[str | None, dict]:
-    """每小時 pulse 報告（v23-2 差分式：附上次報告全文當基準）"""
+    """每小時 pulse 報告（v23-2 差分式：附上次報告全文當基準）
+
+    v203：baseline_status 區分「真的沒有上一則」與「基準讀不出來」。舊版只看
+    last_pulse_text 是否為空，於是壞檔期間每小時都對 LLM 宣稱「今日第一則」——
+    那是一句**假的事實陳述**，且會讓已講過的內容整份重講一次（紅線③的形狀）。
+    """
     user_data = _format_pulse_data(pulse_state)
     if last_pulse_text:
         user_data += (f"\n\n## 上一次 pulse 報告全文（{last_pulse_ts or '?'}）"
                       f"— 差分基準，已講過且沒變的禁止再講\n"
                       f"{last_pulse_text[:1500]}")
+    elif baseline_status == "unreadable":
+        user_data += ("\n\n## 上一次報告：**讀取失敗，基準未知**"
+                      "——⛔ 這不等於「沒有上一則」，禁止宣稱這是今日第一則／首次基準。"
+                      "請只描述當前狀態，並在開頭標明「差分基準暫時遺失，本則為全量描述」。")
     else:
         user_data += "\n\n## 上一次報告：無（今日第一則，輸出基準描述）"
     return await _synthesize_with_prompt(
