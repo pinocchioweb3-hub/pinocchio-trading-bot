@@ -87,6 +87,11 @@ _CLASS_PRIORITY = ("orphan_position", "pnl_unaccounted",
                    "done_state_unreadable", "done_state_write_fail",
                    "cli_missing", "auth_ip_whitelist", "auth",
                    "rate_limit", "timeout", "leverage_fail", "query_fail",
+                   # v192（r86）：讀本地 intent 檔失敗——⛔ 必須排在連線類**之後**。
+                   # 理由同本表開頭：它是純本地失敗，斷流輪照樣會被記到；排前面會把
+                   # 「對外連不上」這個真正主因從代表類別擠掉，使用者拿到的處置建議
+                   # 就會變成「去刪一個檔」，而不是「去補白名單」。
+                   "intent_unreadable",
                    # v164/v166：健康檔壞掉（讀不到／寫不進去）排在最後——它是告警層
                    # 自己的內傷，永遠不該蓋掉同輪真正的交易故障當代表（否則使用者
                    # 看到的主因會被換掉）
@@ -438,6 +443,15 @@ _CLASS_HINT = {
                                "資料夾權限，以及是否被防毒／同步軟體鎖住；"
                                "⛔ 不要直接刪掉 atk_consumer_*health.json——"
                                "刪掉會讓「已持續多久」從零重數，低報斷流時長",
+    "intent_unreadable": "intent 檔存在但讀不出來（半截 JSON／編碼壞掉／內容不是物件）"
+                         "→ 那一筆訊號每輪被跳過。⛔ 它不會自己好：訊號產生端是**依檔名"
+                         "冪等**的（同一個 intent_id 的檔存在就不再寫），壞檔永遠不會被"
+                         "重寫，等 expires_at 一到這筆訊號就永久消失（而且算不進「過期"
+                         "丟棄」的數字——解析失敗發生在讀 expires_at 之前）。"
+                         "⚠️ 管線其餘部分照常運作，只有這一筆被跳過。處置：到 "
+                         "%LOCALAPPDATA%\\TradingBot\\intent_outbox 找日誌指名的那個檔"
+                         "（檔名＝intent_id），確認內容確實壞掉後刪除即可"
+                         "（原始訊號在 trade_journal.db 仍有紀錄）",
     "cli_missing": "okx CLI 不存在 → npm install -g @okx_ai/okx-trade-cli",
     "rate_limit": "被限流 → 通常自癒；持續出現才需降頻",
     "timeout": "呼叫逾時 → 檢查網路；持續出現代表對外連線有問題",
@@ -1192,6 +1206,38 @@ def selftest_fail(rounds: int) -> int:
 
 
 # ── 已處理清單（v165：未知 vs 確認沒處理過） ────────────────────────────
+def _read_intent(path) -> dict | None:
+    """讀一筆 intent。回 None＝讀不出來（已出聲、已記進本輪故障帳）。
+
+    v192（監督員 r86）：舊版是主迴圈裡就地一句 `except Exception: continue`——同物種
+    第 12 次：**讀不出來被折成沒這筆**，而且連一行 print 都沒有。
+
+    這一處不像其他讀取點「下輪重試就會好」：訊號產生端 l4_execution/intent_outbox.py
+    是依檔名冪等的（`if p.exists(): continue`）⇒ 壞檔**永遠不會被重寫**。於是那筆訊號
+    每輪被靜默跳過，直到 expires_at 到期永久消失——連 v169 的「過期丟棄」數字都算不到
+    它頭上（解析失敗發生在讀 expires_at 之前）。
+
+    型別檢查同等重要：合法 JSON 但不是物件（例如 `[]`）在舊碼會逃出 try，在下一行
+    `intent.get(...)` 以 AttributeError 掀掉整輪消費器。
+
+    ⛔ 不可改回無條件 continue；⛔ 偵測端永遠不得刪改壞檔——那是唯一的鑑識證據。"""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        msg = (f"intent 檔讀不出來（{path.name}，{type(e).__name__}）——本輪跳過這一筆；"
+               "產生端依檔名冪等，壞檔不會被自動重寫，過期後這筆訊號將永久消失")
+        print(f"🚨 {msg}")
+        _note_fail("intent_unreadable", msg)
+        return None
+    if not isinstance(raw, dict):
+        msg = (f"intent 檔內容結構不對（{path.name}，頂層是 {type(raw).__name__} 不是物件）"
+               "——本輪跳過這一筆；壞檔不會被自動重寫，過期後這筆訊號將永久消失")
+        print(f"🚨 {msg}")
+        _note_fail("intent_unreadable", msg)
+        return None
+    return raw
+
+
 def _load_state() -> dict | None:
     """讀已處理 intent 清單。回 None＝讀不到／讀壞了（**未知**）；
     ⛔ 不可再當成「確認一筆都沒處理過」。
@@ -1300,9 +1346,9 @@ def main() -> int:
         # v165（r56）：清單未知 ⇒ 冪等的第一道鎖失效，重跑舊 intent 會把早已平掉的倉
         #   憑空記回帳本（見 _load_state）⇒ 本輪整批不碰。⛔ 勿改回無條件 glob。
         for p in ([] if state_blind else sorted(OUTBOX.glob("*.json"))):
-            try:
-                intent = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001
+            # v192（r86）：⛔ 勿改回就地 try/except+裸 continue——讀不出來要出聲、要記帳
+            intent = _read_intent(p)
+            if intent is None:
                 continue
             iid = intent.get("intent_id")
             if not iid or iid in done:

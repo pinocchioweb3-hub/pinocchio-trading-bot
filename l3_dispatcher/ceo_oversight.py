@@ -87,6 +87,25 @@ EXPOSURE_FAIL_CLASSES = {
     ),
 }
 
+# 局部型故障類別（監督員 r86 / v192）：管線照常運作，只有**某一筆輸入**被跳過。
+# 與 EXPOSURE_FAIL_CLASSES 同樣是「不可套通用句」的類別，但錯的方向相反：
+#   通用句＝「未下單（無金錢虧損），但管線實質停擺，須查明修復」——後半句在這裡是**假的**
+#   （其餘 intent 照常送出），會把人導向「整條線掛了」的錯誤處置，也會讓真正的停擺失去分量。
+# 歸屬：user_actionable=False ⇒ 進 system_faults（球在工程端：查為什麼會生出壞檔、
+#   確認後刪掉那個檔），不是「等使用者去 OKX 操作」。
+PARTIAL_FAIL_CLASSES = {
+    "intent_unreadable": (
+        "有 intent 檔存在但讀不出來（半截 JSON／編碼壞掉／內容不是物件）",
+        "⚠️ 管線其餘部分照常運作——只有讀不出來的那一筆訊號每輪被跳過。"
+        "⛔ 它不會自己好：訊號產生端依檔名冪等，壞檔永遠不會被重寫；"
+        "expires_at 一到那筆訊號就**永久**消失，而且算不進「過期丟棄」的數字"
+        "（解析失敗發生在讀 expires_at 之前）。"
+        "處置：到 %LOCALAPPDATA%\\TradingBot\\intent_outbox 找日誌指名的那個檔"
+        "（檔名＝intent_id），確認內容確實壞掉後刪除即可"
+        "（原始訊號在 trade_journal.db 仍有紀錄）",
+    ),
+}
+
 # --- 組織產出斷檔（監督員 r30）---------------------------------------------
 # 同物種第四例（有訊號、無消費者）：2026-07-12～07-28 各席週報無聲斷檔 16.4 天，
 # 無人發現。根因＝排程層的 lastRunAt **只記「觸發」不記「成功」**，所以排程看起來
@@ -265,6 +284,7 @@ def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
     cls = str(health.get("last_fail_class") or "unknown")
     known = USER_ACTIONABLE_FAIL_CLASSES.get(cls)
     exposure = EXPOSURE_FAIL_CLASSES.get(cls)
+    partial = PARTIAL_FAIL_CLASSES.get(cls)
     first_fail = float(health.get("first_fail_ts", 0) or 0)
     dur = f"、已持續 {_fmt_age(now_s - first_fail)}" if first_fail > 0 else ""
     # v179（r77）：consecutive_fail_rounds 與 first_fail_ts 是**跨類別**的單一計數器。
@@ -308,6 +328,9 @@ def live_exec_verdict(health: dict | None, *, now_s: float | None = None,
         sample = sample.removeprefix(strip_prefix).strip()
         which = f"（最近一筆：{sample}）" if sample else ""
         text = (f"真錢執行器{streak}偵測到{label}{which}{dur}——{detail}{mix_note}{cost}")
+    elif partial:
+        label, detail = partial
+        text = (f"真錢執行器{streak}記到{label}{dur}——{detail}{mix_note}{cost}")
     elif known:
         text = (f"真錢執行器{streak}被擋（{known}）{dur}——"
                 f"每輪皆 fail-closed 未下單（無金錢虧損），"
