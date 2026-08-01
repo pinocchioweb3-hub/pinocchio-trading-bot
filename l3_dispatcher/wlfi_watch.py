@@ -46,18 +46,82 @@ _EXCHANGES = {a for a, l in LABELS.items()
               if any(x in l for x in ("幣安", "Gate", "OKX"))}
 
 
-def _load() -> dict:
-    try:
-        return json.loads(_STATE.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return {}
+COLD_START_BLOCKS = 80              # 真·第一次啟動的回看窗（≈16 分鐘）
+MAX_BACKFILL_BLOCKS = 1800          # 補掃上限 ~6h，防冷啟動灌爆公共 RPC
 
 
-def _save(st: dict) -> None:
+def _preserve_bad_state(text: str, err: Exception) -> None:
+    """壞掉的進度檔留一份鑑識副本——原檔下一次 _save 就會被蓋掉。"""
+    bad = _STATE.with_suffix(".bad")
+    kept = ""
     try:
-        _STATE.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        if not bad.exists():           # 只留最早那一份（後續覆蓋會沖掉第一現場）
+            bad.write_text(text, encoding="utf-8")
+        kept = f"；壞檔已留證於 {bad.name}"
     except Exception:  # noqa: BLE001
-        pass
+        kept = "；（留證失敗）"        # 告警層自己的 best-effort——不可反過來壓掉主訊息
+    print(f"🚨 [wlfi] 進度檔壞了（{type(err).__name__}: {err}）{kept}——"
+          "⛔ 不當成『第一次啟動』：那會把上次存檔以來的鏈上轉帳整段靜默跳過")
+
+
+def _load() -> tuple[dict, str]:
+    """讀追蹤進度。回 (state, status)，status ∈ {"ok","missing","unreadable"}。
+
+    v194（監督員 r88）：同物種第 14 次——**未知被折成確認沒有**。舊版三種情形共用同一個
+    回答 `{}`，而掃描端 `frm = st.get("last_block") or (head - 80)` 把它讀成「真·第一次
+    啟動」→ 起點跳到當下往回 80 區塊。於是進度檔一壞，上次存檔到這次重啟之間的 WLFI
+    轉帳整段不會被掃，且下一輪結尾就把 last_block 寫回 head＝永遠不再回頭；同時 seen_tx
+    一併清空 ⇒ 窗內已推過的會重推。漏與重複同時發生、方向相反，畫面上還像「有在動」。
+
+    ⚠️ 本模組 100% display_only，但 WLFI 是目前唯一的真錢阻塞（孤兒倉），這裡是使用者
+    判斷要不要平倉的唯一鏈上資訊面——靜默降級＝把決策依據悄悄挖空。
+    ⛔ 勿改回單一 dict 回傳值。"""
+    try:
+        text = _STATE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, "missing"                      # 沒有檔＝真的還沒跑過
+    except Exception as e:  # noqa: BLE001 權限／被鎖住／IO 錯——檔可能在，只是讀不到
+        print(f"🚨 [wlfi] 進度檔讀不到（{type(e).__name__}: {e}）——"
+              "⛔ 不當成『第一次啟動』；改走最大回補窗")
+        return {}, "unreadable"
+    try:
+        raw = json.loads(text)
+        if not isinstance(raw, dict):
+            raise ValueError(f"頂層是 {type(raw).__name__} 不是物件")
+    except Exception as e:  # noqa: BLE001
+        _preserve_bad_state(text, e)
+        return {}, "unreadable"
+    return raw, "ok"
+
+
+def _scan_start(st: dict, status: str, head: int) -> int:
+    """決定本輪鏈上掃描起點。⛔ 進度未知時不得走冷啟動捷徑。
+
+    未知（unreadable）＝我們**不知道**掃到哪了，唯一誠實的作法是回補到設計允許的最大窗
+    （多掃到的會被 seen_tx 冪等去重，代價只是一次較大的 eth_getLogs）；跳到 head-80
+    等於斷言「中間那段都看過了」，而那正是沒有根據的。"""
+    lb = st.get("last_block")
+    if not (isinstance(lb, int) and lb > 0):
+        lb = (head - MAX_BACKFILL_BLOCKS if status == "unreadable"
+              else head - COLD_START_BLOCKS)      # 真·第一次啟動維持原本的冷啟動窗
+    return max(lb + 1, head - MAX_BACKFILL_BLOCKS)
+
+
+def _save(st: dict) -> bool:
+    """原子寫進度。回 True/False——⛔ 勿改回直接 write_text，也勿改回靜默 pass。
+
+    非原子寫正是上面那個壞檔的來源（同 v166／v193 已治的兩處）。本機有實際斷電事件史
+    （v177 才補了電力哨兵），寫到一半就是半截 JSON，下次啟動再自己誤讀＝自產自誤的閉環。"""
+    tmp = _STATE.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_STATE)                        # 原子改名：讀者永不讀到半寫檔
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"🚨 [wlfi] 進度存不進去（{type(e).__name__}: {e}）——"
+              "下次重啟會拿到過期進度（可能重推舊轉帳／漏掃新區塊）；"
+              "請查磁碟空間／資料夾權限／同步軟體是否鎖檔")
+        return False
 
 
 def label_of(addr: str) -> str:
@@ -209,7 +273,7 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
     """worker：15min 鏈上+行情掃描,事件才推；每日 09:30 台北日報。"""
     print(f"[wlfi] loop online（15min 鏈上+行情;日報 {DIGEST_HOUR_TPE}:30 台北;"
           "display_only）")
-    st = _load()
+    st, _st_status = _load()
     if not st.get("intro_sent") and tg:
         try:
             await tg.send_message(
@@ -231,8 +295,7 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
             head_hex = await _rpc("eth_blockNumber", [])
             if head_hex:
                 head = int(head_hex, 16)
-                frm = st.get("last_block") or (head - 80)
-                frm = max(frm + 1, head - 1800)          # 補掃上限 ~6h,防冷啟動灌爆
+                frm = _scan_start(st, _st_status, head)   # v194：進度未知≠第一次啟動
                 if head >= frm:
                     logs = await _rpc("eth_getLogs", [{
                         "address": CONTRACT, "topics": [_TRANSFER],
