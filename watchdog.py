@@ -441,7 +441,13 @@ def restart_daemon() -> bool:
 def daemon_process_alive():
     """是否有正在跑 run_bot.py 的 python 行程。
     回傳 True／False；查詢失敗回 None（＝不確定，退回只用心跳判斷，避免誤殺）。
-    純靠 powershell 查 CommandLine（watchdog 重啟本來就用 powershell，依賴一致）。"""
+    純靠 powershell 查 CommandLine（watchdog 重啟本來就用 powershell，依賴一致）。
+
+    ⛔ 回 None 的方向是安全的（不確定就不重啟），但**不可無聲**：這支是 2026-06-18
+    事故後補的第二訊號，用來把 30 分鐘心跳盲點縮到 3 分鐘。它若永久壞掉而沒人看見，
+    watchdog 會靜靜退化成只看心跳＝盲點復活。故查不到一律在本機 log 留痕
+    （不發告警，避免每 3 分鐘吵一次）；正常兩條路徑則保持安靜。
+    """
     ps = ("$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
           "-ErrorAction SilentlyContinue | "
           "Where-Object { $_.CommandLine -like '*run_bot*' }; "
@@ -449,15 +455,20 @@ def daemon_process_alive():
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, timeout=30,
         )
-        s = (out.stdout or "").strip()
-        if "ALIVE" in s:
-            return True
-        if "DEAD" in s:
-            return False
-    except Exception:
-        pass
+    except Exception as exc:                      # 逾時／powershell 不存在／被擋
+        log(f"[detect] daemon 行程探測失敗（{type(exc).__name__}: {exc}）"
+            "——⛔ 未知不折成『已死』，本輪退回只看心跳")
+        return None
+    s = _decode_console(out.stdout).strip()       # ⛔ 不用 text=True：解碼不跟隨 locale
+    if "ALIVE" in s:
+        return True
+    if "DEAD" in s:
+        return False
+    err = _decode_console(out.stderr).strip().replace("\n", " ")[:160]
+    log(f"[detect] daemon 行程探測結果無法判讀（exit={out.returncode} "
+        f"stdout={s[:60]!r} stderr={err}）——⛔ 未知不折成『已死』，本輪退回只看心跳")
     return None
 
 
