@@ -379,6 +379,20 @@ def live_stall_verdict(health: dict | None, *, now_s: float | None = None,
     """
     if not health:
         return None
+    # v191（r85）：檔在、卻讀不出來——專屬分支。⛔ 不可讓它掉進下面「沒有可信更新
+    #   時間戳」那句：那句在講「檔讀得出來但欄位缺」，會把「我們根本沒讀到內容」
+    #   說成「讀到了、但時間怪怪的」，方向雖同、事實不同。歸 system_faults（檔壞掉
+    #   不是使用者能處理的事），無論電源量到什麼都不改歸屬。
+    read_err = health.get("_read_error")
+    if read_err:
+        return {"stale_sec": None, "last_rounds": 0,
+                "last_cls": "health_unreadable", "ac_online": ac_online,
+                "user_actionable": False,
+                "text": (f"真錢執行器健康檔**存在但讀不出來**（{read_err}）——"
+                         "⛔ 未知不可折成「無故障」：在它修好之前，帳本無法證明消費器"
+                         "是否還在跑，也看不見任何真錢阻塞（三個判定會同時空白）。"
+                         "請人工檢視 atk_consumer_live_health.json"
+                         "（同目錄有 .bak 可比對）")}
     now_s = now_s if now_s is not None else time.time()
     try:
         updated_at = float(health.get("updated_at", 0) or 0)
@@ -749,12 +763,27 @@ def _read_ledger() -> dict:
 
 
 def _read_live_exec_health() -> dict:
-    """真錢消費器（v143）寫的健康檔；不存在／壞檔 → {}（純讀，永不拋）。"""
+    """真錢消費器（v143）寫的健康檔（純讀，永不拋）。
+
+    v191（監督員 r85）：⛔ 這裡**不可**把兩種狀態折成同一個 {}——
+      * 檔案**不存在** → {}：那是「未知」（可能根本還沒部署過執行器），憑空報停擺
+        會變成慢性假警報（與 live_stall_verdict 的反向護欄同一口徑）。
+      * 檔案**在**、卻讀不出來（壞 JSON／半截檔／權限／編碼／被寫成 list）→ 那是
+        **故障**，不是「沒故障」。舊碼一律回 {}，而 live_exec / live_stall / pnl_gap
+        三個判定的第一行都是 `if not health: return None` ⇒ 帳本上真錢那一欄會是
+        整片空白，與「一切正常」長得一模一樣。同物種第 11 次（未知被折成確認沒有），
+        這次的入口是監督員自己的讀取端。
+    """
     try:
         with open(LIVE_HEALTH_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+    except FileNotFoundError:
         return {}
+    except Exception as exc:            # 壞 JSON／權限／編碼：檔在但讀不出來＝故障
+        return {"_read_error": type(exc).__name__}
+    # 合法 JSON 但不是 dict（例如被寫成 list）：舊碼會原封不動往下傳，下游 .get
+    # 當場爆，再被 build_snapshot 的 except 吞掉 ⇒ 同樣是一片空白。
+    return data if isinstance(data, dict) else {"_read_error": "NotADict"}
 
 
 def _read_org_digest_latest() -> tuple:
