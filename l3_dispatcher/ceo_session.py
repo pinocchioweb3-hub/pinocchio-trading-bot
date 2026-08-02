@@ -631,19 +631,28 @@ def probe_learning_loop(window_hours: float = 26.0, data_dir_fn=None) -> dict:
 
     背景：v114 事故＝一個已過 L2 四關的晉升被 self-check bug 卡死，在 audit jsonl 裡
     沉默數週無人聞問。此探針把「統計放行、工程卡住」這類最貴的靜默阻塞縮到隔日可見。
-    回 {"stuck": [{file,bucket,reasons}], "rounds_checked": n}；讀檔失敗→誠實空結果。"""
+    回 {"stuck": [{file,bucket,reasons}], "rounds_checked": n,
+        "examined": {file: n_in_window}, "unexamined": [{file, why}]}。
+
+    v228：examined／unexamined 是「鍵在＝答案」——某支優化器沒進 examined，代表本次
+    **根本沒看過它**（審計檔讀不到、或近窗一輪都沒跑），不是「看過且沒問題」。舊版把兩支
+    的筆數加總成單一 rounds_checked，只要其中一支有量就足以讓產出端喊全體健康。"""
     import json as _json
     import time as _time
     if data_dir_fn is None:
         from botpaths import data_dir as data_dir_fn
     cutoff = (_time.time() - window_hours * 3600) * 1000
     stuck, checked = [], 0
+    examined: dict = {}
+    unexamined: list = []
     for fname in ("entry_policy_audit.jsonl", "auto_params_audit.jsonl"):
         try:
             lines = (data_dir_fn() / fname).read_text(encoding="utf-8").splitlines()
         except Exception:  # noqa: BLE001
+            unexamined.append({"file": fname, "why": "read_fail"})
             continue
         seen_buckets = set()
+        n_here = 0
         for line in reversed(lines[-800:]):        # 最新一輪在檔尾
             try:
                 r = _json.loads(line)
@@ -652,6 +661,7 @@ def probe_learning_loop(window_hours: float = 26.0, data_dir_fn=None) -> dict:
             if r.get("at_ms", 0) < cutoff:
                 break                               # 出窗即停（檔案按時序 append）
             checked += 1
+            n_here += 1
             b = r.get("bucket") or r.get("l2_bucket_key") or "?"
             if b in seen_buckets:
                 continue
@@ -662,24 +672,51 @@ def probe_learning_loop(window_hours: float = 26.0, data_dir_fn=None) -> dict:
                 stuck.append({"file": fname, "bucket": b,
                               "reasons": (", ".join(map(str, r.get("reasons") or []))
                                           or r.get("note") or "未知非統計阻因")[:120]})
-    return {"stuck": stuck, "rounds_checked": checked}
+        if n_here:
+            examined[fname] = n_here
+        else:
+            unexamined.append({"file": fname, "why": "no_rounds_in_window"})
+    return {"stuck": stuck, "rounds_checked": checked,
+            "examined": examined, "unexamined": unexamined}
+
+
+_OPT_LABEL_ZH = {"entry_policy_audit.jsonl": "入場策略優化器",
+                 "auto_params_audit.jsonl": "參數自動優化器"}
+_UNEXAMINED_WHY_ZH = {"read_fail": "審計檔讀不到",
+                      "no_rounds_in_window": "近窗內一輪都沒跑"}
 
 
 def _section_learning_loop() -> str:
-    """學習迴圈健康段（v120）：無卡住→一行安靜確認；有卡住→醒目列出。"""
+    """學習迴圈健康段（v120）：無卡住→一行安靜確認；有卡住→醒目列出。
+
+    v228（同物種第 48 次）：兩支優化器只要**有一支沒被看過**，就不再喊「✅ 統計閘與晉升
+    機構一致」。舊版判準是加總後的 rounds_checked>0，於是 7/30 起入場策略優化器整整
+    三天沒跑（近窗零審計）時，這行仍每天對使用者宣稱全體一致——把「沒看」講成「看過沒事」。"""
     try:
         p = probe_learning_loop()
     except Exception:  # noqa: BLE001
         return ""
     if not p.get("rounds_checked"):
-        return ""      # 窗內無審計（優化輪未跑）→ 不佔版面
+        return ""      # 兩支都沒量到（優化輪未跑）→ 不佔版面，也不宣稱健康
+    unexamined = p.get("unexamined") or []
+    gap_zh = "；".join(
+        f"{_OPT_LABEL_ZH.get(u.get('file'), u.get('file'))}"
+        f"（{_UNEXAMINED_WHY_ZH.get(u.get('why'), u.get('why'))}）"
+        for u in unexamined)
+    done_zh = "／".join(_OPT_LABEL_ZH.get(f, f) for f in (p.get("examined") or {}))
     if not p["stuck"]:
+        if unexamined:
+            return ("🔄 <b>學習迴圈健康</b>：🟡 <b>只檢了一部分，不等於全體健康</b>"
+                    f"——已檢的{done_zh}近窗 {p['rounds_checked']} 筆審計中無「已放行被卡」"
+                    f"晉升；但 {gap_zh} ⇒ 這部分<b>狀態未知，不是沒問題</b>")
         return ("🔄 <b>學習迴圈健康</b>：✅ 統計閘與晉升機構一致"
                 f"（近窗掃 {p['rounds_checked']} 筆審計，無「已放行被卡」晉升）")
     lines = [f"🔄 <b>學習迴圈健康</b>：⚠️ <b>{len(p['stuck'])} 個晉升已過統計閘但被非統計原因卡住</b>"
              "（v114 教訓：這類靜默阻塞最貴，請優先排查）"]
     for s in p["stuck"][:5]:
         lines.append(f"　• {s['bucket']}（{s['file'].split('_audit')[0]}）：{s['reasons']}")
+    if unexamined:
+        lines.append(f"　⚠️ 另有未檢：{gap_zh} ⇒ 狀態未知，上列不是全貌")
     return "\n".join(lines)
 
 

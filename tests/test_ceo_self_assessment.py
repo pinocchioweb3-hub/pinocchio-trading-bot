@@ -152,3 +152,73 @@ def test_probe_healthy_and_windowing(tmp_path):
     ])
     p = probe_learning_loop(data_dir_fn=lambda: tmp_path)
     assert p["stuck"] == [] and p["rounds_checked"] >= 1
+
+
+# ---------------------------------------- v228：「沒看過」不得印成「✅ 統計閘與晉升機構一致」
+_HEALTHY_ROW = {"bucket": "ZEC|q1", "l2_summary": "❌ 未過閘（n=1）：minTRL✗",
+                "promote": False}
+
+
+def _patch_data_dir(monkeypatch, tmp_path):
+    """_section_learning_loop 內部 `from botpaths import data_dir` → 打 botpaths 上的名字。"""
+    import botpaths
+    monkeypatch.setattr(botpaths, "data_dir", lambda: tmp_path)
+
+
+def test_probe_marks_which_optimizer_was_never_examined(tmp_path):
+    """讀不到／近窗零審計的那一支，必須以『鍵不在 examined』誠實表態，不可與『看過沒事』同形。"""
+    import time as _t
+    from l3_dispatcher.ceo_session import probe_learning_loop
+    now = _t.time() * 1000
+    _write_audit(tmp_path, "auto_params_audit.jsonl", [{**_HEALTHY_ROW, "at_ms": now}])
+    # entry_policy_audit.jsonl 根本不存在＝讀不到
+    p = probe_learning_loop(data_dir_fn=lambda: tmp_path)
+    assert "auto_params_audit.jsonl" in p["examined"]
+    assert [u["file"] for u in p["unexamined"]] == ["entry_policy_audit.jsonl"]
+    assert p["unexamined"][0]["why"] == "read_fail"
+
+
+def test_probe_stale_file_counts_as_unexamined_not_clean(tmp_path):
+    """檔在、但最新一筆已出窗（線上實況：入場策略優化器 87h 沒跑）→ 未檢，非乾淨。"""
+    import time as _t
+    from l3_dispatcher.ceo_session import probe_learning_loop
+    now = _t.time() * 1000
+    _write_audit(tmp_path, "entry_policy_audit.jsonl",
+                 [{**_HEALTHY_ROW, "at_ms": now - 87 * 3600 * 1000}])
+    _write_audit(tmp_path, "auto_params_audit.jsonl", [{**_HEALTHY_ROW, "at_ms": now}])
+    p = probe_learning_loop(data_dir_fn=lambda: tmp_path)
+    assert list(p["examined"]) == ["auto_params_audit.jsonl"]
+    assert p["unexamined"] == [{"file": "entry_policy_audit.jsonl",
+                                "why": "no_rounds_in_window"}]
+
+
+def test_section_never_claims_allclear_when_one_optimizer_unexamined(tmp_path, monkeypatch):
+    """治本主張：只量到一支時，簡報不得再對使用者宣稱『統計閘與晉升機構一致』。"""
+    import time as _t
+    from l3_dispatcher.ceo_session import _section_learning_loop
+    now = _t.time() * 1000
+    _write_audit(tmp_path, "auto_params_audit.jsonl", [{**_HEALTHY_ROW, "at_ms": now}])
+    _patch_data_dir(monkeypatch, tmp_path)
+    out = _section_learning_loop()
+    assert out                                        # 仍要出聲，不是靜靜消失
+    assert "✅ 統計閘與晉升機構一致" not in out        # ⛔ 舊版就是在這裡把未知講成一致
+    assert "入場策略優化器" in out and "狀態未知" in out
+
+
+def test_section_still_says_allclear_when_both_examined(tmp_path, monkeypatch):
+    """反向側（HEAD 上即為綠）：兩支都量到且無卡住＝真的可以喊 ✅，不得矯枉過正。"""
+    import time as _t
+    from l3_dispatcher.ceo_session import _section_learning_loop
+    now = _t.time() * 1000
+    for f in ("entry_policy_audit.jsonl", "auto_params_audit.jsonl"):
+        _write_audit(tmp_path, f, [{**_HEALTHY_ROW, "at_ms": now}])
+    _patch_data_dir(monkeypatch, tmp_path)
+    out = _section_learning_loop()
+    assert "✅ 統計閘與晉升機構一致" in out and "狀態未知" not in out
+
+
+def test_section_stays_silent_when_neither_optimizer_ran(tmp_path, monkeypatch):
+    """反向側（HEAD 上即為綠）：兩支都沒量到＝不佔版面，也不得反過來喊警報。"""
+    from l3_dispatcher.ceo_session import _section_learning_loop
+    _patch_data_dir(monkeypatch, tmp_path)
+    assert _section_learning_loop() == ""
