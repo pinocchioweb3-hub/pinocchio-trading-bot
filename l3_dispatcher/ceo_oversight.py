@@ -740,6 +740,16 @@ def render_nudge(snap: dict) -> str:
                      f"｜模擬已平倉 {snap.get('demo_n', 0)}/{DEMO_SAMPLE_TARGET}"
                      f"（在場 {snap.get('demo_live', 0)} 筆）"
                      f"｜真實 {p.get('live_n', 0)}/{p.get('live_min', 0)}")
+        # v232：真實那格若是個沒有寫入端的計數器，這裡也要說破——⛔ 同一份資料不可在
+        #   日報說破、推播卻照印一個看起來像量測結果的數字（v230 就是漏掉消費端的教訓）。
+        try:
+            from .ceo_session import live_counter_note
+            _cn = live_counter_note(p.get("live_counter"),
+                                    p.get("live_ledger_realized_days", 0))
+            if _cn:
+                lines.append("　　└ " + _cn)
+        except Exception:
+            pass
     if snap.get("system_faults"):
         lines.append("🛑 系統故障：" + "；".join(snap["system_faults"]))
     if snap.get("blockers"):

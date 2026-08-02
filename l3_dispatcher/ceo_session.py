@@ -296,6 +296,78 @@ def _paper_edge_tstat(table: str = "paper_trades",
     return _paper_edge_tstat_ex(table, setup, basis)[1]
 
 
+def _live_ledger_realized_days() -> tuple[int, str]:
+    """真錢部位帳裡「有已實現損益紀錄的日數」＋讀取狀態（判斷真實計數器是否接線用）。
+
+    回 (n_days, status)，status ∈ {"ok", "absent", "unreadable"}：
+      - "absent"     ：部位帳還不存在＝真錢管線沒跑過，**真的**沒有已了結交易（合法空帳）
+      - "unreadable" ：檔在但讀不出來／形狀不對＝**未知**，⛔ 不可折成「沒有」
+      - "ok"         ：讀到了，n_days 是 day_pnl 的日數
+
+    為什麼用 day_pnl 當證據：它**只在一筆真錢部位了結時**被寫入
+    （consume_intents_live.py:1183，同時是日 60U／週 150U 熔斷唯一的輸入）⇒ 有鍵存在
+    就代表確實發生過已了結的真錢交易。⚠️ 它是「日數」不是「筆數」（同一天多筆會合併成
+    一個鍵）——本函式只用來回答「有沒有發生過」，⛔ 不可拿它當成交筆數呈現。
+    """
+    try:
+        f = data_dir() / "atk_positions_live.json"
+        if not f.exists():
+            return 0, "absent"
+        raw = json.loads(f.read_text(encoding="utf-8"))
+        dp = raw.get("day_pnl")
+        if not isinstance(dp, dict):
+            return 0, "unreadable"          # 檔在但形狀不對＝壞檔，不是「沒有交易」
+        return len(dp), "ok"
+    except Exception:
+        return 0, "unreadable"
+
+
+def live_counter_verdict(live_n: int, realized_days: int, ledger_status: str) -> str | None:
+    """Phase 0 的「真實 N/30」這個數字，是不是一個**量測值**？（純函式，可離線測）
+
+    治本 v232（監督員 r126 實測、r127 落地；同物種第 52 次）：`live_n` 讀的是
+    trade_journal.db 的 `trades` 表，但真錢執行器 tools/atk_consumer/consume_intents_live.py
+    **全檔沒有任何寫入該表的呼叫**（唯一寫入端是訊號流 l3_dispatcher/dispatcher.py）。
+    實測 2026-08-03：trades 共 101 列、status 全為 'expired'、closed **零列**、最後寫入
+    約 7/08；而真錢側其實已經了結 3 筆（7/29 QQQ、8/02 SNDK、8/02 ORCL，記在部位帳
+    day_pnl）。⇒ 這個 0 **不是量測出來的**，它是一個沒有寫入端的計數器——就算人真的
+    親手按滿 30 筆，它仍然會顯示 0。
+
+    舊碼把這個 0 印成三句都在斷言「我們量過、只是還沒有」：
+      ①「真實 0/30」進度條　②`live_gate_reason='live_sample_short'`（字面＝樣本不足）
+      ③自評瓶頸「紙上樣本足、待真錢人工逐筆驗證（0/30）」＝只差人工那一下。
+    ①②線上每天 100% 觸發；③目前被顯著性分支蓋住，但毛/淨 t 一旦過 2 就會浮出來——
+    正好是最危險的時刻（會對本人謊報一個假的準備就緒）。
+
+    回 None＝沒有已知的接線問題（0 與「真的還沒有真錢已平倉」一致，不臆測）；
+      "unwired"    ＝**已證實**沒接上：部位帳有已實現損益，計數器仍是 0；
+      "unverified" ＝**無法確認**：部位帳讀不到，這個 0 是不是量測值不明（未知≠沒問題）。
+
+    ⛔ 本函式只解釋 0 的**成因**，不改 Phase 0 的任何門檻判斷：`live_ok`／`ready` 完全
+    不受影響，三閘（真實 30 筆人手實單＋律師＋本人拍板）仍須人拍板（紅線③）。⛔ 絕不可
+    為了讓數字動起來而放寬閘——「計數器沒接上」的正解是接寫入端或改口徑，那是決策項。
+    """
+    if live_n > 0:
+        return None                          # 計數器確實收得到寫入，無需解釋
+    if ledger_status == "unreadable":
+        return "unverified"
+    if ledger_status == "ok" and realized_days > 0:
+        return "unwired"
+    return None
+
+
+def live_counter_note(verdict: str | None, realized_days: int = 0) -> str | None:
+    """把 live_counter_verdict 翻成日報那行的警語（純函式）。None＝無話可說、不加噪音。"""
+    if verdict == "unwired":
+        return ("⚠️ 這個「真實」計數器**沒有寫入端**：真錢已了結交易記在部位帳"
+                f"（{realized_days} 個交易日有已實現損益），但它讀的 trades 表收不到 ⇒ "
+                "這個數字不是量測值，按滿 30 筆它仍會是 0（口徑要不要改屬決策項，⛔ 不逕行）")
+    if verdict == "unverified":
+        return ("🟡 無法確認這個「真實」計數器是否接得上（真錢部位帳讀不到）"
+                "——這個 0 是不是量測值**未知**，不是沒問題")
+    return None
+
+
 def phase0_status() -> dict:
     """回 Phase 0 解鎖進度（純偵測）。
 
@@ -317,8 +389,19 @@ def phase0_status() -> dict:
     live_net_ok = live_net_n >= PHASE0_LIVE_MIN and (live_net_ev or 0) > 0
     live_ok = live_n >= PHASE0_LIVE_MIN and live_ev > 0 and live_net_ok
 
+    # v232：先問「這個 0 是不是量測值」再決定怎麼描述它（見 live_counter_verdict）。
+    #   ⛔ 只影響 reason 這個**說明字**，不影響 live_ok／ready 的任何判斷。
+    _days, _lstat = _live_ledger_realized_days()
+    _counter = live_counter_verdict(live_n, _days, _lstat)
+
     if live_n < PHASE0_LIVE_MIN:
-        reason = "live_sample_short"          # 真錢樣本未達 30 筆（目前 0＝紅線①人工閘）
+        if _counter == "unwired":
+            # ⛔ 不可再說「樣本不足」——那是斷言我們量過。實情是計數器沒接上寫入端。
+            reason = "live_counter_unwired"
+        elif _counter == "unverified":
+            reason = "live_counter_unverified"
+        else:
+            reason = "live_sample_short"      # 真錢樣本未達 30 筆（0＝紅線①人工閘）
     elif live_net_n == 0:
         reason = "live_net_missing"           # 有毛R無淨R＝淨值會計尚未落地，不得放行
     elif live_net_n < PHASE0_LIVE_MIN:
@@ -340,6 +423,10 @@ def phase0_status() -> dict:
         "live_net_ok": live_net_ok,
         "ev_basis": "gross",                  # *_ev_r 的口徑；*_ev_r_net 才是扣費後
         "live_gate_reason": reason,
+        # v232：live_n 這個數字的可信度本身（None＝無已知接線問題）。⛔ 不進 ready 判斷。
+        "live_counter": _counter,
+        "live_ledger_realized_days": _days,
+        "live_ledger_status": _lstat,
     }
 
 
@@ -511,6 +598,11 @@ def _section_normal() -> str:
             f"｜淨（扣費用滑價）{p['paper_ev_r_net']:+.3f}R（n={p['paper_net_n']}）")
     if p.get("live_gate_reason") == "live_net_missing":
         lines.append("　　└ ⚠️ 真錢帳尚無淨值欄位 → Phase 0 真實閘 fail-closed（不以毛R放行）")
+    # v232：上面那個「真實 N/30」若是一個沒有寫入端的計數器，必須當場說破——
+    #   否則進度條看起來像「量到 0」，實際是「量不到」。⛔ 不因此放寬任何閘。
+    _cn = live_counter_note(p.get("live_counter"), p.get("live_ledger_realized_days", 0))
+    if _cn:
+        lines.append("　　└ " + _cn)
 
     # 4.5) OKX 模擬盤實單驗證（task #4/#39）—— 真實成交、零真錢。
     #      只做透明呈現：demo 樣本走 demo_trades 表，**不**計入上方 Phase 0「真實」門檻
@@ -587,7 +679,8 @@ def _section_decisions() -> str:
 
 def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
                            demo_n, demo_rejected, paper_t=None,
-                           paper_t_net=None, net_n=0, t_status=None) -> str:
+                           paper_t_net=None, net_n=0, t_status=None,
+                           live_counter=None) -> str:
     """task#7 CEO 深度綜合：純函式、確定性跨 session 關聯推理（可離線測試）。
     把『樣本供給 × 模擬盤下單健康 × 復盤優化器晉升狀態』綜合成單一瓶頸歸因——這才是
     真綜合分析，非欄位回音。資料不足就誠實說無法綜合（紅線③不臆測）。
@@ -614,7 +707,13 @@ def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
     修法：`not _has_t` 且真錢閘未過時，改走獨立分支誠實說「檢定跑不出來＝未知」。
     ⛔ live_n 已達標的那一支不動（原文「樣本達標，待品質/顯著性驗證」本就沒有斷言 edge 成立）。
     t_status：`_paper_edge_tstat_ex(with_status=True)` 的狀態字，用來分辨「讀不到」與
-    「沒樣本」——⛔ 這兩者的處置不同，不可再折成同一句「無證據」。"""
+    「沒樣本」——⛔ 這兩者的處置不同，不可再折成同一句「無證據」。
+
+    v232 治本（監督員 r127，同物種第 52 次）：v231 補的是「沒有 t 值」那條路，但
+    `live_n < live_min` 這一支的原文「待真錢人工逐筆驗證（0/30）」本身也在斷言「我們量到
+    0」。實測那個計數器**沒有寫入端**（見 `live_counter_verdict`）⇒ 該句把「量不到」講成
+    「還沒有」，且結論是「只差人工那一下」＝假準備就緒。live_counter：
+    `phase0_status()["live_counter"]`（None／"unwired"／"unverified"）。"""
     if paper_n < 8:
         return (f"  本輪樣本過少（紙上 {paper_n}/{paper_min}），尚無足夠基礎做跨 session "
                 "綜合分析——誠實不臆測。")
@@ -655,6 +754,16 @@ def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
         bottleneck = (f"紙上已平倉 {paper_n}≥{paper_min}，但 {_why_unknown}；"
                       "⇒ edge 是否成立**未知**，⛔ 不可讀成『只差真錢人工閘』"
                       "（紅線③：未證實不得當成已證實）")
+    elif live_n < live_min and live_counter in ("unwired", "unverified"):
+        # v232：⛔ 這一支**不可以**說「待真錢人工逐筆驗證」——那句話斷言了「量到 0」，
+        #   但這個計數器根本收不到真錢已了結交易（見 live_counter_verdict）。說成
+        #   「只差人工那一下」等於對本人謊報一個假的準備就緒（紅線③）。
+        _cw = ("**沒有寫入端**（真錢已了結交易記在部位帳、進不了它讀的表）⇒ 這個 0 不是量測值，"
+               "按滿 30 筆它仍會是 0" if live_counter == "unwired"
+               else "**能不能接上無法確認**（真錢部位帳讀不到）⇒ 這個 0 是不是量測值未知")
+        bottleneck = (f"紙上樣本足，但真錢進度計數器（{live_n}/{live_min}）{_cw}；"
+                      "⇒ 真瓶頸是**這條驗證管線的計數口徑**，不是還差幾筆人工單"
+                      "（口徑要不要改屬決策項，⛔ 不逕行放寬門檻）")
     elif live_n < live_min:
         bottleneck = f"紙上樣本足、待真錢人工逐筆驗證（{live_n}/{live_min}，紅線①）"
     else:
@@ -668,8 +777,13 @@ def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
     #   故不以 paper_n 推斷晉升進度（會樂觀高估）；只誠實描述把關機制（對齊全文版口徑）。
     opt_line = ("復盤優化器：晉升由 L2 四關把關（對齊樣本 n_aligned≥30）——對齊樣本不足時 "
                 "0 晉升（健康 fail-closed、非策略失效，詳見每日優化器報告）")
+    # v232：樣本行的「真實 N/30」也要帶上可信度標記——瓶頸敘事被別的分支蓋住時
+    #   （例如現況落在「edge 未證實」那支），這一行是唯一還在露出這個數字的地方。
+    _lc_mark = {"unwired": "（⚠️ 此計數器無寫入端，非量測值）",
+                "unverified": "（🟡 此計數器狀態未知）"}.get(live_counter, "")
     return "\n".join([
-        f"  • 樣本：紙上 {paper_n}/{paper_min}、模擬實倉 {demo_n}、真實 {live_n}/{live_min}{demo_note}",
+        f"  • 樣本：紙上 {paper_n}/{paper_min}、模擬實倉 {demo_n}、"
+        f"真實 {live_n}/{live_min}{_lc_mark}{demo_note}",
         f"  • {opt_line}",
         f"  → <b>當前瓶頸＝{bottleneck}</b>。把關靠統計嚴謹度，真錢仍人工（紅線①）。",
     ])
@@ -697,7 +811,8 @@ def _section_self_assessment() -> str:
     body = _synthesize_bottleneck(
         p.get("paper_n", 0), p.get("paper_min", 100),
         p.get("live_n", 0), p.get("live_min", 30), demo_n, demo_rejected,
-        paper_t=_g_t, paper_t_net=_net_t, net_n=_net_n, t_status=_t_status)
+        paper_t=_g_t, paper_t_net=_net_t, net_n=_net_n, t_status=_t_status,
+        live_counter=p.get("live_counter"))
     # v131：分引擎附註（瓶頸敘事以加密 deepdive 為主體＝OKX 路徑的鑰匙；美股另列）
     # v150：毛/淨並列。美股毛 t 過 2 但扣費後跌破——只報毛會讓人以為這條線已經成立。
     _us_t = _paper_edge_tstat("paper_trades", setup="us_breakout")

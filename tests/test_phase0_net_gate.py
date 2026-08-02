@@ -41,6 +41,11 @@ def db(tmp_path, monkeypatch):
             p.unlink()
         _mkdb(p, **kw)
         monkeypatch.setattr(cs, "_TJ_DB", str(p))
+        # v232：phase0_status 現在還會讀真錢部位帳判斷「真實計數器是否接線」。不隔離的話
+        #   這些測試會讀到**本機真實資料目錄**（該檔現有已實現損益）⇒ live_n=0 的案例會拿到
+        #   live_counter_unwired 而非 live_sample_short，測試結果隨機器狀態而變。指向空的
+        #   tmp_path＝部位帳不存在＝「真的還沒有真錢交易」，正是這些案例原本的前提。
+        monkeypatch.setattr(cs, "data_dir", lambda: tmp_path)
         return p
     return _make
 
