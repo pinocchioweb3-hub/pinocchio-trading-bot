@@ -44,6 +44,36 @@ FIB = "#90a4ae"        # 回撤線（藍灰，與其他疊加層區隔）
 FIB_GOLD = "#d4a017"   # 黃金口袋（0.618–0.786 高勝率回撤帶）
 FIB_RATIOS = (0.236, 0.382, 0.5, 0.618, 0.786)
 
+# v219：圖上 SMC 分量「這輪沒算出來」與「算過、確認沒有」的判準。
+# 判準取自產出端 market_intel_mcp/smc_levels.py::compute_smc_levels()——它成功時
+# **一律寫鍵**（沒東西就寫空 list＝答案是「沒有」），失敗才留 `<name>_error`；而
+# order_blocks 巢狀在 `if swings is not None:` 底下，上游 swing 一爆就整個鍵不寫、
+# 連 *_error 都沒有。⇒ 鍵在＝答案（含空的）；鍵不在＝這輪沒算出來。
+#
+# ⛔ 只列**圖上真的會畫**的三個分量。premium_discount／ote 圖上不畫；圖上的
+#    BoS/CHoCH 與掃單標記是本檔用 swing_points 自算的（detect_structure_breaks／
+#    _detect_sweeps），不讀 smc 的 bos_choch／liquidity 鍵——把它們納入判定
+#    ＝標了一個圖上看不到的東西，天天誤報。
+# ⛔ swing_points 的標籤要連帶點名 BoS/掃單：那兩個圖層是它的下游，swing 一爆
+#    三個圖層同時空白，只說「Swing 沒算出來」仍會讓人把空白讀成「沒有結構變化」。
+_SMC_CHART_COMPONENTS = [
+    ("swing_points", "Swing 結構（連帶 BoS/CHoCH、掃單標記）"),
+    ("order_blocks", "Order Block"),
+    ("fvg", "FVG"),
+]
+
+
+def _smc_unknown_note(smc: dict | None) -> str | None:
+    """回傳圖上該標的缺料字樣；全部算過（含算出空的）回 None＝圖上保持安靜。"""
+    missing = [label for key, label in _SMC_CHART_COMPONENTS
+               if not isinstance(smc, dict) or key not in smc]
+    if not missing:
+        return None
+    # ⛔ 字面只用微軟正黑體有的字：U+26A0（⚠）在 Microsoft JhengHei 缺字，
+    #    會被 matplotlib 畫成豆腐方塊——警語本身變成亂碼是最糟的下場。
+    return ("〔缺料〕這輪沒算出來：" + "、".join(missing) +
+            "\n　 圖上沒畫 ≠ 沒有這個結構（本圖此圖層無資料，非「已確認不存在」）")
+
 
 def _vol(c: dict) -> float:
     for k in ("volume", "vol", "vol_ccy", "volCcy", "baseVol"):
@@ -730,9 +760,22 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
         dir_str = ""
         if plan and plan.get("direction"):
             dir_str = "・做多" if plan["direction"] == "bull" else "・做空"
+        # === v219：SMC 分量缺料標註 ===
+        # 圖上三個 SMC 圖層都是「取不到就什麼都不畫」，缺料與「算過、確認沒有」在圖上
+        # 長得一模一樣，而看圖的人只會有一種解讀。標題又寫著「SMC＋SNR 結構」＝承諾了
+        # 這些圖層，更不該讓空白替它回答。
+        # ⛔ 畫在**框線外**（標題下方）而非面板左上：面板內四角已被右上評分卡、左下
+        #    Wyckoff、以及浮動的 Fib 腿標籤佔用——實測初版擺左上會蓋掉 Fib 標籤，
+        #    那正是 v183 使用者反映「說不出哪裡怪」的同一種傷害（警語蓋掉資訊）。
+        _smc_note = _smc_unknown_note(smc)
         ax.set_title(f"{symbol}/USDT 永續・{tf.upper()}・SMC＋SNR 結構{dir_str}"
                      f"（現價 {cur:,.6g}）",
-                     color=FG, fontsize=11)
+                     color=FG, fontsize=11, pad=26 if _smc_note else None)
+        if _smc_note:
+            ax.text(0.5, 1.005, _smc_note, transform=ax.transAxes,
+                    color="#ffca28", fontsize=7.2, va="bottom", ha="center", zorder=6,
+                    bbox=dict(boxstyle="round,pad=0.3", fc="#1a1f2e",
+                              ec="#ffca28", lw=0.6, alpha=0.9))
         ax.set_xlim(-1, n + 8)
 
         _prune_old()
