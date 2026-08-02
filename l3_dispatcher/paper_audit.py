@@ -271,16 +271,36 @@ def reachability(trade: dict, candles: list[dict]) -> dict:
 
 # ── 4. 窗口歷史 K 線抓取（OKX 公開 history-candles，免 key）─────
 async def fetch_window(src, symbol: str, start_ms: int, end_ms: int,
-                       bar: str = "15m", max_pages: int = 16) -> list[dict]:
+                       bar: str = "15m", max_pages: int = 16,
+                       out: dict | None = None) -> list[dict]:
     """抓 [start_ms, end_ms] 窗口的 K 線。OKX history-candles 一頁 100 根、降序，
-    用 `after` 游標往更舊翻頁，直到覆蓋 start_ms 或達頁數上限。回升序 list。"""
+    用 `after` 游標往更舊翻頁，直到覆蓋 start_ms 或達頁數上限。回升序 list。
+
+    v211：分頁中途失敗（傳輸例外／HTTP 非 200／JSON 解不開／code!=0）或翻到
+    頁數上限時，回去的是**部分**資料——型別上與「這個窗口真的就這麼多根」
+    一模一樣。呼叫端若把它當成完整窗口取 high/low，就會把「我沒看到那段」
+    判成「那個價從未被觸及＝疑似捏造」。改法：不改回傳型別（沿用 list，
+    既有呼叫端不受影響），另用 ``out`` dict 帶回這次抓取的實況：
+
+        {"pages": 翻了幾頁, "truncated": bool, "reason": str|None,
+         "oldest_ms": 最舊看到的一根|None, "requested_start_ms": start_ms,
+         "covered": 是否真的回溯到 start_ms}
+
+    ⛔ 邊界：``{"code":"0","data":[]}`` 是交易所明講「更舊沒有了」＝**確定**，
+    不是未知，不可為保險打成 truncated（否則每次正常抓到底都變告警）。
+    """
     from market_intel_mcp.sources.okx_candles import OKX_INTERVAL
     inst = src._to_inst(symbol)
     okx_bar = OKX_INTERVAL.get(bar.lower(), bar)
     bar_ms = _BAR_MS.get(bar.lower(), 900_000)
     collected: dict[int, dict] = {}
     after = end_ms + bar_ms  # history-candles：回傳「早於 after」的資料
+    pages = 0
+    oldest_seen: int | None = None
+    reason: str | None = None
+    covered = False
     for _ in range(max_pages):
+        pages += 1
         try:
             r = await src.client.get(
                 "/api/v5/market/history-candles",
@@ -288,17 +308,22 @@ async def fetch_window(src, symbol: str, start_ms: int, end_ms: int,
                         "after": str(after), "limit": "100"},
             )
         except Exception:
+            reason = "transport_error"
             break
         if r.status_code != 200:
+            reason = f"http_{r.status_code}"
             break
         try:
             body = r.json()
         except Exception:
+            reason = "bad_json"
             break
         if body.get("code") != "0":
+            reason = f"api_code_{body.get('code')}"
             break
         rows = body.get("data") or []
         if not rows:
+            covered = True  # 交易所確認「更舊沒有了」＝已抓到底，非未知
             break
         for row in rows:
             try:
@@ -309,10 +334,20 @@ async def fetch_window(src, symbol: str, start_ms: int, end_ms: int,
             except (TypeError, ValueError, IndexError):
                 continue
         oldest = min(int(row[0]) for row in rows)
+        oldest_seen = oldest if oldest_seen is None else min(oldest_seen, oldest)
         if oldest <= start_ms:
+            covered = True
             break
         after = oldest
         await asyncio.sleep(0.12)  # 對端點客氣（公開端點 rate limit 寬鬆）
+    else:
+        # 翻滿 max_pages 仍沒回到 start_ms：沒看到的那段依然是未知
+        reason = "page_limit"
+    if out is not None:
+        out.update({"pages": pages, "truncated": reason is not None,
+                    "reason": reason, "oldest_ms": oldest_seen,
+                    "requested_start_ms": start_ms,
+                    "covered": covered and reason is None})
     # 取窗口（含一根緩衝，因 K 棒 high/low 覆蓋 [ts, ts+bar)）
     lo_b = start_ms - bar_ms
     return [collected[k] for k in sorted(collected)
@@ -330,6 +365,10 @@ class Finding:
     verdict: str = "ok"          # ok / warn / flag
     reasons: list[str] = field(default_factory=list)
     window_candles: int = 0
+    # v211：窗口 K 線是否「抓到一半就中斷」（部分資料）。True ⇒ 窗口 high/low
+    # 只是**我看得到的那段**，不可用來斷言某價「從未被觸及＝造假」。
+    window_truncated: bool = False
+    window_gap_reason: str | None = None
 
 
 async def audit_one(trade: dict, src, bar: str = "15m") -> Finding:
@@ -338,10 +377,21 @@ async def audit_one(trade: dict, src, bar: str = "15m") -> Finding:
                 recomputed_r=None)
 
     candles = []
+    fw: dict = {}
     if src is not None:
         candles = await fetch_window(src, trade["symbol"], trade["entry_at"],
-                                     trade["exit_at"] or trade["entry_at"], bar)
+                                     trade["exit_at"] or trade["entry_at"], bar,
+                                     out=fw)
     f.window_candles = len(candles)
+    f.window_truncated = bool(fw.get("truncated"))
+    f.window_gap_reason = fw.get("reason")
+    # v211：窗口殘缺時，「窗口內未觸及」只是「我沒看到」，不是「沒發生」。
+    # 造假指控一律降級為待查——⛔ 這是誤報方向的修補，不是放水：窗口完整時
+    # 判定一字未改（見 test_complete_window_still_flags_unreachable）。
+    cut = f.window_truncated
+    cut_note = (f"⚠️ K線窗口抓取中斷（{f.window_gap_reason}，只翻了 "
+                f"{fw.get('pages')} 頁）⇒ 只看得到部分窗口，"
+                f"未看到的那段無法判定，不作造假認定") if cut else ""
 
     rec = recompute_r(trade)  # 不餵估計 timeout 價：timeout 改用「回推隱含出場價」查
     f.recomputed_r = rec["recomputed_r"]
@@ -365,30 +415,51 @@ async def audit_one(trade: dict, src, bar: str = "15m") -> Finding:
         to = check_timeout_exit(trade, rec, candles)
         if to["status"] == "ok":
             if not to["reachable"]:
-                f.verdict = "flag"
-                f.reasons.append(
-                    f"timeout 隱含出場價 {to['implied_exit']:.4g} 超出窗口K線範圍 "
-                    f"[{to['low']:g}, {to['high']:g}]（不可能成交，疑造假）")
+                if cut:
+                    f.verdict = "warn" if f.verdict != "flag" else f.verdict
+                    f.reasons.append(
+                        f"timeout 隱含出場價 {to['implied_exit']:.4g} 超出**已抓到的**"
+                        f"窗口範圍 [{to['low']:g}, {to['high']:g}]；{cut_note}")
+                else:
+                    f.verdict = "flag"
+                    f.reasons.append(
+                        f"timeout 隱含出場價 {to['implied_exit']:.4g} 超出窗口K線範圍 "
+                        f"[{to['low']:g}, {to['high']:g}]（不可能成交，疑造假）")
             else:
                 f.reasons.append(
                     f"timeout 出場價回推 {to['implied_exit']:.4g} 落在窗口 "
                     f"[{to['low']:g}, {to['high']:g}] 內（合理）")
         elif to["status"] == "no_candles":
             f.verdict = "warn"
-            f.reasons.append("含 timeout 腿且窗口無 K 線可查，無法獨立查核出場價")
+            f.reasons.append("含 timeout 腿且窗口無 K 線可查，無法獨立查核出場價"
+                             + ("；" + cut_note if cut else ""))
 
     # (2) 可達性：所有聲稱打到的 tp/stop 價，必須真的在窗口被觸及
     if candles:
         reach = reachability(trade, candles)
         for bad in reach["unreachable"]:
-            f.verdict = "flag"
-            f.reasons.append("不可達：" + bad)
+            if cut:
+                if f.verdict != "flag":
+                    f.verdict = "warn"
+                f.reasons.append("已抓到的窗口內未觸及（非造假認定）：" + bad)
+            else:
+                f.verdict = "flag"
+                f.reasons.append("不可達：" + bad)
+        if cut and reach["unreachable"]:
+            f.reasons.append(cut_note)
     elif f.verdict == "ok":
         f.verdict = "warn"
-        f.reasons.append("窗口無 K 線（可能太舊或抓取失敗），僅算術檢查通過")
+        if cut:
+            f.reasons.append("窗口零根 K 線：" + cut_note + "（僅算術檢查通過）")
+        else:
+            f.reasons.append("窗口無 K 線（窗口太舊、交易所已無此段歷史），"
+                             "僅算術檢查通過")
 
     if f.verdict == "ok" and not f.reasons:
         f.reasons.append("算術自洽 + 聲稱價位皆可達")
+    if cut and not any("中斷" in r for r in f.reasons):
+        # 即使結論是 ok，也要講清楚這個「可達」只在看得到的那段窗口成立
+        f.reasons.append(cut_note)
     return f
 
 
@@ -436,10 +507,23 @@ def render_audit_report(findings: list[Finding], html: bool = True) -> str:
         lines.append("")
         lines.append(f"⚠️ 待查 {len(warned)} 筆（多為窗口太舊抓不到K線）：" +
                      "、".join(f"#{f.trade_id}{f.symbol}" for f in warned[:12]))
+    # v211：窗口只抓到一半的筆數要看得見——它們的「可達／不可達」都只在
+    # 看得到的那段成立，⛔ 不可讀成已完整查核（未知≠沒發生，也≠造假）
+    n_cut = sum(1 for f in findings if getattr(f, "window_truncated", False))
+    if n_cut:
+        lines.append("")
+        lines.append(f"🕳️ 其中 {code(n_cut)} 筆窗口抓取中斷（分頁中途失敗／翻到頁數"
+                     f"上限），只查了部分窗口：" +
+                     "、".join(f"#{f.trade_id}{f.symbol}({f.window_gap_reason})"
+                              for f in findings
+                              if getattr(f, "window_truncated", False))[:400] +
+                     "——這幾筆不論結論為何，都**不是**完整查核")
     if not flagged:
         lines.append("")
         lines.append("✅ 無造假跡象：所有可查窗口內，聲稱的進出價皆真實觸及，"
-                     "且 realized_r 與自身記錄的腿一致。")
+                     "且 realized_r 與自身記錄的腿一致。"
+                     + (f"（⛔ 但上述 {n_cut} 筆窗口不完整，"
+                        "「無跡象」只涵蓋抓得到的那段）" if n_cut else ""))
     return "\n".join(lines)
 
 
