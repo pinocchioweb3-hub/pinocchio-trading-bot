@@ -115,23 +115,35 @@ class TradFiSource:
                               message=f"only {len(closes)} closes")
 
         current = closes[-1]
-        prev_1d = closes[-2] if len(closes) >= 2 else current
-        prev_7d = closes[-7] if len(closes) >= 7 else closes[0]
-        prev_30d = closes[-30] if len(closes) >= 30 else closes[0]
+        n = len(closes)
+        prev_1d = closes[-2]                      # n >= 2 已由上方守門
+        # ⛔ 窗口湊不齊一律回 None（誠實缺料），不可用 closes[0] 靜默頂替——
+        # 舊碼會把「5 根收盤價的變化」貼上「30d」的標籤送進使用者看的宏觀卡
+        # （health() 固定用 range_str="5d" 呼叫，此路徑每次都走到）。
+        # 部分可讀就用可讀的算：湊得齊 7d 仍照算，只有 30d 缺。
+        prev_7d = closes[-7] if n >= 7 else None
+        prev_30d = closes[-30] if n >= 30 else None
         high = max(closes)
         low = min(closes)
+
+        def _chg(prev):
+            """prev 為 None（窗口不足）或 0（無法定義變化率）→ 誠實回 None。"""
+            if not prev:
+                return None
+            return round((current - prev) / prev * 100, 2)
 
         return {
             "ticker": ticker,
             "name": TICKERS.get(ticker, ticker),
             "source": "tradfi-yahoo",
             "current": round(current, 4),
-            "change_1d_pct": round((current - prev_1d) / prev_1d * 100, 2) if prev_1d else 0,
-            "change_7d_pct": round((current - prev_7d) / prev_7d * 100, 2) if prev_7d else 0,
-            "change_30d_pct": round((current - prev_30d) / prev_30d * 100, 2) if prev_30d else 0,
+            "change_1d_pct": _chg(prev_1d),
+            "change_7d_pct": _chg(prev_7d),
+            "change_30d_pct": _chg(prev_30d),
             "high_3mo": round(high, 4),
             "low_3mo": round(low, 4),
             "drawdown_from_high_pct": round((current - high) / high * 100, 2) if high else 0,
+            "closes_n": n,      # 留痕：上面這組數字實際是用幾根收盤價算出來的
             "currency": meta.get("currency", ""),
         }
 

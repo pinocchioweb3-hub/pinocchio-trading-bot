@@ -227,6 +227,13 @@ def _fmt_funding(x) -> str:
         return "≈0.0000%"
     return f"{pct:+.4f}%"
 
+def _fmt_pct(x) -> str:
+    """v215：漲跌幅顯示——窗口不足時來源回 None，印 n/a 而非讓整張卡 TypeError。"""
+    if x is None:
+        return "n/a"
+    return f"{x:+.2f}%"
+
+
 def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
                             watchlist=None) -> str:
     """把 state + tradfi 結構化成 LLM 易讀的格式"""
@@ -349,7 +356,10 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
         parts.append("\n## 傳統金融跨資產")
         for ticker, data in tradfi.get("items", {}).items():
             if data.get("error"): continue
-            line = f"- {ticker} ({data.get('name','')}): {data.get('current')}  1d {data.get('change_1d_pct'):+.2f}%  7d {data.get('change_7d_pct'):+.2f}%  30d {data.get('change_30d_pct'):+.2f}%"
+            line = (f"- {ticker} ({data.get('name','')}): {data.get('current')}"
+                    f"  1d {_fmt_pct(data.get('change_1d_pct'))}"
+                    f"  7d {_fmt_pct(data.get('change_7d_pct'))}"
+                    f"  30d {_fmt_pct(data.get('change_30d_pct'))}")
             parts.append(line)
 
     # ----- 多時框型態分析 (BTC/ETH/SOL) -----
