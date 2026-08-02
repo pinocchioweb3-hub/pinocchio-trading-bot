@@ -334,6 +334,37 @@ def _bar(n: int, target: int, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def demo_state_text(verdict: dict) -> tuple[str, bool]:
+    """把 demo_activity_verdict() 的量測結果翻成日報那行的狀態字（純函式，可離線測）。
+
+    監督員 r124 治本 —— 「拿布林旗標當量測結果」同物種第 50 次，且是 **v167 治了一半**
+    的那一半：v167 已把 ledger 的 demo_active 從 is_active()（純環境旗標）改成
+    demo_activity_verdict()（實測輪次結果），卻漏了 CEO 日報這個消費端。於是同一份資料
+    在兩個地方講相反的話——ledger 誠實寫 demo_active=false + 停擺原因，日報照樣印「運行中」。
+
+    線上實測（2026-08-03）：旗標 True、最近一輪 105 秒前、outcome=
+    skipped:demo_guard:…⇒ 舊碼印「運行中」，實際自 7/29 起每輪被擋、零新單。
+
+    回 (狀態字, 帳面數字是否已停止更新)。⚠️ 未知一律**不**給正面結論，且明講「未知」
+    不說「停了」——承接 v162-v166／v227-v229 同一紀律：不可把未知壓成確認，兩個方向都不行。
+    """
+    reason = str((verdict or {}).get("reason") or "unknown")
+    if (verdict or {}).get("active"):
+        return "運行中", False
+    if reason == "flag_off":
+        # 旗標本來就沒開＝這是設定狀態、不是故障，且沒開就不會有新資料可言。
+        return "待命（DEMO_OPERATOR_ACTIVE 未開）", False
+    if reason == "unknown":
+        return "🟡 狀態未知（讀不到輪次結果，不是沒問題）", True
+    if reason == "stale":
+        return "🟡 停擺（旗標開著但迴圈沒在轉）", True
+    # 其餘＝demo_operator 明講的那一輪跳過原因，原文照登不摘要成健康字眼。
+    short = reason.split("：")[0].split(". ")[0].strip()
+    if len(short) > 60:
+        short = short[:60] + "…"
+    return f"🟡 停擺（旗標開著但每輪被擋：{short}）", True
+
+
 # ===========================================================================
 # CEO 簡報 —— 兩段式單一視窗
 # ===========================================================================
@@ -473,14 +504,22 @@ def _section_normal() -> str:
     try:
         from . import demo_journal
         from .demo_operator import is_active as _demo_active
+        from .ceo_oversight import demo_activity_verdict as _dav
         dn, dev = demo_journal.count_closed_for_phase0()
         ds = demo_journal.get_demo_stats(30)
         n_live = ds.get("n_open", 0) + ds.get("n_pending", 0)
-        state = "運行中" if _demo_active() else "待命（DEMO_OPERATOR_ACTIVE 未開）"
+        # r124：狀態改看**實測輪次結果**，不再拿環境旗標當事實（與 ledger 同一口徑，v167）。
+        _v = _dav(_demo_active(),
+                  demo_journal.get_state("last_cycle_ts"),
+                  demo_journal.get_state("last_cycle_outcome"))
+        state, _stalled = demo_state_text(_v)
         if dn or n_live:
             lines.append(
                 f"🧪 模擬盤實單：已平倉 {dn} 筆／期望 {dev:+.2f}R｜在場 {n_live} 筆｜{state}"
                 f"（OKX 真實成交·零真錢；不計入上方真實門檻）")
+            if _stalled:
+                # 停擺時「在場 N 筆」不再被對帳＝那是最後一次對帳的殘影，不是現況。
+                lines.append("　　└ ⚠️ 停擺期間在場部位停止對帳，上面的「在場」筆數是舊值、不是現況")
         else:
             lines.append(f"🧪 模擬盤實單：尚無樣本｜{state}（OKX 真實成交·零真錢）")
     except Exception:
