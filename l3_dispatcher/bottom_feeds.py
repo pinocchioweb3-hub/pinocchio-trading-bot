@@ -156,8 +156,16 @@ def fetch_fng_avg30() -> Optional[float]:
         return cached
     try:
         r = httpx.get(_FNG, headers=_UA, timeout=30)
-        vals = [int(x["value"]) for x in r.json().get("data", [])][:30]
-        avg = round(sum(vals) / len(vals), 1) if vals else None
+        raw = r.json().get("data")
+        if not isinstance(raw, list):     # 限流／錯誤 body：未知≠沒有，不可續算
+            return None
+        vals = [int(x["value"]) for x in raw][:30]
+        # v212：窗口殘缺不可折成「這就是 30 日均」——只抓到 N(<30) 天卻回一個數字，
+        # 會被 compute_bottom_score 當成滿窗的 fng_avg30 計分。缺料就誠實回 None
+        # （present_mass 會重正規化，這是本檔既有的誠實路徑）。
+        if len(vals) < 30:
+            return None
+        avg = round(sum(vals) / 30, 1)
         _put("fng", avg)
         return avg
     except Exception:  # noqa: BLE001
@@ -242,15 +250,20 @@ def fetch_etf_overlay() -> Optional[str]:
                               ("xrp", "XRP"), ("solana", "SOL")):
                 try:
                     r = cli.get(f"/api/etf/{coin}/flow-history")
-                    data = (r.json() or {}).get("data") or []
-                    if len(data) < 2:
-                        continue
+                    data = (r.json() or {}).get("data")
+                    if not isinstance(data, list) or len(data) < 5:
+                        continue          # 連 5 日窗口都湊不齊＝該資產不報（未知≠零淨流）
                     def _flow(x):
                         v = x.get("flow_usd")
                         return float(v) if v is not None else 0.0
                     d5 = sum(_flow(x) for x in data[-5:]) / 1e6
-                    d30 = sum(_flow(x) for x in data[-30:]) / 1e6
-                    parts.append(f"{tag} 5日{d5:+,.0f}M/30日{d30:+,.0f}M")
+                    # v212：窗口殘缺不可折成完整的「30日」數字。舊碼在只有 3 天時會印
+                    # 「5日+30M/30日+30M」——同一個數字掛兩個窗口標籤（紅線③相鄰：對外數字）。
+                    if len(data) >= 30:
+                        d30 = sum(_flow(x) for x in data[-30:]) / 1e6
+                        parts.append(f"{tag} 5日{d5:+,.0f}M/30日{d30:+,.0f}M")
+                    else:
+                        parts.append(f"{tag} 5日{d5:+,.0f}M/30日資料不足(僅{len(data)}日)")
                 except Exception:  # noqa: BLE001 — 單一資產失敗不拖累其他
                     continue
     except Exception:  # noqa: BLE001
