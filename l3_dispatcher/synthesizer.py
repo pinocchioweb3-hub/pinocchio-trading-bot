@@ -269,6 +269,27 @@ def _fmt_price(x) -> str:
     return f"${x}"
 
 
+# ── v225：來源**明講拉取失敗**的分量，不再靜靜從 prompt 裡消失 ──────────
+# 舊碼一律 `if x.get("error"): continue`：那一列（甚至那一整區）整個不見，
+# LLM 讀到的是「標題底下什麼都沒有」＝這輪沒有值得講的事，而不是「沒拉到」。
+# ⛔ 只講「這一格沒有數據」，**不印**來源的原始錯誤字串（可能含 URL／憑證
+#    片段，且對 LLM 無用；repo 是 PUBLIC）。
+# ⛔ 鍵根本不在 state（上游沒跑這一項）≠ 明講失敗 ⇒ 保持安靜，不得宣稱失敗。
+_FETCH_FAILED_MARK = "本輪拉取失敗"
+
+
+def _failed(d) -> bool:
+    """來源是否**明講**這一格失敗（只認 dict 上的 error 旗標）。"""
+    return isinstance(d, dict) and bool(d.get("error"))
+
+
+def _fail_line(label: str) -> str:
+    """一列誠實佔位：沒有數據 ≠ 沒有變化／沒有訊號。"""
+    # 逐列自含（LLM 可能只讀到其中一段），但刻意壓短：同一份 prompt 最多會出現
+    # 十幾列，長句重複十幾次反而稀釋注意力。
+    return f"- {label}: 〔{_FETCH_FAILED_MARK}＝沒有數據，非「無變化／無訊號」，不可據此判讀〕"
+
+
 def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
                             watchlist=None) -> str:
     """把 state + tradfi 結構化成 LLM 易讀的格式"""
@@ -284,7 +305,8 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
     for sym in ("BTC", "ETH", "SOL"):
         m = metrics.get(sym, {})
         e = extras.get(sym, {})
-        if m.get("error"): continue
+        if _failed(m):
+            parts.append(_fail_line(sym)); continue
         line = f"- {sym}: {_fmt_price(m.get('current_price'))}"
         for n in (7, 30, 90):
             r = m.get(f"return_{n}d_pct")
@@ -302,7 +324,8 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
     for sym in ("SUI", "WLFI"):
         m = metrics.get(sym, {})
         e = extras.get(sym, {})
-        if m.get("error"): continue
+        if _failed(m):
+            parts.append(_fail_line(sym)); continue
         line = (f"- {sym}: {_fmt_price(m.get('current_price'))}"
                 f"  7d {m.get('return_7d_pct','—')}%  30d {m.get('return_30d_pct','—')}%")
         if e.get("funding") is not None:
@@ -313,7 +336,8 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
     parts.append("\n## 期現基差")
     for sym in ("BTC", "ETH"):
         b = state.get(f"basis_{sym.lower()}", {})
-        if b.get("error"): continue
+        if _failed(b):
+            parts.append(_fail_line(sym)); continue
         parts.append(f"- {sym}: 基差 {_fmt_spec(b.get('basis_pct'), '+.4f', '%')}"
                      f"  ({b.get('interpretation','')})")
 
@@ -321,7 +345,8 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
     parts.append("\n## ETF 機構流向（7d 累計）")
     for sym, key in (("BTC", "etf_btc"), ("ETH", "etf_eth")):
         etf = state.get(key, {})
-        if etf.get("error"): continue
+        if _failed(etf):
+            parts.append(_fail_line(f"{sym} ETF")); continue
         c7 = etf.get("cumulative_7d_flow_usd")
         d24 = etf.get("latest_24h_flow_usd")
         parts.append(f"- {sym} ETF: 7d {_fmt_usd(c7, 1e6, '+.1f', 'M')}"
@@ -329,7 +354,10 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
 
     # ----- Funding 極端值 -----
     fo = state.get("funding_outliers", {})
-    if not fo.get("error"):
+    if _failed(fo):
+        parts.append("\n## Funding 極端值")
+        parts.append(_fail_line("全市場 funding 掃描"))
+    else:
         parts.append("\n## Funding 極端值")
         hot = fo.get("hottest", [])[:5]
         cold = fo.get("coldest", [])[:5]
@@ -346,7 +374,10 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
 
     # ----- 清算 + 鯨魚 -----
     liq = state.get("liq_scan", {})
-    if not liq.get("error"):
+    if _failed(liq):
+        parts.append("\n## 24h 清算 Top 5")
+        parts.append(_fail_line("清算掃描"))
+    else:
         items = liq.get("items", [])[:5]
         parts.append("\n## 24h 清算 Top 5")
         for it in items:
@@ -354,7 +385,10 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
                          f"  imbalance {_fmt_spec(it.get('imbalance'), '+.2f')}")
 
     whales = state.get("whales", {})
-    if not whales.get("error"):
+    if _failed(whales):
+        parts.append("\n## Hyperliquid 鯨魚淨倉位 Top 5")
+        parts.append(_fail_line("鯨魚淨倉位"))
+    else:
         parts.append("\n## Hyperliquid 鯨魚淨倉位 Top 5")
         for w in whales.get("per_symbol_aggregate", [])[:5]:
             parts.append(f"- {w.get('symbol')}: 淨多 {_fmt_spec(w.get('net_long_pct'), '+.0f', '%')}"
@@ -364,13 +398,17 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
     parts.append("\n## 期權市場 OI")
     for sym, key in (("BTC", "options_btc"), ("ETH", "options_eth")):
         o = state.get(key, {})
-        if o.get("error"): continue
+        if _failed(o):
+            parts.append(_fail_line(f"{sym} 期權")); continue
         parts.append(f"- {sym}: 總 OI {_fmt_usd(o.get('total_oi_usd'), 1e9, '.2f', 'B')}"
                      f"  24h {_fmt_spec(o.get('weighted_24h_change_pct'), '+.2f', '%')}")
 
     # ----- 情緒 + 週期 -----
     sent = state.get("sentiment", {})
-    if not sent.get("error"):
+    if _failed(sent):
+        parts.append("\n## 情緒/估值")
+        parts.append(_fail_line("F&G／AHR999"))
+    else:
         fg = sent.get("fear_greed_now")
         ahr = sent.get("ahr999_now")
         parts.append("\n## 情緒/估值")
@@ -380,7 +418,10 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
             parts.append(f"- AHR999: {ahr}  ({sent.get('ahr999_label', '—')})")
 
     cycle = state.get("cycle", {})
-    if not cycle.get("error"):
+    if _failed(cycle):
+        parts.append("\n## BTC 週期指標")
+        parts.append(_fail_line("週期指標"))
+    else:
         parts.append("\n## BTC 週期指標")
         for key, label in [("pi_cycle", "Pi Cycle"), ("puell", "Puell"),
                            ("golden_ratio", "Golden Ratio Multiplier"),
@@ -398,10 +439,14 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
                 parts.append(f"- {label}: {c.get('multiplier')}x  {c.get('label','')}")
 
     # ----- 傳統金融 -----
-    if tradfi and not tradfi.get("error"):
+    if _failed(tradfi):
+        parts.append("\n## 傳統金融跨資產")
+        parts.append(_fail_line("Yahoo 跨資產快照"))
+    elif tradfi:
         parts.append("\n## 傳統金融跨資產")
         for ticker, data in tradfi.get("items", {}).items():
-            if data.get("error"): continue
+            if _failed(data):
+                parts.append(_fail_line(ticker)); continue
             line = (f"- {ticker} ({data.get('name','')}): {data.get('current')}"
                     f"  1d {_fmt_pct(data.get('change_1d_pct'))}"
                     f"  7d {_fmt_pct(data.get('change_7d_pct'))}"
@@ -411,7 +456,9 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
     # ----- 多時框型態分析 (BTC/ETH/SOL) -----
     for sym, key in [("BTC", "pattern_btc"), ("ETH", "pattern_eth"), ("SOL", "pattern_sol")]:
         pat = state.get(key, {})
-        if pat.get("error"): continue
+        if _failed(pat):
+            parts.append(f"\n## {sym} 多時框型態")
+            parts.append(_fail_line("多時框型態分析")); continue
         consensus = pat.get("consensus", "unknown")
         by_tf = pat.get("by_tf", {})
         if not by_tf: continue
@@ -445,7 +492,10 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
 
     # ----- OKX 公告 -----
     okx = state.get("okx_news", {})
-    if not okx.get("error"):
+    if _failed(okx):
+        parts.append("\n## OKX 官方公告（近 72h）")
+        parts.append(_fail_line("OKX 公告源"))
+    else:
         parts.append("\n## OKX 官方公告（近 72h）")
         rel = okx.get("watchlist_relevant", [])
         all_items = okx.get("all_recent", [])
