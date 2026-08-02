@@ -88,8 +88,13 @@ def feature_registry_dump() -> dict:
 
 # ===========================================================================
 # 健康探針 —— 偵測「半成品 / 退化 / 卡住」（對應使用者怕的「四不像」）
-# 每個探針回 (severity, message)；severity: "ok" | "info" | "warn"
+# 每個探針回 (severity, message)；severity: "ok" | "info" | "warn" | "unknown"
 # 探針本身永不拋例外（CEO 簡報必須永遠能產生）
+#
+# v229：新增 "unknown" ＝**探針答不出來**（讀取失敗／沒有資料／時間戳算不出屋齡）。
+# 在此之前這些情況回 "info"，而產出端 `_section_normal()` 只收 "warn" ⇒ 一句
+# 「讀取失敗」被丟掉後剩下空集合 ⇒ 走 else 印「核心管線正常」。⛔ 未知不是健康，
+# 它必須在產出端被指名（紅線③）。
 # ===========================================================================
 def _probe_db() -> tuple[str, str]:
     try:
@@ -110,28 +115,48 @@ def _probe_queue() -> tuple[str, str]:
             return "warn", f"訊號 queue 塞 {queued} 筆未送（dispatcher 慢或 TG 故障）"
         return "ok", f"訊號 queue 暢通（queued={queued}）"
     except Exception as e:
-        return "info", f"queue 狀態讀取失敗：{type(e).__name__}"
+        return "unknown", f"訊號 queue 狀態讀取失敗：{type(e).__name__}（≠ 暢通）"
+
+
+def _run_ts_to_epoch_sec(run_ts: int | float) -> float:
+    """backtest_runs.run_ts → epoch 秒。
+
+    ⛔ 寫入端 `backtest_session.py` 存的是**毫秒**（`int(time.time() * 1000)`），
+    telegram_bot/callbacks.py 讀的時候有 `// 1000`，本檔原本沒有 ⇒ 拿毫秒直接減
+    `time.time()` 的秒，屋齡恆為約 −2064 萬天 ⇒ `age_d > 10` 永遠不成立 ⇒ 不論回測
+    停跑多久都回「新鮮」。這條探針是「回測 Session 卡住」的唯一自動偵測，等於從未
+    生效。以量級判單位（秒的 epoch 約 1.8e9，毫秒約 1.8e12），舊秒級資料也讀得對。
+    """
+    v = float(run_ts)
+    return v / 1000.0 if v > 1e11 else v
 
 
 def _probe_backtest_freshness() -> tuple[str, str]:
-    """回測 Session 每週一跑；超過 ~10 天沒新結果 = 可能卡住。"""
+    """回測 Session 每週一跑；超過 ~10 天沒新結果 = 可能卡住。
+
+    ⛔ 三態：量到且新鮮＝ok／量到且過期＝warn／**答不出來＝unknown**。
+    「沒有任何歷史結果」與「讀取失敗」都不等於健康，不可讓它們靜靜消失。
+    """
     try:
         from backtest.backtest_session import latest_backtest
         from l2_trigger.registry import scheduler_strategies
         strats = scheduler_strategies()
-        newest = 0
+        newest = 0.0
         for s in strats:
             bt = latest_backtest(getattr(s, "id", s) if not isinstance(s, str) else s)
             if bt and bt.get("run_ts"):
-                newest = max(newest, int(bt["run_ts"]))
+                newest = max(newest, _run_ts_to_epoch_sec(bt["run_ts"]))
         if newest == 0:
-            return "info", "回測尚無歷史結果（首輪未跑或樣本不足）"
+            return "unknown", "回測尚無任何歷史結果（首輪未跑或樣本不足）＝無從判斷是否卡住"
         age_d = (time.time() - newest) / 86400
+        # 未來時間戳＝時鐘偏移或資料寫壞：屋齡算不出來，⛔ 不可折成「很新鮮」。
+        if age_d < -0.5:
+            return "unknown", f"回測時間戳落在未來 {abs(age_d):.1f} 天（時鐘偏移或資料異常）＝新鮮度算不出來"
         if age_d > 10:
             return "warn", f"回測結果已 {age_d:.0f} 天未更新（每週應更新一次）"
-        return "ok", f"回測結果新鮮（{age_d:.1f} 天前）"
+        return "ok", f"回測結果新鮮（{max(age_d, 0.0):.1f} 天前）"
     except Exception as e:
-        return "info", f"回測新鮮度讀取失敗：{type(e).__name__}"
+        return "unknown", f"回測新鮮度讀取失敗：{type(e).__name__}（≠ 新鮮）"
 
 
 def feature_health() -> list[tuple[str, str]]:
@@ -319,13 +344,26 @@ def _section_normal() -> str:
 
     lines = ["✅ <b>一切正常 · 今日重點</b>", "━━━━━━━━━━━━━━━━"]
 
-    # 1) 系統健康（探針）
+    # 1) 系統健康（探針）—— v229 三態。
+    #    ⛔ 舊碼只收 sev=="warn"，探針回的「讀取失敗／沒有資料」（當時是 info）在彙總時
+    #    被丟掉，剩下空集合就走 else 印「核心管線正常」＝把未知講成健康（紅線③）。
+    #    ⛔ 舊句「全部 worker 由監督器看顧」沒有任何一支探針量過——全套只有三支：帳本可讀、
+    #    queue 深度、回測新鮮度。正面結論只能講量到的那三件事。
     health = feature_health()
     warns = [m for sev, m in health if sev == "warn"]
+    unknowns = [m for sev, m in health if sev == "unknown"]
+    oks = [m for sev, m in health if sev == "ok"]
     if warns:
-        lines.append("🩺 系統：" + "；".join(warns))
+        line = "🩺 系統：" + "；".join(warns)
+        if unknowns:
+            line += "\n　　↳ 🟡 另有查不到的項目（狀態未知，不是沒問題）：" + "；".join(unknowns)
+        lines.append(line)
+    elif unknowns:
+        lines.append("🩺 系統：🟡 探針未全數量到——" + "；".join(unknowns)
+                     + "\n　　↳ ⛔ 以上為**狀態未知，不是沒問題**；"
+                     + (f"已量到的：{'；'.join(oks)}" if oks else "本輪三支探針無一量到"))
     else:
-        lines.append("🩺 系統：全部 worker 由監督器看顧，核心管線正常")
+        lines.append("🩺 系統：" + "；".join(oks) + "（三項探針全數量到）")
 
     # 1.5) 連續性（v50 / task #22）—— daemon 心跳新鮮度 + 過去 24h 離線缺口回顧。
     #      把「引擎到底有沒有不間斷地跑」攤在日報，使用者不必翻 log。
