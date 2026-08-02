@@ -858,17 +858,30 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
         cvd = cg.get("cvd") or []
         if cvd:
             slope = cg.get("cvd_slope")
-            trend = ("上升=買方主動吸籌" if (slope or 0) > 0
-                     else "下降=賣方主動派發" if (slope or 0) < 0 else "走平")
+            # v227：舊碼 `(slope or 0)` 讓 None 的兩個比較都落空 ⇒ 掉進 else「走平」＝
+            #       斷言多空均衡。數字那半誠實印 n/a、括號裡卻下了結論，兩者矛盾，
+            #       而 LLM 讀的是括號裡那個結論。（v223 在訊號數學輸入端治過的孿生）
+            #       ⛔ 來源明講 0.0 仍是答案，照舊講「走平」。
+            if slope is None:
+                trend = "⛔ 斜率這輪沒算出來，多空方向判不了，不可讀成均衡"
+            else:
+                trend = ("上升=買方主動吸籌" if slope > 0
+                         else "下降=賣方主動派發" if slope < 0 else "走平")
             parts.append(f"- CVD（累積成交量差）：最新 {_fmt_spec(cvd[-1], ',.0f')}，"
                          f"近 24h 斜率 {slope if slope is not None else 'n/a'}（{trend}）")
         oi = cg.get("oi") or []
         if oi:
             d24 = cg.get("oi_delta_24h")
-            oi_trend = ("增倉" if (d24 or 0) > 0 else "減倉" if (d24 or 0) < 0 else "持平")
-            parts.append(f"- OI（未平倉合約）：最新 {_fmt_usd(oi[-1], 1, ',.0f', '')}，"
-                         f"24h {d24:+.2f}%（{oi_trend}）" if d24 is not None
-                         else f"- OI：最新 {_fmt_usd(oi[-1], 1, ',.0f', '')}")
+            if d24 is None:
+                # v227：舊碼整句 24h 變化**靜靜消失**（v225 物種）——讀者不會知道它缺了，
+                #       只會讀成「沒提＝沒事」。另外舊碼的 `oi_trend` 在 None 時算出
+                #       「持平」後根本沒被用到＝死碼，正說明作者當時以為會印成持平。
+                parts.append(f"- OI（未平倉合約）：最新 {_fmt_usd(oi[-1], 1, ',.0f', '')}，"
+                             f"24h 變化這輪沒算出來（⛔ 不是沒變動）")
+            else:
+                oi_trend = "增倉" if d24 > 0 else "減倉" if d24 < 0 else "持平"
+                parts.append(f"- OI（未平倉合約）：最新 {_fmt_usd(oi[-1], 1, ',.0f', '')}，"
+                             f"24h {d24:+.2f}%（{oi_trend}）")
         if cg.get("funding") is not None:
             f = cg["funding"]
             ftone = ("過熱偏多（軋空風險）" if f > 0.0005 else
@@ -935,7 +948,10 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
     # v33：Binance 第二來源交叉驗證（兩所分歧＝資訊，須在分析點出）
     xc = sym_state.get("binance_xcheck") or {}
     bn = xc.get("binance") or {}
-    if bn:
+    # v227：`_fetch_binance_raw` 一律寫鍵（`fund.get("funding")` 缺值就是 None）⇒
+    #       `{"funding": None, "ls_ratio": None}` 是**非空 dict**，舊碼 `if bn:`
+    #       判成有料（v178 治過的同一個坑）⇒ 整段只剩標題 + 一句 ✅、零數據。
+    if any(bn.get(k) is not None for k in ("funding", "ls_ratio")):
         line = "\n## 🔀 跨所交叉驗證（Binance 第二來源）"
         parts.append(line)
         if bn.get("ls_ratio") is not None:
@@ -945,8 +961,21 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
         if xc.get("flags"):
             for fl in xc["flags"]:
                 parts.append(f"- ⚠️ {fl}（兩所分歧，留意）")
-        else:
-            parts.append("- ✅ 與主源(OKX/CoinGlass)大致一致，訊號可信度較高")
+        elif xc.get("compared"):
+            # v227：只有**真的比對過**才給這句；且指名比了哪幾項，
+            #       不再用一句含混的「大致一致」蓋住只比了一項的情況。
+            parts.append(f"- ✅ 已比對 {'、'.join(xc['compared'])}"
+                         "：與主源(OKX/CoinGlass)未見背離，訊號可信度較高")
+        # v227：沒比成的項目必須點名。舊碼只看 `flags` 是否為空，而空有三種
+        #       語意相反的成因 ⇒ 把「這一輪根本沒比」印成「兩所看法相同、更可信」。
+        #       這是本物種第 47 次，也是第一次被折出來的不是數字、而是**一句對
+        #       訊號可信度的加分結論**——正好是這個區塊唯一的存在理由。
+        _unc = xc.get("uncompared") or []
+        if _unc:
+            parts.append("- ⚠️ 這輪**沒比對成**："
+                         + "、".join(f"{u['item']}（{u['why']}）" for u in _unc)
+                         + "——⛔ 沒比對成不代表兩所看法相同，"
+                           "禁止據此提高訊號可信度、也不可當成已通過的確認桶")
 
     # Hyperliquid 鯨魚（如果這個 symbol 上榜）
     whales = sym_state.get("whales", {})

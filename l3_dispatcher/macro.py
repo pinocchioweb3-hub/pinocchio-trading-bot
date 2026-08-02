@@ -398,15 +398,39 @@ async def _fetch_binance_raw(symbol: str) -> dict:
 
 def _binance_divergence(cg: dict, bn: dict) -> dict:
     """v33：比較 主源(OKX/CoinGlass) vs Binance 的 funding 與大戶多空比，回背離摘要。
-    背離大→在分析註記（兩所對同一品種看法分歧＝資訊，不是錯誤）。"""
-    out = {"binance": bn, "flags": []}
+    背離大→在分析註記（兩所對同一品種看法分歧＝資訊，不是錯誤）。
+
+    v227：舊版只回 `flags`，而 `flags == []` 是**三種語意相反狀態**共用的表示：
+      (1) 比過了、沒有背離     ＝ 答案
+      (2) 主源缺值、沒得比     ＝ 未知
+      (3) Binance 缺值、沒得比 ＝ 未知
+    下游 synthesizer 手上沒有 cg，**結構上分不出來**，於是把 (2)(3) 印成
+    「✅ 與主源(OKX/CoinGlass)大致一致，訊號可信度較高」——CoinGlass 自 7/08
+    停權後 funding/ls_ratio 皆 None，這兩個比對一次都沒跑，那句話卻每張加密
+    deepdive 卡片都在印（線上實測 BTC/SOL）。判準只能在這裡寫進資料：
+    `compared`＝真的比對過的項目；`uncompared`＝沒比成的項目與哪一邊缺。
+    沿用本檔既有作法（`_htf_input`）：鍵在＝答案，另立鍵＝未知。
+    ⛔ 用 `is not None` 而非 truthiness：來源明講 0.0 是答案、不是缺料。
+    ⛔ 不寫來源原始錯誤字串（repo 是 PUBLIC）。
+    """
+    out: dict = {"binance": bn, "flags": [], "compared": [], "uncompared": []}
+
+    def _comparable(label: str, cgv, bnv) -> bool:
+        if cgv is not None and bnv is not None:
+            out["compared"].append(label)
+            return True
+        why = ("兩邊這輪都沒有值" if cgv is None and bnv is None
+               else "主源這輪沒有值" if cgv is None else "Binance 這輪沒有值")
+        out["uncompared"].append({"item": label, "why": why})
+        return False
+
     cgf, bnf = cg.get("funding"), bn.get("funding")
-    if cgf is not None and bnf is not None:
+    if _comparable("資金費率", cgf, bnf):
         if (cgf > 0) != (bnf > 0) and abs(cgf - bnf) > 0.0002:
             out["flags"].append(
                 f"資金費率跨所背離：主源 {cgf*100:+.4f}% vs Binance {bnf*100:+.4f}%")
     cgl, bnl = cg.get("ls_ratio"), bn.get("ls_ratio")
-    if cgl and bnl:
+    if _comparable("大戶多空比", cgl, bnl):
         hi, lo = max(cgl, bnl), max(min(cgl, bnl), 0.01)
         if hi / lo > 1.25:
             out["flags"].append(
