@@ -612,6 +612,12 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
     }.get(_mode, "⚖️ 平衡模式")
     parts.append(f"## 🎚️ 訊號模式：{_mode_rule}\n")
 
+    # v219：上面那條規則講「獨立確認 ≥N 桶」，但這個桶數以前**從來沒有人算給讀者看**——
+    #       一條數值門檻被交給目測。這裡先把總帳印出來（確定性盤點），再讓 LLM 往下讀。
+    from l3_dispatcher.signal_preflight import (preflight_verdict,
+                                                render_preflight_block)
+    parts.append(render_preflight_block(preflight_verdict(sym_state)))
+
     # === 使用者帳戶約束（v42：動態依 botconfig，不再寫死）===
     parts.extend(_account_constraints_block())
 
@@ -1050,15 +1056,27 @@ def _extract_plan_block(text: str) -> tuple[str, dict | None]:
 
 async def synthesize_per_symbol(symbol: str, sym_state: dict,
                                timeout_sec: int = 180) -> tuple[str | None, dict]:
-    """單一標的交易計畫（v33：附帶機器可讀 plan，存進 meta['plan']）。"""
+    """單一標的交易計畫（v33：附帶機器可讀 plan，存進 meta['plan']）。
+
+    v219：prompt 只是**請求**，不是把關——模型仍可能在零證據下回 actionable=true。
+    預檢閘的裁決在這裡於程式端落實，並且降級必須看得見（附在文末），
+    ⛔ 不可靜靜改掉旗標：那本身就是另一種無聲折疊。
+    """
+    from l3_dispatcher.signal_preflight import enforce_plan, preflight_verdict
+    verdict = preflight_verdict(sym_state)
     text, meta = await _synthesize_with_prompt(
         system_prompt=PER_SYMBOL_DEEPDIVE_PROMPT.replace("{SYMBOL}", symbol),
         user_data=_format_symbol_data(symbol, sym_state),
         timeout_sec=timeout_sec,
     )
+    meta["preflight"] = verdict
     if text:
         text, plan = _extract_plan_block(text)
-        meta["plan"] = plan
+        was_actionable = bool((plan or {}).get("actionable"))
+        meta["plan"] = enforce_plan(plan, verdict)
+        if verdict.get("block_actionable"):
+            text += (f"\n\n⛔ {verdict['reason']}"
+                     + ("\n（原輸出標為可執行，已由預檢閘降級為觀察。）" if was_actionable else ""))
     return text, meta
 
 
