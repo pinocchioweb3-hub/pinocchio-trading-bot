@@ -46,6 +46,29 @@ _OKX_BIN = shutil.which("okx")
 _QUIET_LOG_S = 3600           # 故障期每小時最多出聲一次
 
 
+_CRED_NAME_TOKENS = ("KEY", "SECRET", "PASSPHRASE", "TOKEN")
+
+
+def _child_env() -> dict:
+    """給 CLI 的子行程環境。⛔ 只**刪空值**，永遠不注入任何憑證。
+
+    v220 真因（線上實證）：.env 帶了 OKX_API_KEY／OKX_API_SECRET／
+    OKX_API_PASSPHRASE 三個**空字串佔位**。CLI 只看「變數在不在」，
+    於是判定使用者要用 env 憑證 → partial → 整個拒絕，而且**不回退**到
+    config.toml 的 [profiles.live]（那裡三欄都填好了）。
+    空字串不是憑證——同物種（「有這個 key」被折成「有這個值」）在環境變數層。
+
+    只清「名稱像憑證」且值為空白的 OKX_* 變數；⛔ 有值的一律不動，
+    ⛔ 不掃非憑證形狀的變數（那些空值可能有「明示關閉」語意）。"""
+    env = dict(os.environ, NODE_OPTIONS="--dns-result-order=ipv4first")
+    for k in [k for k, v in env.items()
+              if k.startswith("OKX_")
+              and any(t in k for t in _CRED_NAME_TOKENS)
+              and not (v or "").strip()]:
+        env.pop(k, None)
+    return env
+
+
 def _okx_news(args: list[str], timeout: int = 45) -> tuple[int, str]:
     """呼叫 okx CLI——子指令硬鎖 news。回 (exit_code, stdout)。
 
@@ -55,7 +78,7 @@ def _okx_news(args: list[str], timeout: int = 45) -> tuple[int, str]:
         raise ValueError("okx_news 模組只允許 news 子指令")
     if not _OKX_BIN:
         return 127, "okx CLI not installed"
-    env = dict(os.environ, NODE_OPTIONS="--dns-result-order=ipv4first")
+    env = _child_env()
     try:
         r = subprocess.run([_OKX_BIN, "--profile", "live", *args, "--json"],
                            capture_output=True, text=True, encoding="utf-8",
@@ -70,6 +93,10 @@ def _fail_class(out: str) -> str:
     low = (out or "").lower()
     if "ip" in low and "whitelist" in low:
         return "auth_ip_whitelist"
+    # v220：⛔ 必須排在 auth 之前。這句話含 "credential"，舊碼會歸成 auth
+    #       ⇒ 讀起來像「金鑰壞了」，實際是環境變數被空值污染，方向完全相反。
+    if "partial api credentials" in low:
+        return "credentials_partial"
     if "401" in low or "credential" in low:
         return "auth"
     if "not available in demo" in low:
@@ -87,6 +114,11 @@ _FAIL_HINT = {
     "auth": ("OKX 回報認證失敗（401／credential）＝live profile 的金鑰被拒。"
              "⛔ 這不是 IP 限制那一類（那會另外分類、另外提示），"
              "請勿據此更動交易所端的存取設定。"),
+    "credentials_partial": ("CLI 判定「憑證只給了一半」而拒絕，且不回退到 "
+                            "config.toml 的 profile。⛔ 這不是金鑰壞掉：多半是環境變數裡有"
+                            "**空字串佔位**的 OKX_* 憑證變數被讀成「有提供」。"
+                            "_child_env() 已負責清掉空值；若此訊息仍出現，"
+                            "代表有非空但不完整的一組憑證變數。"),
     "profile": "此端點需要 live profile，demo 被 OKX 拒絕。",
     "timeout": "呼叫逾時——多為暫時性，下一輪自動再試。",
 }

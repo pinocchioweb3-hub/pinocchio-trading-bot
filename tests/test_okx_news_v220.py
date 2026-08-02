@@ -137,3 +137,49 @@ def test_zero_pushed_with_items_explains_itself():
 
 def test_quiet_when_something_was_pushed():
     assert m.cycle_summary(parsed=20, dup=18, too_old=0, pushed=2) is None
+
+
+# ── ⑥ 真因（線上實證）：空字串佔位被 CLI 讀成「有提供憑證」──────────────
+#
+# daemon 實跑回的是：
+#   "Partial API credentials detected. Hint: Set OKX_API_KEY, OKX_SECRET_KEY
+#    and OKX_PASSPHRASE together (env vars or config.toml profile)."
+# .env 帶了 OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE 三個**空字串**佔位,
+# CLI 只看「變數在不在」⇒ 判 partial ⇒ 整個拒絕,且不回退到 config.toml 的
+# [profiles.live]（那裡三個欄位都填好了）。空字串不是憑證——同物種在環境變數層。
+# 手動測會通是因為沒載 .env,這正是「我的殼跟 daemon 的殼不同」型的假陰性。
+
+_PARTIAL = ("error: Partial API credentials detected. Hint: Set OKX_API_KEY, "
+            "OKX_SECRET_KEY and OKX_PASSPHRASE together (env vars or config.toml "
+            "profile). Version: @okx_ai/okx-trade-cli@1.4.2")
+
+
+def test_partial_credentials_is_its_own_class():
+    """⛔ 舊分類因為字串含 credential 就歸成 auth ⇒ 看起來像金鑰壞了,
+    實際上是設定被空值污染,方向完全相反。"""
+    assert m._fail_class(_PARTIAL) == "credentials_partial"
+
+
+def test_partial_credentials_hint_points_at_env_not_at_keys():
+    msg = m.fail_message(1, _PARTIAL)
+    assert "白名單" not in msg
+    assert "空" in msg and "config.toml" in msg
+
+
+def test_child_env_drops_empty_credential_placeholders(monkeypatch):
+    monkeypatch.setenv("OKX_API_KEY", "")
+    monkeypatch.setenv("OKX_API_SECRET", "   ")
+    monkeypatch.setenv("OKX_TRADE_API_KEY", "realvalue")
+    monkeypatch.setenv("OKX_DEMO_TRADING_ENABLED", "")
+    env = m._child_env()
+    assert "OKX_API_KEY" not in env, "空字串佔位不移除 ⇒ CLI 永遠判 partial"
+    assert "OKX_API_SECRET" not in env
+    assert env["OKX_TRADE_API_KEY"] == "realvalue", "⛔ 有值的一律不得動"
+    assert "OKX_DEMO_TRADING_ENABLED" in env, "⛔ 只清憑證形狀的空變數,不掃全場"
+
+
+def test_child_env_never_injects_values(monkeypatch):
+    """⛔ 這個函式只准刪空值,永遠不准填任何憑證進去。"""
+    monkeypatch.delenv("OKX_API_KEY", raising=False)
+    env = m._child_env()
+    assert "OKX_API_KEY" not in env
