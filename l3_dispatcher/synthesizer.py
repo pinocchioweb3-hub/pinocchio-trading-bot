@@ -290,6 +290,22 @@ def _fail_line(label: str) -> str:
     return f"- {label}: 〔{_FETCH_FAILED_MARK}＝沒有數據，非「無變化／無訊號」，不可據此判讀〕"
 
 
+# ── v226：以下兩個給 hourly pulse 用 ────────────────────────────────────
+# `_ABSENT` 之所以必要：`state.get(k, {})` 會讓「鍵不在」與「鍵在但是空的」
+# 得到同一個值，但這兩件事語意相反——前者是上游沒跑這一項（該安靜），
+# 後者是上游試過而失敗（該出聲）。用預設值 `{}` 就永遠分不開。
+_ABSENT = object()
+
+
+def _empty_section_line() -> str:
+    """一整區一列都沒有時的誠實佔位。
+
+    空標題會被 LLM 讀成「這一區這輪沒什麼好講」，但真相可能是這一區從來
+    沒有被計算過（`flow_recent` 即是：macro.py 建了空 dict 就原樣回傳）。
+    """
+    return "- 〔本輪沒有任何數據＝沒有量到，非「無變化／無訊號」，不可據此判讀〕"
+
+
 def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
                             watchlist=None) -> str:
     """把 state + tradfi 結構化成 LLM 易讀的格式"""
@@ -513,75 +529,122 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
 
 
 def _format_pulse_data(pulse_state: dict) -> str:
-    """組 hourly pulse 用的 delta-focused 數據摘要"""
+    """組 hourly pulse 用的 delta-focused 數據摘要
+
+    v226：與 v225 同物種、下一格。這裡的舊碼有**三種**把「沒拉到」講成
+    「量到了」的形狀，其中第一種是 45 次以來對讀者最直接的一種：
+
+      ① 上游失敗時遞來的**空 dict**（macro.py:342-353 `etf_*_today = {}`）
+         沒有 error 旗標 ⇒ `if d.get("error")` 守門不觸發 ⇒ 落到
+         `.get("today_flow_usd", 0)` ⇒ 印出 `今日 $+0.0M`
+         ＝「今天機構沒有進出」。這是一個**看起來像量測結果的數字**，
+         LLM 會直接把它寫進使用者每小時讀的那張卡。
+      ② `error: continue` ⇒ 那一列／那一整區從 prompt 消失（v225 同形）。
+      ③ `.get(k, 0)` ⇒ 分量沒失敗但缺某個數字鍵時折成 0。
+
+    ⛔ 邊界線：來源明講的 0 仍是答案，照印（ETF 真的零流入是常見事實）；
+       資料齊全時每一列與舊碼**逐字相同**；不印來源原始錯誤字串（repo 是
+       PUBLIC，可能含 URL／憑證片段）；鍵不在 state ＝上游沒跑這一項，
+       保持安靜、不可宣稱失敗。
+    """
     ts = pulse_state.get("ts")
     ts_str = ts.strftime("%H:%M UTC") if ts else "now"
     parts = [f"# 時間：{ts_str}\n"]
 
+    def _flush(header: str, rows: list[str]) -> None:
+        """一整區：有列就照印；一列都沒有 ⇒ 明說沒有數據，不留空標題。
+
+        空標題 ＝「這輪沒什麼好講」，但真相可能是這一項根本沒被算過
+        （`flow_recent` 就是：macro.py 從頭到尾沒填過它）。
+        """
+        parts.append(header)
+        parts.extend(rows if rows else [_empty_section_line()])
+
     # ---- 即時價格與變動 ----
-    parts.append("## 即時價格 (1h/24h/3d/1w)")
+    rows = []
     for sym, d in pulse_state.get("price_deltas", {}).items():
-        if d.get("error"): continue
-        cur = d.get("current")
-        c1h = d.get("change_1h_pct")
-        c24h = d.get("change_24h_pct")
-        c3d = d.get("change_3d_pct")
-        c1w = d.get("change_1w_pct")
-        hi24 = d.get("high_24h")
-        lo24 = d.get("low_24h")
-        parts.append(
-            f"- {sym}: ${cur}  "
-            f"1h={c1h:+.2f}% 24h={c24h:+.2f}% 3d={c3d:+.2f}% 1w={c1w:+.2f}%  "
-            f"24h 高/低: ${hi24}/${lo24}"
+        if _failed(d):
+            rows.append(_fail_line(sym)); continue
+        rows.append(
+            f"- {sym}: {_fmt_price(d.get('current'))}  "
+            f"1h={_fmt_spec(d.get('change_1h_pct'), '+.2f', '%')} "
+            f"24h={_fmt_spec(d.get('change_24h_pct'), '+.2f', '%')} "
+            f"3d={_fmt_spec(d.get('change_3d_pct'), '+.2f', '%')} "
+            f"1w={_fmt_spec(d.get('change_1w_pct'), '+.2f', '%')}  "
+            f"24h 高/低: {_fmt_price(d.get('high_24h'))}/{_fmt_price(d.get('low_24h'))}"
         )
+    _flush("## 即時價格 (1h/24h/3d/1w)", rows)
 
     # ---- 過去 24h CVD 與 taker buy/sell ----
-    parts.append("\n## 24h 主動買賣力量")
+    rows = []
     for sym, d in pulse_state.get("flow_recent", {}).items():
-        if d.get("error"): continue
-        slope = d.get("cvd_slope_24h", 0)
-        taker_ratio = d.get("buy_sell_ratio_24h", 0)
-        parts.append(f"- {sym}: CVD 24h 斜率={slope:+.3f}  taker buy/sell={taker_ratio:.2f}")
+        if _failed(d):
+            rows.append(_fail_line(sym)); continue
+        rows.append(f"- {sym}: CVD 24h 斜率={_fmt_spec(d.get('cvd_slope_24h'), '+.3f')}  "
+                    f"taker buy/sell={_fmt_spec(d.get('buy_sell_ratio_24h'), '.2f')}")
+    _flush("\n## 24h 主動買賣力量", rows)
 
     # ---- 今日清算 ----
-    liq = pulse_state.get("liq_today", {})
-    if liq and not liq.get("error"):
-        parts.append("\n## 今日清算（過去 24h）")
-        for it in liq.get("items", [])[:5]:
-            imb = it.get("imbalance", 0)
-            tag = "（軋空）" if imb > 0.3 else ("（多殺多）" if imb < -0.3 else "")
-            parts.append(f"- {it['symbol']}: ${it.get('total_24h', 0)/1e6:.1f}M  imb={imb:+.2f}{tag}")
+    liq = pulse_state.get("liq_today", _ABSENT)
+    if liq is not _ABSENT:
+        rows = []
+        if _failed(liq) or not liq:
+            rows.append(_fail_line("今日清算"))
+        else:
+            for it in liq.get("items", [])[:5]:
+                imb = it.get("imbalance")
+                tag = "" if imb is None else (
+                    "（軋空）" if imb > 0.3 else ("（多殺多）" if imb < -0.3 else ""))
+                rows.append(f"- {it['symbol']}: {_fmt_usd(it.get('total_24h'), 1e6, '.1f', 'M')}  "
+                            f"imb={_fmt_spec(imb, '+.2f')}{tag}")
+        _flush("\n## 今日清算（過去 24h）", rows)
 
     # ---- 今日 ETF ----
-    parts.append("\n## ETF 即時")
+    rows = []
     for sym in ("BTC", "ETH"):
-        d = pulse_state.get(f"etf_{sym.lower()}_today", {})
-        if d.get("error"): continue
-        today = d.get("today_flow_usd", 0)
-        last_3d = d.get("cumulative_3d_flow_usd", 0)
-        parts.append(f"- {sym}: 今日 ${today/1e6:+,.1f}M  近 3d 累計 ${last_3d/1e6:+,.1f}M")
+        d = pulse_state.get(f"etf_{sym.lower()}_today", _ABSENT)
+        if d is _ABSENT:
+            continue
+        # ⭐ 空 dict ＝ 上游試過而失敗（macro.py 失敗時的表示法），不是「零流入」。
+        if _failed(d) or not d:
+            rows.append(_fail_line(sym)); continue
+        rows.append(f"- {sym}: 今日 {_fmt_usd(d.get('today_flow_usd'), 1e6, '+,.1f', 'M')}  "
+                    f"近 3d 累計 {_fmt_usd(d.get('cumulative_3d_flow_usd'), 1e6, '+,.1f', 'M')}")
+    _flush("\n## ETF 即時", rows)
 
     # ---- Funding 即時變化 ----
     fund = pulse_state.get("funding_changes", {})
     if fund:
-        parts.append("\n## Funding 24h 變化")
+        rows = []
         for sym, d in fund.items():
-            if d.get("error"): continue
-            chg = d.get("change_24h_pct_points", 0) * 100
-            parts.append(f"- {sym}: 現 {_fmt_funding(d.get('current'))}/8h  "
-                         f"24h 變化 {chg:+.4f} 百分點")
+            if _failed(d):
+                rows.append(_fail_line(sym)); continue
+            chg = d.get("change_24h_pct_points")
+            rows.append(f"- {sym}: 現 {_fmt_funding(d.get('current'))}/8h  "
+                        f"24h 變化 {_fmt_spec(None if chg is None else chg * 100, '+.4f')} 百分點")
+        _flush("\n## Funding 24h 變化", rows)
 
     # ---- 鯨魚最新狀態 ----
-    whales = pulse_state.get("whales_now", {})
-    if whales and not whales.get("error"):
-        parts.append("\n## Hyperliquid 鯨魚最新淨倉 Top 5")
-        for w in whales.get("per_symbol_aggregate", [])[:5]:
-            parts.append(f"- {w['symbol']}: 淨多 {w['net_long_pct']:+.0f}%  總倉 ${w['total_usd']/1e6:.1f}M")
+    whales = pulse_state.get("whales_now", _ABSENT)
+    if whales is not _ABSENT:
+        rows = []
+        if _failed(whales) or not whales:
+            rows.append(_fail_line("鯨魚淨倉"))
+        else:
+            for w in whales.get("per_symbol_aggregate", [])[:5]:
+                rows.append(f"- {w['symbol']}: 淨多 {_fmt_spec(w.get('net_long_pct'), '+.0f', '%')}  "
+                            f"總倉 {_fmt_usd(w.get('total_usd'), 1e6, '.1f', 'M')}")
+        _flush("\n## Hyperliquid 鯨魚最新淨倉 Top 5", rows)
 
     # ---- 情緒即時 ----
-    sent = pulse_state.get("sentiment_now", {})
-    if sent and not sent.get("error"):
-        parts.append(f"\n## 情緒：F&G {sent.get('fear_greed_now')} ({sent.get('fear_greed_label','—')})")
+    sent = pulse_state.get("sentiment_now", _ABSENT)
+    if sent is not _ABSENT:
+        if _failed(sent) or not sent:
+            parts.append("\n## 情緒")
+            parts.append(_fail_line("F&G"))
+        else:
+            parts.append(f"\n## 情緒：F&G {sent.get('fear_greed_now')} "
+                         f"({sent.get('fear_greed_label','—')})")
 
     return "\n".join(parts)
 

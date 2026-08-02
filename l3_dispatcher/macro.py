@@ -335,22 +335,28 @@ async def compute_pulse_state(source, watchlist) -> dict:
                 # 24h change pts: simplified to predicted - current (rough trend proxy)
                 "change_24h_pct_points": (fr.get("funding_predicted", 0) or 0) - (fr.get("funding", 0) or 0),
             }
+        else:
+            # v226：失敗的標的舊碼**根本不塞進來** ⇒ 它在 prompt 裡等於不存在，
+            # 讀者無從分辨「這個標的資費沒異常」與「這個標的沒拉到」。
+            funding_changes[sym] = {"error": True}
 
     def _safe(x): return x if isinstance(x, dict) else {"error": str(x)}
 
     # ETF today (last datapoint vs prior)
-    etf_btc_today = {}
-    if isinstance(etf_btc, dict) and not etf_btc.get("error"):
-        flows = etf_btc.get("series", [])
-        today = flows[-1]["flow_usd"] if flows else 0
-        cum_3d = sum(f.get("flow_usd", 0) for f in flows[-3:])
-        etf_btc_today = {"today_flow_usd": today, "cumulative_3d_flow_usd": cum_3d}
-    etf_eth_today = {}
-    if isinstance(etf_eth, dict) and not etf_eth.get("error"):
-        flows = etf_eth.get("series", [])
-        today = flows[-1]["flow_usd"] if flows else 0
-        cum_3d = sum(f.get("flow_usd", 0) for f in flows[-3:])
-        etf_eth_today = {"today_flow_usd": today, "cumulative_3d_flow_usd": cum_3d}
+    # v226：失敗時舊碼留一個**空 dict**，下游 `if d.get("error")` 認不得它，
+    # 於是落到 `.get("today_flow_usd", 0)` ⇒ prompt 上印出「今日 $+0.0M」
+    # ＝把沒拉到講成「今天機構沒有進出」。這裡改成明講失敗。
+    def _etf_today(raw) -> dict:
+        if not isinstance(raw, dict) or raw.get("error"):
+            return {"error": True}
+        flows = raw.get("series", [])
+        if not flows:
+            return {"error": True}      # 沒有任何一天的資料 ⇒ 不知道，不是 0
+        return {"today_flow_usd": flows[-1]["flow_usd"],
+                "cumulative_3d_flow_usd": sum(f.get("flow_usd", 0) for f in flows[-3:])}
+
+    etf_btc_today = _etf_today(etf_btc)
+    etf_eth_today = _etf_today(etf_eth)
 
     return {
         "ts": dt.datetime.now(tz=dt.timezone.utc),
