@@ -574,19 +574,37 @@ class CoinGlassSource:
                               code="PARSE_ERROR",
                               message="no usable taker volume rows")
 
-        # 短期斜率（最後 12 根 = 12h on 1h）= 近期主動買賣淨力
+        # v223：一根有量的 bar 都沒有時，斜率是「沒算出來」，**不是**「多空均衡」。
+        #   舊碼的 `else 0.0` 讓 0.0 同時代表兩件相反的事：買賣真的相抵，以及
+        #   根本沒量到。下游 l2_trigger/types.py:122 的 is_stale() 只認 None
+        #   （規格：「任一欄位 None 或列在 stale_fields → True」），所以折成 0.0
+        #   會讓 signals.py:45/205 既有的 STALE 早退**整條失效**，改由訊號數學
+        #   對著虛構值給出正式判讀；wyckoff.py:94 也會據此對放量突破掛上
+        #   「疑似假突破」警語。⛔ 本次一行都不碰 signals.py／strength.py——
+        #   修法是把契約餵對，讓它們既有的守門自己生效。
+        #   ⚠️ 可達性不是理論值：delta_pcts 只在 total > 0 時 append，而上面的
+        #   `_to_float(...) or 0.0` 會把解析不出來的欄位折成 0.0 ⇒ 上游一改欄位
+        #   名或回 null，每一根都變成 total==0（而 series 恆非空 ⇒ 上面那條
+        #   PARSE_ERROR 是死碼、永遠不會回報）。
+        #   ⛔ 邊界：有量的 bar 算出來剛好是 0.0 仍是 0.0——0.0 是答案，不是
+        #   未知的代名詞；部分 bar 有量就用那幾根算，不因其他根沒量而判未知。
         n_recent = min(12, len(delta_pcts))
-        cvd_slope = (sum(delta_pcts[-n_recent:]) / n_recent) if n_recent > 0 else 0.0
+        cvd_slope = (round(sum(delta_pcts[-n_recent:]) / n_recent, 4)
+                     if n_recent > 0 else None)
 
         # 7d 斜率（最後 168 根 on 1h）
         n_7d = min(168, len(delta_pcts))
-        cvd_slope_7d = (sum(delta_pcts[-n_7d:]) / n_7d) if n_7d > 0 else 0.0
+        cvd_slope_7d = (round(sum(delta_pcts[-n_7d:]) / n_7d, 4)
+                        if n_7d > 0 else None)
 
         return {
             "symbol": symbol, "source": "coinglass",
             "cvd": round(series[-1]["value"], 2),
-            "cvd_slope": round(cvd_slope, 4),
-            "cvd_slope_7d": round(cvd_slope_7d, 4),
+            "cvd_slope": cvd_slope,
+            "cvd_slope_7d": cvd_slope_7d,
+            # v223 留痕：斜率是用幾根「有量」的 bar 算的（信心度，非只有值）。
+            # 0 ＝ 未知；下游若只看值會分不出 12 根算出的 0.0 與 1 根算出的 0.0。
+            "slope_bars": len(delta_pcts),
             "cvd_price_divergence": "none",  # 在 snapshot 層比對 price 後填
             "series": series,
         }
