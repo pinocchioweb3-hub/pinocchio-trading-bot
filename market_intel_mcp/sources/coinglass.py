@@ -357,11 +357,29 @@ class CoinGlassSource:
 
         latest = series[-1]["value"]
         first = series[0]["value"]
-        delta_pct_24h = ((latest - first) / first * 100) if first else 0.0
+        # v224：變化率「算不出來」不再折成 0.0（＝「OI 24h 完全沒變」）。
+        #   舊碼 `if first else 0.0` 讓 0.0 同時代表兩件相反的事：OI 真的持平，
+        #   以及根本沒有可算的分母/窗。兩個算不出來的入口：
+        #     * first == 0（新上市／極冷門幣／上游該欄位回 0）⇒ 分母為 0；
+        #     * len(series) == 1 ⇒ latest 即 first ⇒ 數學上必得 0，但那是
+        #       「沒有 24h 這個窗」，不是「窗內沒變」。
+        #   同支檔案的 get_cvd_series（v223）與免費源 binance_perp.get_oi:185
+        #   (`if len(series) >= 2 and series[0]["value"]`) 都已是誠實的——這裡
+        #   不改，同一個欄位在兩個來源之間語意會相反：Binance 說「不知道」、
+        #   CoinGlass 說「沒變」，而 snapshot 走哪一條全看誰活著。
+        #   下游 l2_trigger/signals.py:115 的 is_stale("oi_delta_pct") 只認 None
+        #   （types.py:122 規格），折成 0.0 會讓那條 STALE 早退整條變成死碼，
+        #   engine.py:96 進而寫下 `oi_fuel_insufficient(delta=0.00%)`＝一個沒
+        #   發生過的量測；regime_vector.py:86 的誠實死區同樣被繞過。
+        #   ⛔ 邊界：首根非 0、兩根以上、OI 剛好持平 ⇒ 仍是 0.0。0.0 是答案，
+        #      不是未知的代名詞。⛔ 變化率未知不影響 latest/series（獨立量測）。
+        delta_pct_24h = (round((latest - first) / first * 100, 3)
+                         if (len(series) >= 2 and first) else None)
         return {
             "symbol": symbol, "source": "coinglass",
             "latest": round(latest, 2),
-            "delta_pct_24h": round(delta_pct_24h, 3),
+            "delta_pct_24h": delta_pct_24h,
+            "delta_bars": len(series),      # 用幾根算的＝信心度／未知時的原因
             "series": series,
         }
 

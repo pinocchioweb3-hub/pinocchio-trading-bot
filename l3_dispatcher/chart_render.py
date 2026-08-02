@@ -707,13 +707,21 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
             oi = overlays["oi"][-n:]
             ox = range(n - len(oi), n)
             d24 = overlays.get("oi_delta_24h")
-            oi_color = OICOL if (d24 or 0) >= 0 else DOWN
+            # v224：d24 未知時，顏色不得替讀者宣稱方向。舊碼 `(d24 or 0) >= 0`
+            #   讓 None 一律染成「OI 上升」藍——在 v224 之前這條到不了（來源
+            #   coinglass.get_oi 永不回 None），把來源改誠實之後就變成可達：
+            #   :871-873 out["oi"] 與 out["oi_delta_24h"] 同一個 if 區塊設值 ⇒
+            #   面板照畫、d24 卻是 None。⇒ 未知走中性色（FG），並在文字側說出
+            #   「沒算出來」，不是靜靜不寫（讀者分不出沒算與不重要）。
+            oi_color = FG if d24 is None else (OICOL if d24 >= 0 else DOWN)
             axo.plot(list(ox), oi, color=oi_color, linewidth=1.3, zorder=3)
             axo.fill_between(list(ox), oi, min(oi), color=oi_color, alpha=0.12)
             axo.set_ylabel("OI", color=FG, fontsize=8)
             extra = []
             if d24 is not None:
                 extra.append(f"OI 24h {d24:+.1f}%")
+            else:
+                extra.append(f"OI 24h {_SC_MISSING}這輪沒算出來（曲線為實際 OI）")
             if overlays.get("funding") is not None:
                 extra.append(f"資金費率 {overlays['funding']*100:+.3f}%")
             if overlays.get("ls_ratio") is not None:
