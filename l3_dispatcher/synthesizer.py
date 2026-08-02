@@ -634,18 +634,21 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
             vp = by_tf.get("volume_price", {})
             patterns = by_tf.get("patterns", [])
             d = trend.get("direction", "?")
-            chg = trend.get("change_pct", 0)
-            line = f"- {tf}: 趨勢={d} ({chg:+.2f}%)"
+            # v217：缺 change_pct 舊碼折成 0 ⇒「趨勢=上升 (+0.00%)」＝同時宣稱有趨勢與零漲跌
+            chg = trend.get("change_pct")
+            line = f"- {tf}: 趨勢={d} ({_fmt_spec(chg, '+.2f', '%')})"
             if vp.get("interpretation"):
                 line += f"  量價={vp['interpretation']}"
             if patterns:
                 line += f"  型態={','.join(p['pattern'] for p in patterns[:2])}"
             parts.append(line)
             if sr.get("supports"):
-                sup_str = ", ".join(f"${s['price']}({s['distance_pct']}%)" for s in sr["supports"][:2])
+                sup_str = ", ".join(f"{_fmt_price(s.get('price'))}({_fmt_raw(s.get('distance_pct'), '%')})"
+                                    for s in sr["supports"][:2])
                 parts.append(f"   支撐: {sup_str}")
             if sr.get("resistances"):
-                res_str = ", ".join(f"${r['price']}({r['distance_pct']}%)" for r in sr["resistances"][:2])
+                res_str = ", ".join(f"{_fmt_price(r.get('price'))}({_fmt_raw(r.get('distance_pct'), '%')})"
+                                    for r in sr["resistances"][:2])
                 parts.append(f"   阻力: {res_str}")
 
     # 即時數據（v33：OI/資金費率/多空比 一律以下方「CoinGlass 數據佐證」為唯一來源，
@@ -658,20 +661,31 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                   for k in ("cvd", "oi", "funding", "ls_ratio"))
     if snap and not snap.get("error"):
         parts.append(f"\n## 即時數據")
-        parts.append(f"- 現價 ${snap.get('price')}")
+        parts.append(f"- 現價 {_fmt_price(snap.get('price'))}")
         if not _has_cg:   # 無 CoinGlass 真值時用快照的 OI/funding/多空比（Binance/OKX 備援）
-            parts.append(f"- OI: ${snap.get('oi', 0):,.0f}  24h 變化 {snap.get('oi_delta_pct', 0):+.2f}%（備援源）")
-            funding = snap.get("funding", 0)
-            if funding is not None:
-                parts.append(f"- Funding: {_fmt_funding(funding)}/8h（備援源）")
+            # v217：舊碼 `.get('oi', 0)` 把「這輪沒回來」寫成「OI: $0」＝永續合約不可能的斷言；
+            #       而 present-but-None 會直接 TypeError 讓整份 deepdive prompt 生不出來。
+            parts.append(f"- OI: {_fmt_usd(snap.get('oi'), 1, ',.0f', '')}  "
+                         f"24h 變化 {_fmt_spec(snap.get('oi_delta_pct'), '+.2f', '%')}（備援源）")
+            # v217：預設值拿掉——缺鍵舊碼折成 0 ⇒「≈0.0000%」＝宣稱資費中性。
+            #       _fmt_funding 本來就把 None 印成 n/a（沿用 :677 v178 的判斷：
+            #       印 n/a 比整行消失誠實，LLM 才看得見這裡是缺料而非中性）。
+            _fd = snap.get("funding")
+            parts.append(f"- Funding: {_fmt_funding(_fd)}/8h（備援源）" if _fd is not None
+                         else "- Funding: n/a（備援源這輪讀不出來，不等於資費為 0）")
             parts.append(f"- 大戶持倉比: {snap.get('top_trader_ratio')}  vs 散戶: {snap.get('ls_ratio')}（備援源）")
             if snap.get("cvd_slope") is not None:
                 _cs = snap["cvd_slope"]
                 parts.append(f"- CVD 24h 淨流（taker 買-賣量,Binance 備援·忠實閘 r=0.93）: "
                              f"{_cs:+,.0f}（{'買方主動' if _cs > 0 else '賣方主動' if _cs < 0 else '平衡'}）")
         _ll, _ls2 = snap.get("liq_long"), snap.get("liq_short")
-        if _ll or _ls2:
-            parts.append(f"- 24h 清算: 多 ${(_ll or 0)/1e6:.2f}M  空 ${(_ls2 or 0)/1e6:.2f}M")
+        # v217：兩處分開修。①舊 `if _ll or _ls2` 把「來源明講兩邊都是 0」判成缺料
+        #       （答案被折成未知，本物種的反方向）；改看 is not None。
+        #       ②舊 `(_ll or 0)` 在單邊未知時印「空 $0.00M」＝宣稱那一邊沒有清算，
+        #       LLM 會把它讀成方向性資訊。
+        if _ll is not None or _ls2 is not None:
+            parts.append(f"- 24h 清算: 多 {_fmt_usd(_ll, 1e6, '.2f', 'M')}  "
+                         f"空 {_fmt_usd(_ls2, 1e6, '.2f', 'M')}")
         else:
             # v178：源停權時印 n/a——「$0.00M」是誤導性零值（看起來像量測到零）
             parts.append("- 24h 清算: n/a（清算數據源停權中）")
@@ -689,15 +703,15 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
             slope = cg.get("cvd_slope")
             trend = ("上升=買方主動吸籌" if (slope or 0) > 0
                      else "下降=賣方主動派發" if (slope or 0) < 0 else "走平")
-            parts.append(f"- CVD（累積成交量差）：最新 {cvd[-1]:,.0f}，"
+            parts.append(f"- CVD（累積成交量差）：最新 {_fmt_spec(cvd[-1], ',.0f')}，"
                          f"近 24h 斜率 {slope if slope is not None else 'n/a'}（{trend}）")
         oi = cg.get("oi") or []
         if oi:
             d24 = cg.get("oi_delta_24h")
             oi_trend = ("增倉" if (d24 or 0) > 0 else "減倉" if (d24 or 0) < 0 else "持平")
-            parts.append(f"- OI（未平倉合約）：最新 ${oi[-1]:,.0f}，"
+            parts.append(f"- OI（未平倉合約）：最新 {_fmt_usd(oi[-1], 1, ',.0f', '')}，"
                          f"24h {d24:+.2f}%（{oi_trend}）" if d24 is not None
-                         else f"- OI：最新 ${oi[-1]:,.0f}")
+                         else f"- OI：最新 {_fmt_usd(oi[-1], 1, ',.0f', '')}")
         if cg.get("funding") is not None:
             f = cg["funding"]
             ftone = ("過熱偏多（軋空風險）" if f > 0.0005 else
@@ -715,10 +729,19 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
         # v33 新增佐證：清算 / 期現基差 / 結構評分 / 情緒
         liq = cg.get("liq_24h") or {}
         if liq:
-            lo, sh = liq.get("long", 0) / 1e6, liq.get("short", 0) / 1e6
-            fuel = ("空頭被清算較多→軋空燃料" if sh > lo * 1.3 else
-                    "多頭被清算較多→下殺燃料" if lo > sh * 1.3 else "多空清算均衡")
-            parts.append(f"- 近24h 清算：多 {lo:.2f}M／空 {sh:.2f}M USD（{fuel}）")
+            # v217：本物種第一次不只是數字被折，而是**由折出來的 0 推出一個方向性結論**。
+            # 舊碼 `liq.get("long", 0)` 缺一邊就當 0，於是「空邊讀不出來」被推成
+            # 「多頭被清算較多→下殺燃料」——一句 LLM 會照抄進交易計畫的看空理由。
+            # 兩邊都有值才判燃料方向；缺任一邊就明說判不了。
+            lo_raw, sh_raw = liq.get("long"), liq.get("short")
+            if lo_raw is not None and sh_raw is not None:
+                lo, sh = lo_raw / 1e6, sh_raw / 1e6
+                fuel = ("空頭被清算較多→軋空燃料" if sh > lo * 1.3 else
+                        "多頭被清算較多→下殺燃料" if lo > sh * 1.3 else "多空清算均衡")
+            else:
+                fuel = "多空對比判不了（有一邊這輪讀不出來）"
+            parts.append(f"- 近24h 清算：多 {_fmt_spec(None if lo_raw is None else lo_raw / 1e6, '.2f', 'M')}"
+                         f"／空 {_fmt_spec(None if sh_raw is None else sh_raw / 1e6, '.2f', 'M')} USD（{fuel}）")
         clusters = cg.get("liq_clusters") or []   # M1
         if clusters:
             parts.append("- 清算密集價帶（估計分佈，非真實掛單／非熱力圖，流動性磁吸參考）：")
@@ -726,8 +749,10 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                 dom = {"long": "多單清算為主→下方磁吸/支撐曾被洗",
                        "short": "空單清算為主→上方磁吸/軋空帶",
                        "balanced": "多空均衡"}.get(cl["dominant"], "")
-                parts.append(f"  · ${cl['low']:.4g}–${cl['high']:.4g}："
-                             f"${cl['total']/1e6:.1f}M（{dom}）")
+                _tot = cl.get("total")
+                parts.append(f"  · {_fmt_usd(cl.get('low'), 1, '.4g', '')}–"
+                             f"{_fmt_usd(cl.get('high'), 1, '.4g', '')}："
+                             f"{_fmt_usd(_tot, 1e6, '.1f', 'M')}（{dom}）")
         basis = cg.get("basis") or {}
         if basis.get("pct") is not None:
             parts.append(f"- 期現基差：{basis['pct']:+.3f}%"
@@ -773,16 +798,21 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                          if w.get("symbol") == symbol), None)
         if sym_whale:
             parts.append(f"\n## Hyperliquid 鯨魚 ({symbol})")
-            parts.append(f"- 淨多倉位百分比: {sym_whale['net_long_pct']:+.0f}%")
-            parts.append(f"- 多倉 ${sym_whale['long_usd']/1e6:.1f}M  空倉 ${sym_whale['short_usd']/1e6:.1f}M")
+            # v217：這三個是直接下標＋無守門格式化——任一為 None 就 TypeError，
+            #       整份 per-symbol deepdive prompt 生不出來（漏報換成停播）。
+            parts.append(f"- 淨多倉位百分比: {_fmt_spec(sym_whale.get('net_long_pct'), '+.0f', '%')}")
+            parts.append(f"- 多倉 {_fmt_usd(sym_whale.get('long_usd'), 1e6, '.1f', 'M')}  "
+                         f"空倉 {_fmt_usd(sym_whale.get('short_usd'), 1e6, '.1f', 'M')}")
 
     # ETF (僅 BTC/ETH)
     if symbol in ("BTC", "ETH"):
         etf = sym_state.get(f"etf_{symbol.lower()}", {})
         if etf and not etf.get("error"):
             parts.append(f"\n## {symbol} ETF 流向")
-            parts.append(f"- 7d 累計: ${etf.get('cumulative_7d_flow_usd', 0)/1e6:+.1f}M")
-            parts.append(f"- 24h: ${etf.get('latest_24h_flow_usd', 0)/1e6:+.1f}M")
+            # v217：與 v216 在 Daily Macro 治的是同一句話、不同呼叫端——
+            #       缺鍵折成「$+0.0M」＝對 LLM 宣稱「機構這週零進出」。
+            parts.append(f"- 7d 累計: {_fmt_usd(etf.get('cumulative_7d_flow_usd'), 1e6, '+.1f', 'M')}")
+            parts.append(f"- 24h: {_fmt_usd(etf.get('latest_24h_flow_usd'), 1e6, '+.1f', 'M')}")
 
     # === SMC 量化結構（joshyattridge/smartmoneyconcepts 套件）===
     smc_data = sym_state.get("smc_levels", {})
@@ -791,14 +821,17 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
         for tf, levels in [("4h", smc_data.get("4h", {})), ("1d", smc_data.get("1d", {}))]:
             if levels.get("error"):
                 continue
-            parts.append(f"\n### {tf} 時框 (現價 ${levels.get('current_price')}, {levels.get('candle_count')} 根)")
+            parts.append(f"\n### {tf} 時框 (現價 {_fmt_price(levels.get('current_price'))}, "
+                         f"{_fmt_raw(levels.get('candle_count'))} 根)")
 
             # Swing 點
             swings = levels.get("swing_points", [])
             if swings:
                 parts.append(f"**Swing 點（最近 {len(swings)} 個）**：")
                 for sp in swings:
-                    parts.append(f"  - {sp['type']} @ ${sp['level']} ({sp['distance_pct']:+.2f}%, {sp['ago_bars']} 根前)")
+                    parts.append(f"  - {sp.get('type')} @ {_fmt_price(sp.get('level'))} "
+                                 f"({_fmt_spec(sp.get('distance_pct'), '+.2f', '%')}, "
+                                 f"{_fmt_raw(sp.get('ago_bars'))} 根前)")
 
             # Order Blocks（H3：只取未緩解、依強度排序，與圖一致；L_b：附強度）
             obs_all = levels.get("order_blocks", [])
@@ -809,9 +842,13 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                 parts.append(f"**Order Block（未緩解 {len(obs)} 個，與圖一致"
                              + (f"；另 {_drop} 個已 mitigated 略過" if _drop else "") + "）**：")
                 for ob in obs:
-                    parts.append(f"  - {ob['type']} OB: ${ob['bottom']:.2f} – ${ob['top']:.2f} "
-                               f"({ob['mid_distance_pct']:+.2f}%, {ob['ago_bars']} 根前, "
-                               f"強度 {ob.get('strength', 0):.0f}/100)")
+                    # v217：`strength` 缺鍵舊碼折成 0 ⇒「強度 0/100」＝宣稱這個 OB 毫無強度，
+                    #       而它同時是上面排序用的鍵；其餘四個是無守門格式化＝整份 prompt 停播點。
+                    parts.append(f"  - {ob.get('type')} OB: {_fmt_usd(ob.get('bottom'), 1, '.2f', '')} – "
+                               f"{_fmt_usd(ob.get('top'), 1, '.2f', '')} "
+                               f"({_fmt_spec(ob.get('mid_distance_pct'), '+.2f', '%')}, "
+                               f"{_fmt_raw(ob.get('ago_bars'))} 根前, "
+                               f"強度 {_fmt_spec(ob.get('strength'), '.0f', '/100')})")
 
             # FVG（H3：只取位移達標的，與圖表 0.45×ATR 過濾一致）
             fvgs_all = levels.get("fvg", [])
@@ -821,16 +858,18 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                 parts.append("**FVG (Fair Value Gap，已過位移過濾"
                              + (f"；另 {_drop} 個位移不足略過" if _drop else "") + ")**：")
                 for f in fvgs:
-                    parts.append(f"  - {f['type']} FVG: ${f['bottom']:.2f} – ${f['top']:.2f} "
-                               f"({f['mid_distance_pct']:+.2f}%, {f['ago_bars']} 根前)")
+                    parts.append(f"  - {f.get('type')} FVG: {_fmt_usd(f.get('bottom'), 1, '.2f', '')} – "
+                               f"{_fmt_usd(f.get('top'), 1, '.2f', '')} "
+                               f"({_fmt_spec(f.get('mid_distance_pct'), '+.2f', '%')}, "
+                               f"{_fmt_raw(f.get('ago_bars'))} 根前)")
 
             # BoS / CHoCH（M4：附 OI 確認真偽）
             bcs = levels.get("bos_choch", [])
             if bcs:
                 parts.append(f"**結構變化（BoS / CHoCH）**：")
                 for bc in bcs:
-                    line = (f"  - {bc['type']} {bc['direction']} @ ${bc['level']} "
-                            f"({bc['ago_bars']} 根前)")
+                    line = (f"  - {bc.get('type')} {bc.get('direction')} @ {_fmt_price(bc.get('level'))} "
+                            f"({_fmt_raw(bc.get('ago_bars'))} 根前)")
                     if bc.get("oi_confirm"):
                         line += f"｜OI：{bc['oi_confirm']}"
                     parts.append(line)
@@ -842,15 +881,19 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                         "discount": "折價區（偏找多、不追空）",
                         "equilibrium": "均衡區（中性）"}
                 parts.append(f"**溢價/折價（{tf}）**：現價位於 {zmap.get(pd['zone'], pd['zone'])}"
-                             f"，區間 ${pd['swing_low']:.4g}–${pd['swing_high']:.4g}"
-                             f"，均衡線 ${pd['equilibrium']:.4g}，位置 {pd['price_position']:.0%}")
+                             f"，區間 {_fmt_usd(pd.get('swing_low'), 1, '.4g', '')}–"
+                             f"{_fmt_usd(pd.get('swing_high'), 1, '.4g', '')}"
+                             f"，均衡線 {_fmt_usd(pd.get('equilibrium'), 1, '.4g', '')}"
+                             f"，位置 {_fmt_spec(pd.get('price_position'), '.0%')}")
                 ote = levels.get("ote") or {}
                 lo, sh = ote.get("long") or {}, ote.get("short") or {}
                 if lo and sh:
                     parts.append(
-                        f"  - OTE 多方甜蜜帶 ${lo['low']:.4g}–${lo['high']:.4g}"
+                        f"  - OTE 多方甜蜜帶 {_fmt_usd(lo.get('low'), 1, '.4g', '')}–"
+                        f"{_fmt_usd(lo.get('high'), 1, '.4g', '')}"
                         f"{'（現價在此✓）' if lo.get('in_zone') else ''}；"
-                        f"OTE 空方甜蜜帶 ${sh['low']:.4g}–${sh['high']:.4g}"
+                        f"OTE 空方甜蜜帶 {_fmt_usd(sh.get('low'), 1, '.4g', '')}–"
+                        f"{_fmt_usd(sh.get('high'), 1, '.4g', '')}"
                         f"{'（現價在此✓）' if sh.get('in_zone') else ''}")
 
             # H2：流動性掃單（Spring/UTAD，最有 alpha 的反轉前置）+ M4 OI 確認
@@ -860,7 +903,8 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                 for sw in sweeps:
                     tag = ("▲ 下方掃單(Spring，偏多反轉)" if sw["dir"] == "up"
                            else "▼ 上方掃單(UTAD，偏空反轉)")
-                    line = f"  - {tag} @ ${sw['level']:.4g}（{sw['ago_bars']} 根前）"
+                    line = (f"  - {tag} @ {_fmt_usd(sw.get('level'), 1, '.4g', '')}"
+                            f"（{_fmt_raw(sw.get('ago_bars'))} 根前）")
                     if sw.get("oi_confirm"):
                         line += f"｜OI：{sw['oi_confirm']}"
                     parts.append(line)
@@ -870,8 +914,9 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
             if liqs:
                 parts.append(f"**流動性區域（stop hunt 目標）**：")
                 for l in liqs:
-                    parts.append(f"  - {l['type']} @ ${l['level']} "
-                               f"({l['distance_pct']:+.2f}%, {l['ago_bars']} 根前)")
+                    parts.append(f"  - {l.get('type')} @ {_fmt_price(l.get('level'))} "
+                               f"({_fmt_spec(l.get('distance_pct'), '+.2f', '%')}, "
+                               f"{_fmt_raw(l.get('ago_bars'))} 根前)")
 
     return "\n".join(parts)
 
