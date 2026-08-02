@@ -439,18 +439,57 @@ def _most_recent(bc_list: list | None) -> dict | None:
     return min(items, key=lambda b: b.get("ago_bars", 1e9))
 
 
+def _htf_input(s: dict, name: str) -> tuple:
+    """取一個 SMC 分量並分辨『答案』與『未知』，回 (value, unknown_reason|None)。
+
+    判準取自產出端 market_intel_mcp/smc_levels.py::compute_smc_levels()——它成功時
+    **一律寫鍵**（真的沒東西就寫空 list）、失敗才留 <name>_error 或整個鍵不寫：
+      鍵在  ＝ 答案（含空 list、含 equilibrium）
+      鍵不在／有 <name>_error／整個時框缺或回 error ＝ 未知（這輪沒算出來）
+    分不出這兩者，就會把「沒算出來」講成「確認沒有這個結構」（同物種第 40 次）。
+    """
+    if not isinstance(s, dict) or not s:
+        return None, "整個時框沒抓到"
+    err = s.get("error")
+    if err:
+        return None, f"時框失敗({err})"
+    if f"{name}_error" in s:
+        return None, "分量算失敗"
+    if name in s:
+        # 鍵在但值是 None ≠ 答案：compute_smc_levels 成功時寫的是 list/dict，
+        # None 只會出自呼叫端用 .get() 重組字典（如 backtest/smc_walkforward.py），
+        # 那正是「上游沒算出來」被抹平成鍵存在的形狀 → 仍判未知。
+        return (s[name], None) if s[name] is not None else (None, "分量未產出")
+    return None, "分量未產出"
+
+
 def _compute_htf_alignment(s4: dict, s1d: dict) -> dict:
     """M2：HTF(1d)→LTF(4h) 對齊驗證。產『已對齊事實』餵 deepdive，
-    不在程式層硬否決（disclaimer #5：閘鬆緊是自由參數，須 OOS 回測校準才可收緊）。"""
+    不在程式層硬否決（disclaimer #5：閘鬆緊是自由參數，須 OOS 回測校準才可收緊）。
+
+    ⛔ note 會被 synthesizer 原文放進餵給 LLM 的 prompt 標題，且 verdict 會進復盤
+    紀錄（macro.py::_review_context 的 htf_verdict_1d4h）——所以「這輪沒算出來」
+    絕不可寫成「無 1d 結構」「位於均衡區」這類肯定句。算過而確實沒有仍然是答案，
+    照舊保持原措辭、不加缺料標記（否則盤面乾淨的標的天天誤報）。
+    """
     out = {"ltf_signal": None, "htf_trend": None, "price_1d_zone": None,
            "direction_aligned": None, "location_favorable": None,
-           "verdict": "unknown", "note": ""}
-    ltf = _most_recent(s4.get("bos_choch"))
-    htf = _most_recent(s1d.get("bos_choch"))
+           "verdict": "unknown", "note": "", "unknown_inputs": []}
+    ltf_list, u_ltf = _htf_input(s4, "bos_choch")
+    htf_list, u_htf = _htf_input(s1d, "bos_choch")
+    pd1d, u_zone = _htf_input(s1d, "premium_discount")
+    if u_zone is None and not (isinstance(pd1d, dict) and pd1d.get("zone")):
+        # 分量鍵在但沒有 zone：當未知處理（正常算成功一定寫 zone）
+        u_zone, pd1d = "區位未產出", {}
+    ltf = _most_recent(ltf_list)
+    htf = _most_recent(htf_list)
     out["ltf_signal"] = ltf.get("direction") if ltf else None
     out["htf_trend"] = htf.get("direction") if htf else None
-    pd1d = s1d.get("premium_discount") or {}
+    pd1d = pd1d if isinstance(pd1d, dict) else {}
     out["price_1d_zone"] = pd1d.get("zone")
+    for _lbl, _u in (("4h 結構", u_ltf), ("1d 趨勢", u_htf), ("1d 折價/溢價區位", u_zone)):
+        if _u:
+            out["unknown_inputs"].append(f"{_lbl}（{_u}）")
 
     if out["ltf_signal"] and out["htf_trend"]:
         out["direction_aligned"] = (out["ltf_signal"] == out["htf_trend"])
@@ -473,20 +512,39 @@ def _compute_htf_alignment(s4: dict, s1d: dict) -> dict:
         out["verdict"] = "partial"   # 含一個 False，或單邊 True 另一邊 None
 
     if out["verdict"] == "partial":
-        # 精準文案：區分「其一不利」與「其一資料不足」，不誇大成兩者皆有利
+        # 精準文案：區分「其一不利」「其一算過就是沒有」「其一這輪沒算出來」三者，
+        # 不誇大成兩者皆有利，也不把未知講成肯定的均衡區／沒有結構
         if da is True and lf is None:
-            out["note"] = ("⚠️ HTF 部分對齊：方向順勢一致，但 1d 位於均衡區/區位資料不足，"
-                           "未確認折價-溢價有利位置 → 順勢偏置成立但勿放大倉位，等更佳位置")
+            if u_zone:
+                out["note"] = (f"⚠️ HTF 部分對齊：方向順勢一致，但 1d 折價-溢價區位**這輪沒算出來**"
+                               f"（{u_zone}）＝未知，⛔ 不等於均衡區、也不等於位置不利 → "
+                               "位置這一票視同棄權，勿放大倉位")
+            else:
+                out["note"] = ("⚠️ HTF 部分對齊：方向順勢一致，但 1d 位於均衡區，"
+                               "未確認折價-溢價有利位置 → 順勢偏置成立但勿放大倉位，等更佳位置")
         elif lf is True and da is None:
-            out["note"] = ("⚠️ HTF 部分對齊：1d 區位有利，但 1d 趨勢方向未確立（無 1d 結構）"
-                           " → 需 4h 自身結構與獨立數據佐證，勿單據區位進場")
+            if u_htf:
+                out["note"] = (f"⚠️ HTF 部分對齊：1d 區位有利，但 1d 趨勢方向**這輪沒算出來**"
+                               f"（{u_htf}）＝未知，⛔ 不可讀成「1d 沒有結構」或「1d 無趨勢」"
+                               " → 需 4h 自身結構與獨立數據佐證，勿單據區位進場")
+            else:
+                out["note"] = ("⚠️ HTF 部分對齊：1d 區位有利，但 1d 趨勢方向未確立（無 1d 結構）"
+                               " → 需 4h 自身結構與獨立數據佐證，勿單據區位進場")
         else:
             out["note"] = ("⚠️ HTF 部分對齊：方向或進場位置其一不利，"
                            "需謹慎、縮小倉位、等更佳位置")
+    elif out["verdict"] == "unknown":
+        if out["unknown_inputs"]:
+            # ⛔ 只在真的有 *_error／缺鍵／缺時框時才喊缺料，且照實說是哪一邊
+            out["note"] = ("ℹ️ HTF 對齊未知：" + "、".join(out["unknown_inputs"])
+                           + " 這輪沒算出來，無法判定 ⛔ 未知≠沒有結構／沒有偏置，"
+                             "不可當作「HTF 沒意見」而放大倉位")
+        else:
+            out["note"] = ("ℹ️ HTF 對齊未知：4h/1d 都算過了，但沒有可用的結構事件或區位"
+                           "（算出來就是沒有），無法判定")
     else:
         _v = {"aligned": "✅ HTF 對齊：1d 趨勢與 4h 訊號一致且位置有利，順勢進場條件較佔優（傾向，非勝率保證）",
-              "conflict": "⛔ HTF 衝突：4h 訊號與 1d 趨勢/位置相悖（接刀風險），除非有強力獨立確認否則應降權或觀望",
-              "unknown": "ℹ️ HTF 對齊未知：1d 結構或區位資料不足，無法判定"}
+              "conflict": "⛔ HTF 衝突：4h 訊號與 1d 趨勢/位置相悖（接刀風險），除非有強力獨立確認否則應降權或觀望"}
         out["note"] = _v.get(out["verdict"], "")
     return out
 

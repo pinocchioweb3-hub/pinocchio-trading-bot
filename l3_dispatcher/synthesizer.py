@@ -638,6 +638,13 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
 
     # M2：多時框對齊驗證（HTF 1d → LTF 4h）— 高層偏置閘，deepdive 須據此調整信心
     ha = sym_state.get("htf_alignment") or {}
+    if ha.get("verdict") == "unknown" and ha.get("unknown_inputs"):
+        # 未知且**真的有缺料**時不可整段消失：讀者(LLM)看不到這段只會有一種解讀
+        # 「多時框沒問題／HTF 沒意見」，而它其實是「這一輪沒算出來」。
+        # ⛔ 未知但無缺料（算過就是沒有結構/區位）照舊保持安靜，不然天天誤報。
+        parts.append("## 🎯 多時框對齊（HTF 1d → LTF 4h）：" + ha.get("note", "")
+                     + "\n（⛔ 這是**缺料**不是「沒有訊號」：不可據此認定 HTF 無阻力，"
+                       "本輪請勿把多時框對齊當成已通過的條件。）\n")
     if ha.get("verdict") and ha["verdict"] != "unknown":
         parts.append(f"## 🎯 多時框對齊（HTF 1d → LTF 4h）：{ha['note']}")
         seg = []
