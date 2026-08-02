@@ -160,8 +160,42 @@ def init_db() -> None:
         conn.close()
 
 
-async def fetch_market_snapshot() -> dict[str, dict]:
-    """3 次請求 → {base_symbol: {last, vol24h_usd, oi_usd, funding, chg24h_pct}}"""
+def _okx_rows(resp) -> list | None:
+    """OKX 回應 → 資料列，或 None ＝『這輪讀不出來』（未知，非答案）。
+
+    純函式、零網路、可離線測試。分離「未知」與「答案」的唯一判準：
+      None（未知）：HTTP 非 200／JSON 解不開（HTML 錯誤頁）／OKX 業務碼非 '0'
+                    ／缺 data 鍵／data 不是 list／body 不是 dict。
+      list（答案）：正常回應的資料列。
+
+    ⛔ 邊界線（與 v208/v210/v212/v213 一致）：{"code":"0","data":[]} 是
+    **交易所確認沒有**＝答案，不可為保險打成未知——否則正常的空回應每輪都會
+    變成缺料告警＝慢性假警報。
+    """
+    try:
+        if getattr(resp, "status_code", None) != 200:
+            return None
+        body = resp.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    code = body.get("code")
+    if code is not None and str(code) != "0":
+        return None
+    rows = body.get("data")
+    if not isinstance(rows, list):
+        return None
+    return rows
+
+
+async def fetch_market_snapshot_ex() -> tuple[dict[str, dict], dict]:
+    """3 次請求 → ({base_symbol: {...}}, gaps)。
+
+    gaps 講明這一輪**哪一支讀不出來**（未知），而不是把限流/錯誤 body 折成
+    「交易所回答：沒有資料」。呼叫端據此決定要不要把衍生數字打成未知
+    （見 compute_breadth 的 avg_funding／n_overheat）。
+    """
     async with httpx.AsyncClient(timeout=25) as c:
         await ensure_crypto_allowset(c)
         r1, r2, r3 = await asyncio.gather(
@@ -169,9 +203,28 @@ async def fetch_market_snapshot() -> dict[str, dict]:
             c.get(f"{OKX}/api/v5/public/open-interest", params={"instType": "SWAP"}),
             c.get(f"{OKX}/api/v5/public/funding-rate", params={"instId": "ANY"}),
         )
-    tickers = r1.json().get("data", [])
-    ois = {d["instId"]: d for d in r2.json().get("data", [])}
-    fundings = {d["instId"]: d for d in r3.json().get("data", [])}
+    t_rows = _okx_rows(r1)
+    oi_rows = _okx_rows(r2)
+    fr_rows = _okx_rows(r3)
+    gaps = {
+        "tickers_unreadable": t_rows is None,
+        "oi_unreadable": oi_rows is None,
+        "funding_unreadable": fr_rows is None,
+    }
+    tickers = t_rows or []
+    ois = {d["instId"]: d for d in (oi_rows or []) if isinstance(d, dict) and d.get("instId")}
+    fundings = {d["instId"]: d for d in (fr_rows or []) if isinstance(d, dict) and d.get("instId")}
+
+    # no silent cap（紅線③）：讀不出來要留痕，不得與「交易所確認沒有」同形
+    if gaps["tickers_unreadable"]:
+        print("[scanner] tickers 這輪讀不出來（限流/錯誤回應）→ 本輪空快照、整輪跳過"
+              "（⛔ 不等於全市場零檔）")
+    if gaps["oi_unreadable"]:
+        print("[scanner] open-interest 這輪讀不出來 → 本輪 OI 全記未知(NULL)，"
+              "OI 突變偵測本輪與下一小時基準皆不成立（漏報方向，不產生錯誤斷言）")
+    if gaps["funding_unreadable"]:
+        print("[scanner] funding-rate 這輪讀不出來 → 均資費/過熱檔數記未知(NULL)，"
+              "不折成 0")
 
     allow = _CRYPTO_INSTIDS
     n_noncrypto = 0
@@ -206,6 +259,15 @@ async def fetch_market_snapshot() -> dict[str, dict]:
     elif n_noncrypto:
         print(f"[scanner] 來源濾除 {n_noncrypto} 檔非加密永續"
               f"（代幣化美股/商品 instCategory!=1），純加密 {len(out)} 檔")
+    return out, gaps
+
+
+async def fetch_market_snapshot() -> dict[str, dict]:
+    """3 次請求 → {base_symbol: {last, vol24h_usd, oi_usd, funding, chg24h_pct}}
+
+    舊介面（只要快照本身的呼叫端用；要知道缺料請改用 fetch_market_snapshot_ex）。
+    """
+    out, _gaps = await fetch_market_snapshot_ex()
     return out
 
 
@@ -317,14 +379,22 @@ def compute_breadth(snap: dict[str, dict], past_1h: dict[str, tuple],
                 up1h += 1
             elif r < -1:
                 dn1h += 1
-    overheat = sum(1 for d in liquid.values() if (d["funding"] or 0) >= 0.001)
     oversold = sum(1 for d in liquid.values() if (d["chg24h_pct"] or 0) < -8)
     fundings = [d["funding"] for d in liquid.values() if d["funding"] is not None]
-    avg_f = sum(fundings) / len(fundings) if fundings else 0.0
+    # 「一筆可讀資費都沒有」＝未知，不是「均資費 0.000%／過熱 0 檔」。折成 0 會被
+    # 印給使用者當確定數字、被 macro_confluence 當在線分量計分（並擋掉 BTC funding
+    # 備援）、被 postmortem 寫進復盤資料集。可讀資費 ≥1 筆時，逐項與舊碼相同。
+    if fundings:
+        avg_f = round(sum(fundings) / len(fundings), 6)
+        overheat = sum(1 for d in liquid.values()
+                       if d["funding"] is not None and d["funding"] >= 0.001)
+    else:
+        avg_f = None
+        overheat = None
 
     b = {"ts": now, "n_total": len(liquid), "n_up24h": up24, "n_down24h": dn24,
          "n_up1h": up1h, "n_down1h": dn1h, "n_overheat": overheat,
-         "n_oversold": oversold, "avg_funding": round(avg_f, 6),
+         "n_oversold": oversold, "avg_funding": avg_f,
          "n_scanned": len(snap)}   # 全市場原始掃描檔數（n_total 是其中達 $10M 流動性的子集）
     conn = _conn()
     try:
@@ -377,11 +447,15 @@ def render_breadth_line(b: dict | None) -> str:
         return "🌐 市場廣度：累積數據中…"
     bias = "🟢 偏多" if b["n_up24h"] > b["n_down24h"] * 1.5 else (
            "🔴 偏空" if b["n_down24h"] > b["n_up24h"] * 1.5 else "⚪ 中性")
+    # 資費未知（該輪 funding-rate 讀不出來）→ 講明，不得印成 +0.000%（＝把未知
+    # 講成「全市場資費中性」這個確定判斷）
+    af = b.get("avg_funding")
+    f_txt = (f"均資費 <code>{af*100:+.3f}%</code>" if isinstance(af, (int, float))
+             else "均資費 <code>n/a</code>（本輪資費讀不出來）")
     return (f"🌐 市場廣度（{b['n_total']} 檔）：{bias}　"
             f"24h ↑<code>{b['n_up24h']}</code>/↓<code>{b['n_down24h']}</code>　"
             f"1h ↑<code>{b['n_up1h']}</code>/↓<code>{b['n_down1h']}</code>　"
-            f"超跌 <code>{b['n_oversold']}</code>　"
-            f"均資費 <code>{b['avg_funding']*100:+.3f}%</code>")
+            f"超跌 <code>{b['n_oversold']}</code>　" + f_txt)
 
 
 def _render_alert(a: dict) -> str:
@@ -425,7 +499,7 @@ async def run_market_scanner_loop(tg, interval_seconds: int = 300):
     while True:
         try:
             now = int(time.time()) // 60 * 60
-            snap = await fetch_market_snapshot()
+            snap, _gaps = await fetch_market_snapshot_ex()   # 缺料已於 fetch 內留痕
             if snap:
                 _save_snapshot(now, snap)
                 past_1h = _get_past_snapshot(now, 60)
