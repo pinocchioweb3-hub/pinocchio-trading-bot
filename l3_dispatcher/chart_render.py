@@ -62,6 +62,14 @@ _SMC_CHART_COMPONENTS = [
     ("fvg", "FVG"),
 ]
 
+# v222：佐證框裡「這輪沒算出來」的字樣。純中文＋全形括號，Microsoft JhengHei 有字。
+_SC_MISSING = "〔缺料〕"
+
+# CoinGlass get_structure 的 7 個分量（上游逐格填、缺的留 None）。逐格判斷用。
+_ST_FIELDS = ("atr_pct_7d", "vol_24h_vs_30d", "cvd_slope_7d",
+              "top_trader_slope_7d", "oi_delta_7d_pct",
+              "higher_lows_7d", "above_4h_200ma")
+
 
 def _smc_unknown_note(smc: dict | None) -> str | None:
     """回傳圖上該標的缺料字樣；全部算過（含算出空的）回 None＝圖上保持安靜。"""
@@ -346,26 +354,44 @@ def _prune_old():
 
 
 def _structure_scorecard_lines(overlays: dict) -> list[str]:
-    """v33：把 CoinGlass 結構評分卡 + 基差 + 情緒組成圖上佐證框文字。無資料回空。"""
+    """v33：把 CoinGlass 結構評分卡 + 基差 + 情緒組成圖上佐證框文字。無資料回空。
+
+    v222：分量「這輪沒算出來」不得折成數字 0。上游
+    market_intel_mcp/sources/coinglass.py::get_structure 是**逐分量誠實**的——:1194
+    先把 7 欄全設 None，再由 4 條獨立子請求（price／oi／positioning／cvd）各自填得
+    出來的那幾格；任一條掛掉、或 bars 不足門檻（vols<30 → 量比留 None、tseries<6 →
+    大戶斜率留 None、<200 根 4h → above_4h_200ma 留 None）該格就是 None。**部分缺格
+    是常態不是邊角。** 舊碼 `(st.get(k) or 0):.2f` 把缺格寫成「量比 0.00」「大戶斜率
+    +0.00」——那不是中性佔位符，而是兩個**有意義的讀數**（量塌到零／大戶一動也沒動），
+    看圖的人分不出是量出來的還是沒量到。
+    ⛔ 邊界：真的算出 0.0 仍照印（0.0 是答案，不是未知的代名詞）；整份 structure 一格
+       都沒有則整個框不畫（維持 v183——框不出現不對盤面做任何斷言，而畫一個全是
+       〔缺料〕的框＝天天噪音）。
+    ⛔ 字面只用 Microsoft JhengHei 有的字：本輪實測 U+2713（✓）在該字型缺字，舊碼
+       「墊高低點✓」長年被畫成空心豆腐方塊 ⇒ 讀者根本分不出那個記號是「是」還是壞字。
+    """
     lines: list[str] = []
     st = overlays.get("structure") or {}
-    if st:
+    sv = {k: st.get(k) for k in _ST_FIELDS}
+    if any(v is not None for v in sv.values()):
         lines.append("◆ 結構評分（7d）")
-        if st.get("atr_pct_7d") is not None:
-            lines.append(f"  ATR% {st['atr_pct_7d']:.1f}　量比 "
-                         f"{(st.get('vol_24h_vs_30d') or 0):.2f}")
-        cvs = st.get("cvd_slope_7d")
-        tts = st.get("top_trader_slope_7d")
+        atr, volr = sv["atr_pct_7d"], sv["vol_24h_vs_30d"]
+        if atr is not None or volr is not None:
+            lines.append(f"  ATR% {f'{atr:.1f}' if atr is not None else _SC_MISSING}"
+                         f"　量比 {f'{volr:.2f}' if volr is not None else _SC_MISSING}")
+        cvs, tts = sv["cvd_slope_7d"], sv["top_trader_slope_7d"]
         if cvs is not None or tts is not None:
-            lines.append(f"  CVD斜率 {(cvs or 0):+.2f}　大戶斜率 {(tts or 0):+.2f}")
-        oid = st.get("oi_delta_7d_pct")
+            lines.append(
+                f"  CVD斜率 {f'{cvs:+.2f}' if cvs is not None else _SC_MISSING}"
+                f"　大戶斜率 {f'{tts:+.2f}' if tts is not None else _SC_MISSING}")
+        oid = sv["oi_delta_7d_pct"]
         if oid is not None:
             lines.append(f"  OI 7d {oid:+.1f}%")
         flags = []
-        if st.get("higher_lows_7d") is not None:
-            flags.append("墊高低點✓" if st["higher_lows_7d"] else "未墊高低點")
-        if st.get("above_4h_200ma") is not None:
-            flags.append("站上4h_200MA✓" if st["above_4h_200ma"] else "在4h_200MA下")
+        if sv["higher_lows_7d"] is not None:
+            flags.append("已墊高低點" if sv["higher_lows_7d"] else "未墊高低點")
+        if sv["above_4h_200ma"] is not None:
+            flags.append("已站上4h_200MA" if sv["above_4h_200ma"] else "在4h_200MA下")
         if flags:
             lines.append("  " + "　".join(flags))
     basis = overlays.get("basis") or {}
@@ -654,14 +680,24 @@ def render_smc_chart(symbol: str, candles: list[dict], smc: dict,
             cvd = overlays["cvd"]
             cx = range(n - len(cvd), n) if len(cvd) <= n else range(n)
             cvd = cvd[-n:]
-            slope = overlays.get("cvd_slope") or 0
-            cvd_color = UP if slope >= 0 else DOWN
+            # v222：斜率沒算出來時不得折成 0——`or 0` 會讓面板判「多空均衡（+0.00）」，
+            # 而那正是 SMC 真假突破的核心判讀之一。⚠️ 曲線本身是真資料（series 有值），
+            # 所以警語只能否認**斜率判讀**，不可說整個面板沒資料。
+            slope = overlays.get("cvd_slope")
+            slope_known = slope is not None
+            cvd_color = FG if not slope_known else (UP if slope >= 0 else DOWN)
             axc.plot(list(cx), cvd, color=cvd_color, linewidth=1.3, zorder=3)
             axc.fill_between(list(cx), cvd, min(cvd), color=cvd_color, alpha=0.12)
             axc.axhline(0, color=FG, linewidth=0.4, alpha=0.3)
-            trend = "買盤主導 ↑" if slope > 0.5 else "賣盤主導 ↓" if slope < -0.5 else "多空均衡"
             axc.set_ylabel("CVD", color=FG, fontsize=8)
-            axc.text(0.01, 0.92, f"CVD 主動買賣淨力：{trend}（斜率 {slope:+.2f}）",
+            if slope_known:
+                trend = ("買盤主導 ↑" if slope > 0.5
+                         else "賣盤主導 ↓" if slope < -0.5 else "多空均衡")
+                note = f"CVD 主動買賣淨力：{trend}（斜率 {slope:+.2f}）"
+            else:
+                note = ("CVD 主動買賣淨力：" + _SC_MISSING
+                        + "斜率這輪沒算出來（曲線為實際 CVD 累計，僅缺判讀）")
+            axc.text(0.01, 0.92, note,
                      transform=axc.transAxes, color=cvd_color, fontsize=8,
                      va="top", ha="left")
 
