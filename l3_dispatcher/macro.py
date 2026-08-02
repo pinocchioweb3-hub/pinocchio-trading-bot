@@ -906,6 +906,14 @@ def _deepdive_extra_context(sym: str, sym_state: dict | None) -> dict:
         # v114（Fable5 稽核）：週/月線層落快照——tf_nesting/M2 verdict 早已算好卻從未持久化
         #   （死端）；純資料重用零新請求，缺料→省略鍵＝骨架 None（紅線③誠實留空）。
         _nest = (sym_state or {}).get("tf_nesting") or {}
+        # v221（監督員 r115）：零分層＝未知，整組 nest_* 一律不落快照。
+        # build_nesting 已在源頭把未知態的 stage_code/alignment_score 改回 None（故下面
+        # 的守門本來就會省略），這裡再明寫一次是因為**這裡才是傷害發生的地方**：
+        # 這四欄是復盤引擎的 regime 分桶學習欄位，一旦寫進去就分不出「當時是盤整」
+        # 與「當時沒抓到 K 線」。⛔ 只擋 insufficient_data，算過的答案（含確實是 RANGE、
+        # 含對齊真的是 0.0）必須照舊寫入，否則等於用修補把真樣本刪掉。
+        if _nest.get("insufficient_data"):
+            _nest = {}
         if _nest.get("stage_code"):
             out["nest_stage_code"] = _nest["stage_code"]
         if _nest.get("alignment_score") is not None:

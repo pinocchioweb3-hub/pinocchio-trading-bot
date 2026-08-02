@@ -130,7 +130,11 @@ def test_extra_context_whale_net_none_skipped(monkeypatch):
 
 
 def test_extra_context_wyckoff_only(monkeypatch):
+    # v221：_read_cycle_value_zone 也要擋掉——它讀的是真實資料目錄的
+    # cycle_shadow.jsonl，本機一旦有 BTC 讀數，這條「只該有 wyckoff」的斷言就會
+    # 被線上資料污染而翻紅（非程式壞掉，是測試不密封）。
     monkeypatch.setattr(macro, "_read_macro_confluence_score", lambda: None)
+    monkeypatch.setattr(macro, "_read_cycle_value_zone", lambda _s: None)
     out = macro._deepdive_extra_context("BTC", {"wyckoff": {"phase": "markup"}})
     assert out == {"wyckoff_phase": "markup"}
 
@@ -138,6 +142,7 @@ def test_extra_context_wyckoff_only(monkeypatch):
 def test_extra_context_empty_sources(monkeypatch):
     """全缺料 → 回空 dict（assemble 不覆蓋，骨架維持 None）。"""
     monkeypatch.setattr(macro, "_read_macro_confluence_score", lambda: None)
+    monkeypatch.setattr(macro, "_read_cycle_value_zone", lambda _s: None)  # 同上，密封
     assert macro._deepdive_extra_context("BTC", None) == {}
     assert macro._deepdive_extra_context("BTC", {}) == {}
     assert macro._deepdive_extra_context("BTC", {"wyckoff": {}, "whales": {}}) == {}

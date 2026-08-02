@@ -524,13 +524,22 @@ def build_nesting(candles_by_tf: dict, tf_order: list[str] | None = None) -> dic
         })
 
     if not layers:
+        # v221（監督員 r115）：一層都沒算出來＝**未知**，不是「確認是盤整・對齊 0%」。
+        # 舊碼在這裡回 stage_code='RANGE' / alignment_score=0.0，那是一個看起來算完了
+        # 的答案：macro._deepdive_extra_context() 會原樣寫進 plan_snapshot 的
+        # nest_stage_code / nest_alignment_pct，而那兩欄是復盤引擎拿來做 regime 分桶的
+        # 學習欄位——缺料樣本會被當成一筆「盤整、各層完全不對齊」的觀測值，且復盤時
+        # 分不出來（stage_rationale 雖然誠實，但沒有任何消費端讀它）。
+        # ⛔ 邊界：這只涵蓋「零分層」。真的算出分層而結論是盤整，仍走下面的正常路徑
+        #    回 'RANGE'——把「確認是盤整」也折成未知，是把這個修補反向做壞。
         empty = {
             "layers": [], "layer_count": 0,
             "dominant_trend": "unknown", "agreement_depth": 0,
-            "divergence_tf": None, "alignment_score": 0.0,
-            "stage": STAGE_LABELS["RANGE"], "stage_code": "RANGE",
-            "stage_label": STAGE_LABELS["RANGE"],
-            "stage_rationale": "無有效分層 → 預設區間",
+            "divergence_tf": None, "alignment_score": None,
+            "stage": None, "stage_code": None,
+            "stage_label": None,
+            "stage_rationale": "無有效分層 → 未知（非盤整）",
+            "insufficient_data": True,
             "false_break": {"is_false_break": False, "confidence": 0.0,
                             "reasons": ["no_layers"], "side": None},
             "trade_side": {"side": "neutral", "rationale": "無分層資料"},
