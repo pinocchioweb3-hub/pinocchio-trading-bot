@@ -564,6 +564,37 @@ def _account_constraints_block() -> list[str]:
     ]
 
 
+# v218：SMC 分量「算不出來」與「算過、確認沒有」的判準。
+# 取自產出端 market_intel_mcp/smc_levels.py::compute_smc_levels()——它成功時**一律寫鍵**
+# （沒東西就寫空 list＝答案是「沒有」），失敗才留 `<name>_error`；而 order_blocks／
+# bos_choch／liquidity 三者包在 `if swings is not None:` 底下，上游 swing 一爆就
+# **整個鍵不寫、連 *_error 都沒有**。
+# ⇒ 判準：鍵在＝答案（含空的）；鍵不在＝這輪沒算出來。
+# ⛔ 不可把 liquidity_sweeps／ote 放進來：前者只有 4h 會被 macro.py 補寫、1d 永遠沒有，
+#    後者是 premium_discount 的衍生值——放進來會天天誤報「算不出來」。
+_SMC_COMPONENT_LABELS = [
+    ("swing_points", "Swing 點"),
+    ("order_blocks", "Order Block"),
+    ("fvg", "FVG"),
+    ("bos_choch", "結構變化(BoS/CHoCH)"),
+    ("liquidity", "流動性區域"),
+    ("premium_discount", "溢價/折價區間"),
+]
+
+
+def _smc_unknown_components(levels: dict) -> list[str]:
+    """回傳這個時框裡「這輪沒算出來」的分量標籤（空清單＝全部都算過了）。"""
+    out = []
+    for key, label in _SMC_COMPONENT_LABELS:
+        if key in levels:
+            continue                      # 鍵在就是答案，空的也是答案
+        if f"{key}_error" in levels:
+            out.append(f"{label}（{levels[f'{key}_error']}）")
+        else:
+            out.append(label)             # 連錯誤鍵都沒有＝被上游 swing 失敗連坐
+    return out
+
+
 def _format_symbol_data(symbol: str, sym_state: dict) -> str:
     """組 per-symbol deep dive 用的單一標的全資料摘要（含 SMC 量化指標 + 帳戶約束）"""
     parts = [f"# {symbol} 完整數據\n"]
@@ -818,8 +849,22 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
     smc_data = sym_state.get("smc_levels", {})
     if smc_data:
         parts.append("\n## 🔬 SMC 量化結構（4h 戰術 / 1d 戰略）")
-        for tf, levels in [("4h", smc_data.get("4h", {})), ("1d", smc_data.get("1d", {}))]:
+        for tf, levels in [("4h", smc_data.get("4h")), ("1d", smc_data.get("1d"))]:
+            # v218：這裡是「未知折成確認沒有」的落點，三種下場都在 HEAD 上實測過：
+            #   ① 該時框的鍵整個不在（macro.py:579 那根 K 線沒抓到就是這樣）⇒ 舊碼 `{}`
+            #      過得了 error 檢查 ⇒ 印出『### 1d 時框 (現價 n/a, n/a 根)』後面**一片空白**。
+            #      LLM 讀到的是「1d 戰略層零根 K 線、沒有任何結構」——一句關於盤面的斷言。
+            #   ② 該時框回 error ⇒ 舊碼 `continue` **無聲跳過**，但區塊標題仍寫著
+            #      「4h 戰術 / 1d 戰略」＝承諾了兩個時框卻只給一個，讀起來還是「1d 沒東西」。
+            # 兩者都改成明講「這輪沒有這個時框的資料」，並點名不可據此推論。
+            if not levels:
+                parts.append(f"\n### {tf} 時框：⚠️ 這輪沒有這個時框的資料（K 線沒取到）"
+                             f"——⛔ **不等於 {tf} 沒有 SMC 結構**，是這一輪沒算，"
+                             f"禁止據此推論該時框無結構或做方向判斷")
+                continue
             if levels.get("error"):
+                parts.append(f"\n### {tf} 時框：⚠️ 這輪算不出來（{levels['error']}）"
+                             f"——⛔ 同上，**不等於 {tf} 沒有 SMC 結構**，禁止據此推論")
                 continue
             parts.append(f"\n### {tf} 時框 (現價 {_fmt_price(levels.get('current_price'))}, "
                          f"{_fmt_raw(levels.get('candle_count'))} 根)")
@@ -849,6 +894,12 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                                f"({_fmt_spec(ob.get('mid_distance_pct'), '+.2f', '%')}, "
                                f"{_fmt_raw(ob.get('ago_bars'))} 根前, "
                                f"強度 {_fmt_spec(ob.get('strength'), '.0f', '/100')})")
+            elif obs_all:
+                # v218：算出 N 個但**全部已 mitigated** ⇒ 舊碼整段消失，讀起來是
+                #       「這個時框沒有 Order Block」。實際是有、只是都被吃掉了——
+                #       這兩件事對「下方還有沒有承接」的判讀完全不同。
+                parts.append(f"**Order Block**：{len(obs_all)} 個全部已 mitigated"
+                             f"（＝有 OB 但都被吃過了，不是沒有 OB）")
 
             # FVG（H3：只取位移達標的，與圖表 0.45×ATR 過濾一致）
             fvgs_all = levels.get("fvg", [])
@@ -862,6 +913,10 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                                f"{_fmt_usd(f.get('top'), 1, '.2f', '')} "
                                f"({_fmt_spec(f.get('mid_distance_pct'), '+.2f', '%')}, "
                                f"{_fmt_raw(f.get('ago_bars'))} 根前)")
+            elif fvgs_all:
+                # v218：同上——全部位移不足被濾掉 ≠ 沒有 FVG。
+                parts.append(f"**FVG**：{len(fvgs_all)} 個全部位移不足被濾掉"
+                             f"（＝有缺口但都不夠力，不是沒有缺口）")
 
             # BoS / CHoCH（M4：附 OI 確認真偽）
             bcs = levels.get("bos_choch", [])
@@ -917,6 +972,16 @@ def _format_symbol_data(symbol: str, sym_state: dict) -> str:
                     parts.append(f"  - {l.get('type')} @ {_fmt_price(l.get('level'))} "
                                f"({_fmt_spec(l.get('distance_pct'), '+.2f', '%')}, "
                                f"{_fmt_raw(l.get('ago_bars'))} 根前)")
+
+            # v218：第三種下場——**單一分量**算失敗時，該段在上面全部靜靜消失。
+            # HEAD 實測：order_blocks 算爆時整段 OB 不見（讀起來＝「沒有未緩解的 OB」＝
+            # 一句會直接影響進場/停損擺放的 SMC 斷言）；swing 一爆更是 OB／BoS／流動性
+            # 三段同時消失、連 *_error 都沒有。這裡把「沒列到」與「確認沒有」分開講。
+            _unk = _smc_unknown_components(levels)
+            if _unk:
+                parts.append(f"  ⚠️ {tf} 這輪**沒算出來**的分量：{'、'.join(_unk)}"
+                             f"——上面沒列到它們是因為沒算出來，**不是確認沒有**，"
+                             f"⛔ 不可讀成該結構不存在")
 
     return "\n".join(parts)
 

@@ -216,8 +216,10 @@ def test_full_data_output_is_byte_identical_to_old_behaviour():
                               "strength": 82}],
             "liquidity": [{"type": "BSL", "level": 67000, "distance_pct": 3.08,
                            "ago_bars": 12}]},
-            # ⚠️ 1d 必須一起填滿：`_format_symbol_data` 對 4h/1d 兩個時框無條件迭代，
-            #    少填一個就會生出一段空的 1d 區塊，讓「資料齊全」這個前提不成立。
+            # ⚠️ 1d 必須一起填滿，「資料齊全」這個前提才成立。
+            #    （v218 已把「少填一個就生出一段空的 1d 區塊」治掉——現在會明講
+            #      『這輪沒有這個時框的資料』；但本測試要驗的是齊全時的逐字輸出，
+            #      所以兩個時框仍舊都要填。見 test_symbol_deepdive_smc_unknown_vs_none.py）
             "1d": {"current_price": 65000, "candle_count": 300,
                    "swing_points": [{"type": "HL", "level": 61000,
                                      "distance_pct": -6.15, "ago_bars": 9}]}},
