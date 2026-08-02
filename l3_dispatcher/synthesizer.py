@@ -234,6 +234,41 @@ def _fmt_pct(x) -> str:
     return f"{x:+.2f}%"
 
 
+# ── v216：餵給 LLM 的數據表，「這輪讀不出來」與「來源明講的值」必須分得開 ──
+# 這三個小工具只做一件事：None ⇒ "n/a"；有值 ⇒ 與舊碼**逐字相同**的格式。
+# ⛔ 邊界線：來源明講的 0 是答案，照常印成 0，不可為保險打成 n/a
+#    （否則「資費為 0／淨多為 0」這種正常值每天都變成缺料告警）。
+_UNKNOWN = "n/a"
+
+
+def _fmt_spec(x, spec: str, suffix: str = "") -> str:
+    """數值 + 格式規格；None ⇒ n/a（連單位一起省掉，避免印出「n/a%」）。"""
+    if x is None:
+        return _UNKNOWN
+    return f"{x:{spec}}{suffix}"
+
+
+def _fmt_usd(x, scale: float, spec: str, unit: str) -> str:
+    """金額；None ⇒ n/a。scale/unit 例：(1e6,'M')、(1e9,'B')。"""
+    if x is None:
+        return _UNKNOWN
+    return f"${x / scale:{spec}}{unit}"
+
+
+def _fmt_raw(x, suffix: str = "") -> str:
+    """原樣印（來源已 round 過）；None ⇒ n/a。"""
+    if x is None:
+        return _UNKNOWN
+    return f"{x}{suffix}"
+
+
+def _fmt_price(x) -> str:
+    """價格；None ⇒ n/a 而非「$None」。"""
+    if x is None:
+        return _UNKNOWN
+    return f"${x}"
+
+
 def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
                             watchlist=None) -> str:
     """把 state + tradfi 結構化成 LLM 易讀的格式"""
@@ -250,16 +285,16 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
         m = metrics.get(sym, {})
         e = extras.get(sym, {})
         if m.get("error"): continue
-        line = f"- {sym}: ${m.get('current_price')}"
+        line = f"- {sym}: {_fmt_price(m.get('current_price'))}"
         for n in (7, 30, 90):
             r = m.get(f"return_{n}d_pct")
             if r is not None: line += f"  {n}d {r:+.1f}%"
-        line += f"  距期內高 {m.get('drawdown_from_high_pct', 0):.1f}%"
+        line += f"  距期內高 {_fmt_spec(m.get('drawdown_from_high_pct'), '.1f', '%')}"
         if m.get("ma50"): line += f"  50d MA ${m.get('ma50')}"
         if e.get("funding") is not None:
             line += f"  funding {_fmt_funding(e['funding'])}/8h"
         parts.append(line)
-    parts.append(f"- ETH/BTC ratio: {state.get('eth_btc_ratio')}")
+    parts.append(f"- ETH/BTC ratio: {_fmt_raw(state.get('eth_btc_ratio'))}")
     parts.append(f"- 系統判定 regime: {state.get('regime')}")
 
     # ----- 現貨層 -----
@@ -268,7 +303,8 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
         m = metrics.get(sym, {})
         e = extras.get(sym, {})
         if m.get("error"): continue
-        line = f"- {sym}: ${m.get('current_price')}  7d {m.get('return_7d_pct','—')}%  30d {m.get('return_30d_pct','—')}%"
+        line = (f"- {sym}: {_fmt_price(m.get('current_price'))}"
+                f"  7d {m.get('return_7d_pct','—')}%  30d {m.get('return_30d_pct','—')}%")
         if e.get("funding") is not None:
             line += f"  funding {_fmt_funding(e['funding'])}/8h"
         parts.append(line)
@@ -278,16 +314,18 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
     for sym in ("BTC", "ETH"):
         b = state.get(f"basis_{sym.lower()}", {})
         if b.get("error"): continue
-        parts.append(f"- {sym}: 基差 {b.get('basis_pct', 0):+.4f}%  ({b.get('interpretation','')})")
+        parts.append(f"- {sym}: 基差 {_fmt_spec(b.get('basis_pct'), '+.4f', '%')}"
+                     f"  ({b.get('interpretation','')})")
 
     # ----- ETF 流向 -----
     parts.append("\n## ETF 機構流向（7d 累計）")
     for sym, key in (("BTC", "etf_btc"), ("ETH", "etf_eth")):
         etf = state.get(key, {})
         if etf.get("error"): continue
-        c7 = etf.get("cumulative_7d_flow_usd", 0)
-        d24 = etf.get("latest_24h_flow_usd", 0)
-        parts.append(f"- {sym} ETF: 7d ${c7/1e6:+.1f}M  24h ${d24/1e6:+.1f}M")
+        c7 = etf.get("cumulative_7d_flow_usd")
+        d24 = etf.get("latest_24h_flow_usd")
+        parts.append(f"- {sym} ETF: 7d {_fmt_usd(c7, 1e6, '+.1f', 'M')}"
+                     f"  24h {_fmt_usd(d24, 1e6, '+.1f', 'M')}")
 
     # ----- Funding 極端值 -----
     fo = state.get("funding_outliers", {})
@@ -296,10 +334,14 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
         hot = fo.get("hottest", [])[:5]
         cold = fo.get("coldest", [])[:5]
         if hot:
-            hot_str = ", ".join(f"{h['symbol']}={h['funding_pct_8h']:+.3f}%" for h in hot)
+            hot_str = ", ".join(
+                f"{h.get('symbol')}={_fmt_spec(h.get('funding_pct_8h'), '+.3f', '%')}"
+                for h in hot)
             parts.append(f"- 過熱 Top 5: {hot_str}")
         if cold:
-            cold_str = ", ".join(f"{c['symbol']}={c['funding_pct_8h']:+.3f}%" for c in cold)
+            cold_str = ", ".join(
+                f"{c.get('symbol')}={_fmt_spec(c.get('funding_pct_8h'), '+.3f', '%')}"
+                for c in cold)
             parts.append(f"- 過冷 Top 5: {cold_str}")
 
     # ----- 清算 + 鯨魚 -----
@@ -308,20 +350,23 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
         items = liq.get("items", [])[:5]
         parts.append("\n## 24h 清算 Top 5")
         for it in items:
-            parts.append(f"- {it.get('symbol')}: ${it.get('total_24h')/1e6:.1f}M  imbalance {it.get('imbalance'):+.2f}")
+            parts.append(f"- {it.get('symbol')}: {_fmt_usd(it.get('total_24h'), 1e6, '.1f', 'M')}"
+                         f"  imbalance {_fmt_spec(it.get('imbalance'), '+.2f')}")
 
     whales = state.get("whales", {})
     if not whales.get("error"):
         parts.append("\n## Hyperliquid 鯨魚淨倉位 Top 5")
         for w in whales.get("per_symbol_aggregate", [])[:5]:
-            parts.append(f"- {w['symbol']}: 淨多 {w['net_long_pct']:+.0f}%  總倉 ${w['total_usd']/1e6:.1f}M")
+            parts.append(f"- {w.get('symbol')}: 淨多 {_fmt_spec(w.get('net_long_pct'), '+.0f', '%')}"
+                         f"  總倉 {_fmt_usd(w.get('total_usd'), 1e6, '.1f', 'M')}")
 
     # ----- 期權 -----
     parts.append("\n## 期權市場 OI")
     for sym, key in (("BTC", "options_btc"), ("ETH", "options_eth")):
         o = state.get(key, {})
         if o.get("error"): continue
-        parts.append(f"- {sym}: 總 OI ${o.get('total_oi_usd', 0)/1e9:.2f}B  24h {o.get('weighted_24h_change_pct'):+.2f}%")
+        parts.append(f"- {sym}: 總 OI {_fmt_usd(o.get('total_oi_usd'), 1e9, '.2f', 'B')}"
+                     f"  24h {_fmt_spec(o.get('weighted_24h_change_pct'), '+.2f', '%')}")
 
     # ----- 情緒 + 週期 -----
     sent = state.get("sentiment", {})
@@ -343,7 +388,8 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
             c = cycle.get(key, {})
             if not c: continue
             if key == "pi_cycle":
-                parts.append(f"- {label}: 距 350d×2 {c.get('distance_pct'):+.1f}%  signal={c.get('signal')}")
+                parts.append(f"- {label}: 距 350d×2 {_fmt_spec(c.get('distance_pct'), '+.1f', '%')}"
+                             f"  signal={c.get('signal')}")
             elif key == "puell":
                 parts.append(f"- {label}: {c.get('value')}  {c.get('label','')}")
             elif key == "golden_ratio":
@@ -378,8 +424,8 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
             vp = tf_data.get("volume_price", {})
             patterns = tf_data.get("patterns", [])
             d = trend.get("direction", "?")
-            chg = trend.get("change_pct", 0)
-            line = f"- {tf}: trend={d} ({chg:+.2f}%)"
+            chg = trend.get("change_pct")
+            line = f"- {tf}: trend={d} ({_fmt_spec(chg, '+.2f', '%')})"
             if vp.get("interpretation"):
                 line += f"  量價={vp['interpretation']}"
             if patterns:
@@ -387,10 +433,14 @@ def _format_data_for_prompt(state: dict, tradfi: dict | None = None,
             parts.append(line)
             # 支撐阻力
             if sr.get("supports"):
-                supports_str = ", ".join(f"${s['price']}({s['distance_pct']}%)" for s in sr["supports"][:2])
+                supports_str = ", ".join(
+                    f"{_fmt_price(s.get('price'))}({_fmt_raw(s.get('distance_pct'), '%')})"
+                    for s in sr["supports"][:2])
                 parts.append(f"   支撐: {supports_str}")
             if sr.get("resistances"):
-                resist_str = ", ".join(f"${r['price']}({r['distance_pct']}%)" for r in sr["resistances"][:2])
+                resist_str = ", ".join(
+                    f"{_fmt_price(r.get('price'))}({_fmt_raw(r.get('distance_pct'), '%')})"
+                    for r in sr["resistances"][:2])
                 parts.append(f"   阻力: {resist_str}")
 
     # ----- OKX 公告 -----
