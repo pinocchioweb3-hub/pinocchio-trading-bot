@@ -229,7 +229,8 @@ def _count_closed_net(table: str) -> tuple[int, float | None]:
 
 def _paper_edge_tstat_ex(table: str = "paper_trades",
                          setup: str | None = None,
-                         basis: str = "gross") -> tuple[int, float | None]:
+                         basis: str = "gross",
+                         *, with_status: bool = False):
     """紙上『真實已平倉』單樣本 t 值 + 樣本數（檢定 EV 是否顯著異於 0）。
 
     t = mean / (sd/√n)。n<2 或 sd=0 → t=None（無法檢定，誠實不報）。與 _count_closed 同
@@ -242,8 +243,20 @@ def _paper_edge_tstat_ex(table: str = "paper_trades",
       - "net"  ：net_r（扣費後，`paper_journal.compute_net_r`，v118 起落帳）。額外要求
         realized_r 也非空＝**配對子集**，讓毛/淨兩個 t 建立在同一批交易上、可直接對照
         （不配對的話會拿 348 筆的毛去比 166 筆的淨，差異分不清是費用還是換了樣本）。
-    回傳 n 是為了讓呼叫端能判「淨值覆蓋是否足夠」——覆蓋太少時 t 再漂亮也不算證據。"""
+    回傳 n 是為了讓呼叫端能判「淨值覆蓋是否足夠」——覆蓋太少時 t 再漂亮也不算證據。
+
+    v231（監督員 r125）新增 `with_status`：舊版**讀取失敗**與**真的沒樣本**都回 `(0, None)`，
+    兩者在回傳值上完全同形 ⇒ 下游只能一律當「沒證據」，而「DB 讀不到」與「這個引擎沒單」
+    需要的處置完全不同（前者要修管線、後者要等樣本）。帶 `with_status=True` 時多回一個
+    狀態字：
+      - "ok"          ：t 算得出來
+      - "unreadable"  ：查詢丟例外（表不存在／欄位不存在／DB 鎖住）＝**未知**，非「沒有」
+      - "no_rows"     ：查得到但一列都沒有＝真的沒樣本
+      - "untestable"  ：有列但 n<2 或 sd=0，數學上無法檢定
+    ⛔ 預設回傳形狀不變（兩元組），既有呼叫端不受影響。"""
     col = "net_r" if basis == "net" else "realized_r"
+    def _ret(n, t, status):
+        return (n, t, status) if with_status else (n, t)
     try:
         conn = sqlite3.connect(_TJ_DB, timeout=5)
         try:
@@ -262,17 +275,18 @@ def _paper_edge_tstat_ex(table: str = "paper_trades",
         finally:
             conn.close()
     except Exception:
-        return 0, None                     # 表或 net_r 欄不存在＝無此口徑的證據
+        # ⛔ 這是「讀不到」不是「沒有」——v231 起用 status 分辨，⛔ 不可再折成同一件事
+        return _ret(0, None, "unreadable")
     rs = [float(r[0]) for r in rows if r[0] is not None]
     n = len(rs)
     if n < 2:
-        return n, None
+        return _ret(n, None, "no_rows" if n == 0 else "untestable")
     mean = sum(rs) / n
     var = sum((x - mean) ** 2 for x in rs) / (n - 1)
     sd = var ** 0.5
     if sd <= 0:
-        return n, None
-    return n, mean / (sd / (n ** 0.5))
+        return _ret(n, None, "untestable")
+    return _ret(n, mean / (sd / (n ** 0.5)), "ok")
 
 
 def _paper_edge_tstat(table: str = "paper_trades",
@@ -573,7 +587,7 @@ def _section_decisions() -> str:
 
 def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
                            demo_n, demo_rejected, paper_t=None,
-                           paper_t_net=None, net_n=0) -> str:
+                           paper_t_net=None, net_n=0, t_status=None) -> str:
     """task#7 CEO 深度綜合：純函式、確定性跨 session 關聯推理（可離線測試）。
     把『樣本供給 × 模擬盤下單健康 × 復盤優化器晉升狀態』綜合成單一瓶頸歸因——這才是
     真綜合分析，非欄位回音。資料不足就誠實說無法綜合（紅線③不臆測）。
@@ -589,7 +603,18 @@ def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
     把瓶頸敘事從『edge 未證實』翻成『只差真錢人工閘』＝對本人謊報一個假的準備就緒。
     故『已顯著』改成**毛與淨都要過**，且淨值覆蓋須 ≥`PAPER_NET_MIN_N`；沒有淨值證據時
     一律當作**未證實**（fail-closed），並明說是哪一邊沒過，不讓缺口靜默通過。
-    paper_t_net/net_n：淨口徑 t 與其配對樣本數（_paper_edge_tstat_ex(basis="net")）。"""
+    paper_t_net/net_n：淨口徑 t 與其配對樣本數（_paper_edge_tstat_ex(basis="net")）。
+
+    v231 治本（監督員 r125，同物種第 51 次）：v150 只堵住「毛過了、淨沒過／沒證據」那條路
+    （`_has_t` 為真）；**兩個口徑都拿不到 t 值**時（DB 讀不到、或該引擎沒有可檢定的樣本），
+    `_has_t` 為假 ⇒ 兩道顯著性閘直接被跳過 ⇒ 只要 paper_n≥paper_min 就落到
+    `live_n < live_min` 那一支，印出「紙上樣本足、待真錢人工逐筆驗證（0/30，紅線①）」
+    ——那句話**斷言了 edge 沒問題、只剩人工閘**，正是上面這段 v150 docstring 明文說不可以
+    出現的假準備就緒，只是這次的成因是「未知」而非「數據」。
+    修法：`not _has_t` 且真錢閘未過時，改走獨立分支誠實說「檢定跑不出來＝未知」。
+    ⛔ live_n 已達標的那一支不動（原文「樣本達標，待品質/顯著性驗證」本就沒有斷言 edge 成立）。
+    t_status：`_paper_edge_tstat_ex(with_status=True)` 的狀態字，用來分辨「讀不到」與
+    「沒樣本」——⛔ 這兩者的處置不同，不可再折成同一句「無證據」。"""
     if paper_n < 8:
         return (f"  本輪樣本過少（紙上 {paper_n}/{paper_min}），尚無足夠基礎做跨 session "
                 "綜合分析——誠實不臆測。")
@@ -617,6 +642,19 @@ def _synthesize_bottleneck(paper_n, paper_min, live_n, live_min,
                     "——毛利上的 edge 被費用與滑價吃掉，未證實")
         bottleneck = (f"紙上毛口徑已顯著（名目 t≈{paper_t:.2f}≥2）{_why}；"
                       "真瓶頸是**扣費後**的 edge，非樣本量")
+    elif not _has_t and live_n < live_min:
+        # v231：⛔ 這裡**不可以**落到下面那支人工閘敘事——沒有 t 值不等於 edge 沒問題
+        _why_unknown = {
+            "unreadable": "統計檢定**讀不出來**（查詢丟例外：表／欄位不存在或 DB 鎖住）"
+                          "——這是管線問題，先修讀取再談歸因",
+            "no_rows": "這個引擎**一筆可檢定的已平倉樣本都沒有**——先確認樣本為何沒進來",
+            "untestable": "可檢定樣本不足（n<2 或全同值，數學上算不出 t）——等樣本",
+        }.get(t_status,
+              "毛與淨兩個口徑都沒有 t 值（讀取失敗或無可檢定樣本，"
+              "此處分辨不出是哪一種）")
+        bottleneck = (f"紙上已平倉 {paper_n}≥{paper_min}，但 {_why_unknown}；"
+                      "⇒ edge 是否成立**未知**，⛔ 不可讀成『只差真錢人工閘』"
+                      "（紅線③：未證實不得當成已證實）")
     elif live_n < live_min:
         bottleneck = f"紙上樣本足、待真錢人工逐筆驗證（{live_n}/{live_min}，紅線①）"
     else:
@@ -650,12 +688,16 @@ def _section_self_assessment() -> str:
         demo_rejected, _ = demo_journal.count_rejected()
     except Exception:
         pass
-    _net_n, _net_t = _paper_edge_tstat_ex("paper_trades", setup="deepdive", basis="net")
+    _net_n, _net_t, _net_st = _paper_edge_tstat_ex(
+        "paper_trades", setup="deepdive", basis="net", with_status=True)
+    _g_n, _g_t, _g_st = _paper_edge_tstat_ex(
+        "paper_trades", setup="deepdive", with_status=True)
+    # v231：兩個口徑的狀態合併成一個「為何沒有 t」——讀不到優先（它是管線問題、要先修）
+    _t_status = "unreadable" if "unreadable" in (_g_st, _net_st) else _g_st
     body = _synthesize_bottleneck(
         p.get("paper_n", 0), p.get("paper_min", 100),
         p.get("live_n", 0), p.get("live_min", 30), demo_n, demo_rejected,
-        paper_t=_paper_edge_tstat("paper_trades", setup="deepdive"),
-        paper_t_net=_net_t, net_n=_net_n)
+        paper_t=_g_t, paper_t_net=_net_t, net_n=_net_n, t_status=_t_status)
     # v131：分引擎附註（瓶頸敘事以加密 deepdive 為主體＝OKX 路徑的鑰匙；美股另列）
     # v150：毛/淨並列。美股毛 t 過 2 但扣費後跌破——只報毛會讓人以為這條線已經成立。
     _us_t = _paper_edge_tstat("paper_trades", setup="us_breakout")
