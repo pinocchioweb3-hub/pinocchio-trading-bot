@@ -477,6 +477,14 @@ def live_stall_verdict(health: dict | None, *, now_s: float | None = None,
 RISK_SIZING_WINDOW_SEC = 24 * 3600
 
 
+def _round2(v):
+    """給人看的金額：收掉浮點尾巴。⛔ 讀不出來就原樣回傳，不假裝成 0。"""
+    try:
+        return round(float(v), 2)
+    except (TypeError, ValueError):
+        return v
+
+
 def risk_sizing_verdict(health: dict | None, *, now_s: float | None = None,
                         window_sec: int = RISK_SIZING_WINDOW_SEC) -> dict | None:
     """把「單筆實際風險 ≠ 風險預算」翻成阻塞（純函式，可離線測）。
@@ -523,7 +531,9 @@ def risk_sizing_verdict(health: dict | None, *, now_s: float | None = None,
         recent = health.get("risk_capped_recent")
         last = recent[-1] if isinstance(recent, list) and recent else {}
         eff, want = last.get("risk_effective"), last.get("risk_intended")
-        detail = (f"（最近一筆 {last.get('inst_id')}：預算 {want}U → 實際 {eff}U）"
+        # 這行會原樣進帳本給人看：5.937165000000033U 這種浮點尾巴要收乾淨
+        detail = (f"（最近一筆 {last.get('inst_id')}："
+                  f"預算 {_round2(want)}U → 實際 {_round2(eff)}U）"
                   if isinstance(last, dict) and eff and want else "")
         parts.append(f"名義值上限先咬住風險預算，累計 {capped} 筆{detail}")
     if fresh_drift and drift_over > 0:

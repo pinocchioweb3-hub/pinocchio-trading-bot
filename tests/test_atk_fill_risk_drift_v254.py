@@ -201,6 +201,19 @@ def test_ledger_surfaces_recent_sizing_gap_as_a_user_blocker():
     assert "9.3" in v["text"] and "只有你能定" in v["text"]
 
 
+def test_ledger_text_has_no_float_tails():
+    """這串會原樣進帳本給人看：實測線上第一筆就長成 5.937165000000033U。"""
+    from l3_dispatcher.ceo_oversight import risk_sizing_verdict
+    now = 1_800_000_000.0
+    h = {"risk_capped_total": 1, "risk_capped_last_ts": now - 60,
+         "risk_capped_recent": [{"inst_id": "QQQ-USDT-SWAP",
+                                 "risk_intended": 20.0,
+                                 "risk_effective": 5.937165000000033}]}
+    text = risk_sizing_verdict(h, now_s=now)["text"]
+    assert "5.94U" in text, text
+    assert "5.937165" not in text
+
+
 def test_ledger_gap_expires_because_it_is_a_condition_not_a_fact():
     """⚠️ 與 pnl_gap 的刻意差異：漏記的損益不可逆（不套窗），夾層／滑價是現況條件——
     參數一改或單純沒有新單它就不再發生。拿累計數當永久阻塞，等於使用者裁決完了帳本
