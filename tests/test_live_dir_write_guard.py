@@ -207,6 +207,13 @@ def _under_guarded_tree(p: Path) -> bool:
     return False
 
 
+# `consume_intents_live.py` 是 make_live_copy.ps1 產生出來的真錢副本，**刻意不進
+# 版控**（git ls-files 只有模板 consume_intents.py）。所以在任何乾淨 checkout ——
+# 新 clone、CI、`git worktree` ——它都不在場。
+_ATK_DIR = Path(__file__).resolve().parent.parent / "tools" / "atk_consumer"
+_GENERATED_ONLY = {"consume_intents_live"}   # 未進版控＝可以不在場
+
+
 @pytest.mark.parametrize("mod_name", ["consume_intents", "consume_intents_live"])
 def test_atk_consumer_constants_are_bound_to_the_live_tree(mod_name):
     """證明危害是真的：這些常數在 import 期就綁死線上目錄，`BOT_DATA_DIR` 改不動。
@@ -216,8 +223,19 @@ def test_atk_consumer_constants_are_bound_to_the_live_tree(mod_name):
     """
     if not LIVE_WRITE_GUARD_ROOTS:
         pytest.skip("這台機器沒有 LOCALAPPDATA")
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent
-                           / "tools" / "atk_consumer"))
+
+    # 監督員 r135：「這台機器上還沒產生真錢副本」是**量不到**，不是**閘破了**。
+    # 舊碼在副本不在場時以 ModuleNotFoundError 收場＝把量不到折成失敗——正是本專案
+    # 一修再修的那個物種（v238 的鏡像）。⛔ 但只有未進版控的產生物可以走這條路：
+    # 模板 consume_intents.py 在版控裡，它不在場就是真的紅，絕不可一起放行。
+    if mod_name in _GENERATED_ONLY and not (_ATK_DIR / f"{mod_name}.py").exists():
+        pytest.skip(
+            f"本機沒有 {mod_name}.py（尚未產生過真錢副本，該檔刻意不進版控）——"
+            "本檢查不適用，⛔ 不可解讀為『真錢副本的路徑常數已驗過』。"
+            "要驗請先跑 tools/atk_consumer/make_live_copy.ps1 -GenerateOnly"
+        )
+
+    sys.path.insert(0, str(_ATK_DIR))
     mod = __import__(mod_name)
     bound = {name: getattr(mod, name)
              for name in ("OUTBOX", "STATE", "POS_STATE", "HEALTH")
