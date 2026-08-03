@@ -1304,14 +1304,30 @@ def place(intent: dict, sz: float, dry: bool,
     每腿 clOrdId 加尾碼 a/b/c 冪等；部分失敗→回 False 由外層重試（已成腿撞
     51016 重複視為成功，不會重複開倉）。單一 TP 時維持原單筆路徑。"""
     lev = leverage_for_trade(intent.get("entry"), intent.get("stop"))
-    # v155（監督員 r45）修C：設槓桿失敗只在「風險帶」擋單。
-    # 風險帶＝算出的 lev < LEVERAGE：此時交易所可能仍卡在更高的舊值，逐倉保證金
-    # 被壓小、清算距離縮到止損之內 ⇒ 單會在走到自己的止損前先被清算（v84 不變式破）。
-    # lev == LEVERAGE 時舊值不可能更高（本執行器只設 ≤ 上限）⇒ 擋單純屬白擋，維持照下。
-    if not ensure_leverage(intent["inst_id"], intent["pos_side"], dry, lev=lev) \
-            and lev < LEVERAGE:
-        print(f"⚠️ {intent['inst_id']}/{intent['pos_side']} 應設 {lev}x（低於上限 "
-              f"{LEVERAGE}x）但設槓桿失敗——本輪整筆不下（fail-closed，下輪重試）")
+    # v248（監督員 r139）：設槓桿失敗 ⇒ **無條件**整筆不下。
+    #
+    # 被推翻的是 v155（r45）修C 的「風險帶」：當時只擋 lev < 上限 的情形，理由是
+    # 「上限本身不可能被交易所卡在更高的舊值 ⇒ 擋單純屬白擋」。那個推理只想過
+    # 「交易所側比意圖**高**」一種偏離，漏掉了對稱的另一半——**交易所側比意圖低**。
+    #
+    # 2026-08-03 17:12 真錢實證（不是推測）：SOXL-USDT-SWAP short，算出 lev＝上限，
+    # 設槓桿被 OKX 回 59102「Leverage exceeds the maximum limit」（該合約上限低於本
+    # 執行器的上限；模板第 45 行「美股代幣永續上限 25x」這個假設對 SOXL 不成立），
+    # ensure_leverage 回 False、記了一筆 leverage_fail——然後因為 lev == 上限不在風險帶，
+    # **三腿真錢單照樣送出去**，倉開在交易所預設的 3x 上。事後的讀回閘（v171）只能在
+    # 錢已經下去之後喊 mismatch，且它按設計不擋單、不自動調整 ⇒ 那一刻沒有任何東西
+    # 攔得住。這就是「fail-closed 的控制項自己 fail-open」。
+    #
+    # 為什麼改成無條件擋是安全方向：它只會讓單**變少**，永遠不會讓單變多。網路類的
+    # 暫時失敗＝延後一輪重試（每分鐘一輪）；若是 59102 這種該合約結構性擋不住的，
+    # 那就該一直擋——⛔ 開一個「槓桿設不成功」的真錢倉，本來就沒有正確版本。
+    # ⚠️ 副作用要講明：上限高於該合約上限的標的，從此永遠下不了單，而不是自動降級
+    # 成該合約的上限。要不要改成「查上限後夾住再算 sz」是另一個決策（會動到部位
+    # 大小的數學），⛔ 不在本修範圍內；在那之前，這類標的每輪會留下一筆 leverage_fail
+    # ＝擋在哪裡看得見，不是靜音。
+    if not ensure_leverage(intent["inst_id"], intent["pos_side"], dry, lev=lev):
+        print(f"⚠️ {intent['inst_id']}/{intent['pos_side']} 應設 {lev}x 但設槓桿失敗"
+              f"——本輪整筆不下（fail-closed，下輪重試）")
         return False
     tps = [intent.get("tp1"), intent.get("tp2"), intent.get("tp3")]
     legs = (split_tp_levels(sz, spec["lotSz"], spec["minSz"], tps)

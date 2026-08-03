@@ -345,9 +345,13 @@ def test_old_fill_is_clamped_into_retention_window_not_silently_pruned(tmp_path,
     assert sum(day_pnl.values()) == -5.5
 
 
-# ── v155（監督員 r45）修C：設槓桿失敗只在「風險帶」擋單，並記可辨識類別 ────
-# 風險帶＝算出的 lev < LEVERAGE。lev == LEVERAGE 時交易所舊值不可能更高⇒白擋，
-# 維持照下（見 docs/org/2026-07-31-真錢路徑設槓桿失敗-唯一不擋單也不記帳的呼叫.md §五）。
+# ── v248（監督員 r139）：設槓桿失敗 ⇒ 無條件擋單，並記可辨識類別 ──────────
+# ⚠️ 這裡原本鎖的是 v155（r45）修C 的「風險帶」規則（只擋 lev < LEVERAGE，lev 等於
+# 上限時視為白擋、照下）。2026-08-03 17:12 真錢實證推翻了它：SOXL-USDT-SWAP short
+# 算出的 lev 剛好是上限，設槓桿被 OKX 回 59102（該合約上限低於本執行器上限），
+# 三腿真錢單照樣送出，倉開在交易所預設 3x 上。v155 的推理只涵蓋「交易所側比意圖
+# 高」，漏了對稱的「比意圖低」。詳見 tests/test_leverage_fail_blocks_entry_v248.py
+# 與 docs/2026-08-03-v248-設槓桿失敗仍下真錢單-風險帶推理漏了另一半.md。
 _LEV_401 = ("Error: HTTP 401 from OKX: Your IP 203.0.113.7 is not included in "
             "your API key's 00000000-0000-4000-8000-000000000000 IP whitelist.")
 
@@ -384,13 +388,13 @@ def test_leverage_fail_blocks_order_when_computed_lev_below_cap(monkeypatch):
     assert "leverage_fail" in ci._ROUND_FAILS   # 且類別要分得出是哪一支呼叫死的
 
 
-def test_leverage_fail_still_places_when_computed_lev_equals_cap(monkeypatch):
-    # 止損 2%、上限 20x → 算出來就是上限 20x。舊值不可能比上限更高⇒擋單純屬白擋，
-    # 維持現行「只警告、照下」，但故障仍要進帳（安靜≠健康）。
+def test_leverage_fail_blocks_order_when_computed_lev_equals_cap(monkeypatch):
+    # 止損 2%、上限 20x → 算出來就是上限 20x，也就是 v155 判定「白擋」而放行的那一段。
+    # SOXL 那筆證明交易所側可以**低於**意圖（59102／預設 3x），一樣破壞下單前提 ⇒ 必須擋。
     ok, legs = _arm_place(monkeypatch, entry=100.0, stop=98.0, max_lev=20)
-    assert ci.leverage_for_trade(100.0, 98.0, 20) == 20       # 確認不在風險帶
-    assert ok is True
-    assert len(legs) == 1                  # 照樣送出
+    assert ci.leverage_for_trade(100.0, 98.0, 20) == 20       # 確認就是 v155 放行的那一段
+    assert ok is False                     # 本輪不下，下輪重試
+    assert legs == []                      # 一腿都不准送出去
     assert "leverage_fail" in ci._ROUND_FAILS
 
 
