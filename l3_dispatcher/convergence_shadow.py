@@ -91,7 +91,7 @@ async def _binance_funding(bn, symbol: str):
     return None
 
 
-async def _coinglass_focus_map(source, focus_syms: list[str]) -> dict:
+async def _coinglass_focus_map(source, focus_syms: list[str]) -> tuple[dict, dict]:
     """焦點幣 CoinGlass per-coin 覆蓋 + 聚合 funding（bounded：≤len(focus) 次）。
 
     為何只查焦點幣：CoinGlass `futures/coins-markets`（單呼叫全市場覆蓋）在
@@ -101,29 +101,62 @@ async def _coinglass_focus_map(source, focus_syms: list[str]) -> dict:
     共振確認，且 ≤12 次/30 分 << 80rpm。重用 daemon 既有 source（共用限流器 +
     TTL 快取），不另建實例、不另開額度。
 
-    回 {canonical: {"funding": float|None, "vol_usd": float|None}}；
-    缺料/失敗/未覆蓋的幣不入 map（不在 map = CoinGlass 未覆蓋該幣）。
+    回 **兩個** 值（v245/v246）：
+        (map, unavailable)
+        map          = {canonical: {"funding": float|None, "vol_usd": float|None}}
+                       ＝**確實問到、且 CoinGlass 有覆蓋** 的幣
+        unavailable  = {成因: [canonical...]}
+                       ＝**根本沒問到** 的幣（權限死／限流／逾時／例外）
+
+    ⛔ 舊版只回 map，docstring 寫著「不在 map = CoinGlass 未覆蓋該幣」——那是把
+    「我沒問到」**定義成**「市場上沒有」。CoinGlass 自 2026-07-08 權限到期後，
+    這個定義讓 1066 輪 / 12,792 筆焦點紀錄全部寫下 `triple_present: false`，
+    一個關於市場的**假事實主張**；外加 `except Exception: return {}` 讓一個例外
+    就抹掉整張表。三種狀態必須分開：
+        有覆蓋（True） / 問到了但沒覆蓋（False） / 沒問到（None）
+    「沒問到」與「沒有」的處置天差地別：前者要去續訂或修連線，後者什麼都不必做。
     """
     out: dict[str, dict] = {}
+    unavailable: dict[str, list[str]] = {}
     if not focus_syms or source is None or not hasattr(source, "get_strength_universe"):
-        return out
+        return out, unavailable
+    from market_intel_mcp.symbol_mapping import to_canonical_aliased
+    canon = [to_canonical_aliased(s) for s in focus_syms]
     try:
-        from market_intel_mcp.symbol_mapping import to_canonical_aliased
         r = await source.get_strength_universe(
             limit=len(focus_syms), candidate_symbols=list(focus_syms))
-        if isinstance(r, dict) and not r.get("error"):
-            for it in (r.get("items") or []):
-                sym = it.get("symbol")
-                if sym is None:
-                    continue
-                f = it.get("funding")
-                out[to_canonical_aliased(sym)] = {
-                    "funding": float(f) if isinstance(f, (int, float)) else None,
-                    "vol_usd": it.get("vol_24h_usd"),
-                }
-    except Exception:
-        return {}
-    return out
+    except Exception as e:
+        # ⛔ 不得回空表了事——那會讓每一檔都被下游讀成「CoinGlass 未覆蓋」。
+        unavailable[f"{type(e).__name__}: {e}".strip()[:160] or "未知例外"] = canon
+        return {}, unavailable
+    if not isinstance(r, dict):
+        unavailable["回應不是 dict（未知形狀）"] = canon
+        return {}, unavailable
+    if r.get("error"):
+        code = r.get("code") or "ERROR"
+        msg = str(r.get("message") or r.get("msg") or "").strip()
+        unavailable[f"{code}: {msg}"[:160] if msg else f"{code}（無訊息）"] = canon
+        return {}, unavailable
+
+    for it in (r.get("items") or []):
+        sym = it.get("symbol")
+        if sym is None:
+            continue
+        f = it.get("funding")
+        out[to_canonical_aliased(sym)] = {
+            "funding": float(f) if isinstance(f, (int, float)) else None,
+            "vol_usd": it.get("vol_24h_usd"),
+        }
+    # v246：整批沒死、但上游（v245）逐幣說得出誰沒取到 → 轉述，⛔ 不自行改判成「沒覆蓋」。
+    up = r.get("unavailable")
+    if isinstance(up, dict):
+        for why, syms in up.items():
+            for s in (syms or []):
+                c = to_canonical_aliased(s)
+                if c in out:
+                    continue          # 後來還是拿到資料了就不算未取得
+                unavailable.setdefault(str(why)[:160], []).append(c)
+    return out, unavailable
 
 
 async def _run_cycle(source=None) -> dict:
@@ -188,7 +221,9 @@ async def _run_cycle(source=None) -> dict:
     except Exception:
         okx_snap = {}
     hl_funding = await _hl_funding_map(hl)
-    cg_map = await _coinglass_focus_map(source, focus_syms)
+    cg_map, cg_unavailable = await _coinglass_focus_map(source, focus_syms)
+    # v246：「沒問到」的幣集合——⛔ 這些幣的 triple_present 必須是 None，不是 False。
+    cg_unknown = {s for syms in cg_unavailable.values() for s in syms}
 
     # Binance funding 逐幣（bounded gather，失敗各自 None）
     bn_results = await asyncio.gather(
@@ -201,6 +236,7 @@ async def _run_cycle(source=None) -> dict:
 
     focus_out = []
     n_triple_confirmed = 0
+    n_triple_unknown = 0
     for sym, pres in focus:
         sigs = {}
         okx_f = (okx_snap.get(sym) or {}).get("funding")
@@ -215,9 +251,16 @@ async def _run_cycle(source=None) -> dict:
             sigs["hyperliquid"] = direction_of("funding", hl_funding[sym])
 
         # triple_present = OKX∧Binance（前濾已保證）∧ CoinGlass 覆蓋（本步確認）
-        cg_covered = sym in cg_map
-        if cg_covered:
+        # v246：三態。⛔ 沒問到寫 None，不得折成 False（那是關於市場的假事實主張），
+        #        也不得算進 n_triple_confirmed（⛔ 不拿未知墊高已確認數）。
+        if sym in cg_map:
+            cg_covered = True
             n_triple_confirmed += 1
+        elif sym in cg_unknown:
+            cg_covered = None
+            n_triple_unknown += 1
+        else:
+            cg_covered = False
 
         metric_results = {"funding": metric_convergence("funding", sigs)}
         agg = aggregate_convergence(sym, metric_results, pres)
@@ -226,7 +269,8 @@ async def _run_cycle(source=None) -> dict:
             "liquidity_tier": pres.get("liquidity_tier"),
             "liquidity_depth_usd": pres.get("liquidity_depth_usd"),
             "presence_score": pres.get("presence_score"),
-            "triple_present": cg_covered,      # OKX∧Binance∧CoinGlass 三方共現
+            # True=三方共現／False=問到了但 CG 沒覆蓋／None=沒問到（v246）
+            "triple_present": cg_covered,
             "funding_sources": sigs,           # {okx/binance/coinglass/hl: -1/0/+1}
             "funding_convergent": metric_results["funding"].get("is_convergent"),
             "convergence_score": agg.get("convergence_score"),
@@ -234,18 +278,24 @@ async def _run_cycle(source=None) -> dict:
             "strength_multiplier_SHADOW": agg.get("strength_multiplier"),  # 觀測，永不施用
         })
 
-    return {
+    summary = {
         "ts": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
         "universe_size": len(presence),
         "n_dual_present": n_dual,                 # 全宇宙 OKX∧Binance（cheap）
         "n_triple_confirmed": n_triple_confirmed,  # 焦點幣中 CoinGlass 已確認覆蓋
+        "n_triple_unknown": n_triple_unknown,      # v246：沒問到（≠ 沒覆蓋）
         "tier_counts": tier_counts,
         "focus_count": len(focus_out),
         "focus": focus_out,
         "note": "shadow-only: strength_multiplier 從不施用於 strength_score/fire；"
                 "universe 層為 OKX∧Binance 雙源(CoinGlass全市場端點被鎖)，"
-                "三方共現(triple_present)僅對焦點幣逐幣確認",
+                "三方共現(triple_present)僅對焦點幣逐幣確認"
+                "（true=共現／false=問到了但未覆蓋／null=沒問到，見 cg_unavailable）",
     }
+    # v246：⛔ 反向側——全數問到時不得多出這個鍵（避免 sink 膨脹、⚠️ 貶值）。
+    if cg_unavailable:
+        summary["cg_unavailable"] = cg_unavailable
+    return summary
 
 
 async def run_convergence_shadow_loop(source=None, interval_seconds: int = 1800):
@@ -260,10 +310,15 @@ async def run_convergence_shadow_loop(source=None, interval_seconds: int = 1800)
         try:
             summary = await _run_cycle(source)
             _append_jsonl(summary)
+            # v246：`triple=0` 同時代表「都沒共現」與「根本沒問到」——後者要說出來，
+            # 否則就是 26 天沒人發現的那個形狀（安靜、像正常輪）。
+            _un = summary.get("cg_unavailable") or {}
+            _why = ("  ⚠️第三源未取得：" + "；".join(_un)) if _un else ""
             print(f"[convergence_shadow] universe={summary['universe_size']} "
                   f"dual={summary['n_dual_present']} "
                   f"triple={summary['n_triple_confirmed']} "
-                  f"focus={summary['focus_count']}")
+                  f"unknown={summary.get('n_triple_unknown', 0)} "
+                  f"focus={summary['focus_count']}{_why}")
         except Exception as e:  # 整輪保護：任何意外吞掉續跑，不拖垮 daemon
             print(f"[convergence_shadow] cycle error: {e}")
         await asyncio.sleep(max(60, int(interval_seconds)))

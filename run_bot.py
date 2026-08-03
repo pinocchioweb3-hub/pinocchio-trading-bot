@@ -136,8 +136,12 @@ async def amain(args: argparse.Namespace) -> int:
         # 讀成「一切正常，只是沒東西」的地方。源說得出成因就一起印。
         _un = _utel.get("unavailable") or {}
         _why = ("  ⚠️未取得：" + "；".join(f"{w}×{len(s)}" for w, s in _un.items())) if _un else ""
+        # v246：必須併印 source——降級後 `n_universe/n_pool/n_dropped` 全是**免費源**的
+        # 輸出，而 `⚠️未取得×N` 講的是**原始源**。不寫清楚是誰的數字，兩者並列會被讀成
+        # 同一件事（「45/48 還好啊」），這正是降級掩蓋源死掉的老形狀。
         print(f"[startup] universe truncation: {_utel.get('n_universe')}/{_utel.get('n_pool')} "
-              f"returned (dropped {_utel.get('n_dropped')}, errored={_utel.get('errored')})"
+              f"returned (dropped {_utel.get('n_dropped')}, errored={_utel.get('errored')}, "
+              f"source={_utel.get('universe_source')})"
               f"{_why}")
 
     # === 開機訊息（v23-6: 30 分鐘內重啟不重推，避免部署期洗版系統主題）===

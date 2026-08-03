@@ -1328,10 +1328,23 @@ def _shadow_convergence_focus_line() -> str:
         focus = [it for it in (rec.get("focus") or []) if it.get("triple_present")]
         focus.sort(key=lambda it: it.get("convergence_score") or 0.0, reverse=True)
         syms = [it.get("symbol") for it in focus[:5] if it.get("symbol")]
-        if not syms:
-            return ""
-        return ("📊 本輪三方共現焦點幣（OKX∧Binance∧CoinGlass 資金費率方向一致，"
-                f"觀察中／參考）：{'、'.join(syms)}\n")
+        if syms:
+            return ("📊 本輪三方共現焦點幣（OKX∧Binance∧CoinGlass 資金費率方向一致，"
+                    f"觀察中／參考）：{'、'.join(syms)}\n")
+        # v246：橫幅空掉時要分清楚兩件事——
+        #   (a) 問到了、就是沒有共現 → 照舊回 ""（⛔ 不製造 ⚠️ 雜訊，否則符號貶值）
+        #   (b) 第三源根本沒問到     → 必須說出來
+        # CoinGlass 權限 2026-07-08 到期後走的是 (b)，但舊碼兩者都回 ""，
+        # 於是這個橫幅**靜默熄燈 26 天**，畫面上沒有一個字說得出為什麼。
+        cg_un = rec.get("cg_unavailable") or {}
+        if cg_un:
+            why = "；".join(str(k) for k in cg_un)[:120]
+            n = rec.get("n_triple_unknown")
+            n_txt = f"（{n} 檔焦點幣狀態未知）" if isinstance(n, int) and n else ""
+            return ("📊 本輪三方共現焦點幣：⚠️ 本輪無法確認——第三源 CoinGlass 讀不到"
+                    f"{n_txt}：{why}。"
+                    "⛔ 這不代表這些幣沒有共現，只代表我們沒問到。\n")
+        return ""
     except Exception:
         return ""
 
