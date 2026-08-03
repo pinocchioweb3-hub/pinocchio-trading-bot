@@ -199,6 +199,63 @@ def test_move_uses_recorded_stop_not_the_live_one_to_avoid_ratchet(monkeypatch):
     assert info["px"] == pytest.approx(first)
 
 
+def test_legacy_record_without_ticksz_asks_the_exchange(monkeypatch):
+    """線上唯一那筆真錢倉（MU）就是這個形狀：v249 之前下的單，部位檔裡
+    stop=None、tickSz=None。沒有 tickSz 就送出未對齊的價格 ⇒ 交易所每輪退件、
+    保本永遠搬不成。⛔ 這不是『量不到』——離一次 instruments 查詢只有一步。"""
+    def _f(args, timeout=None):
+        if args[:2] == ["market", "instruments"]:
+            return 0, json.dumps([{"ctVal": "1", "lotSz": "0.01", "minSz": "0.01",
+                                   "tickSz": "0.01", "lever": "50"}])
+        if args[:3] == ["swap", "algo", "orders"]:
+            return 0, json.dumps([_algo_row()])
+        if args[:3] == ["swap", "algo", "amend"]:
+            px = args[args.index("--newSlTriggerPx") + 1]
+            # 0.01 的整數倍才對齊；813.571 這種會被 OKX 退件
+            assert abs(round(float(px) / 0.01) - float(px) / 0.01) < 1e-6, px
+            return 0, '{"sCode": "0"}'
+        raise AssertionError(f"未預期：{args}")
+
+    monkeypatch.setattr(ci, "_okx", _f)
+    rec = _rec(stop=None, tickSz=None)
+    state, info = ci.move_stops_to_breakeven(rec, MU_AVG, dry=False)
+    assert state == "done" and info["moved"] == 1
+    assert rec["tickSz"] == 0.01, "問到了就補記，下輪不必再問"
+    # 舊紀錄沒有 stop ⇒ 退回讀掛單上的值（還沒搬過，所以那就是原始止損）
+    assert info["px"] == pytest.approx(
+        ci.breakeven_stop_px(MU_AVG, MU_SL, "short", MU_TICK))
+
+
+def test_ticksz_lookup_failure_still_attempts_the_move(monkeypatch):
+    """問不到就退回原樣送，讓交易所當權威。未對齊只會被拒、不會改到錯的價位；
+    為了一次查詢失敗就放著倉不保護，代價比較大。"""
+    def _f(args, timeout=None):
+        if args[:2] == ["market", "instruments"]:
+            return 1, "Error: HTTP 500"
+        if args[:3] == ["swap", "algo", "orders"]:
+            return 0, json.dumps([_algo_row()])
+        if args[:3] == ["swap", "algo", "amend"]:
+            return 0, '{"sCode": "0"}'
+        raise AssertionError(f"未預期：{args}")
+
+    monkeypatch.setattr(ci, "_okx", _f)
+    state, info = ci.move_stops_to_breakeven(_rec(stop=None, tickSz=None),
+                                             MU_AVG, dry=False)
+    assert state == "done" and info["moved"] == 1
+
+
+def test_ticksz_is_not_asked_for_when_already_recorded(monkeypatch):
+    def _f(args, timeout=None):
+        if args[:2] == ["market", "instruments"]:
+            raise AssertionError("已經記了 tickSz 還去問＝每輪多一次無謂呼叫")
+        if args[:3] == ["swap", "algo", "orders"]:
+            return 0, json.dumps([_algo_row()])
+        return 0, '{"sCode": "0"}'
+
+    monkeypatch.setattr(ci, "_okx", _f)
+    assert ci.move_stops_to_breakeven(_rec(), MU_AVG, dry=False)[0] == "done"
+
+
 def test_dry_run_never_calls_amend(monkeypatch):
     calls = _fake_okx(monkeypatch, [_algo_row()])
     state, _ = ci.move_stops_to_breakeven(_rec(), MU_AVG, dry=True)

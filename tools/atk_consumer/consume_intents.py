@@ -1241,7 +1241,10 @@ def pending_stop_legs(rows, pos_side: str) -> list | None:
 
 
 def move_stops_to_breakeven(rec: dict, avg_px, dry: bool) -> tuple[str, dict]:
-    """把該倉**剩餘腿**的止損搬到保本價。回 (state, info)；⛔ 不就地改 rec。
+    """把該倉**剩餘腿**的止損搬到保本價。回 (state, info)。
+
+    ⛔ 除了補記 tickSz（純快取，見下方）之外不就地改 rec——be 狀態一律由
+    maybe_breakeven 一處寫，兩邊都寫會出現「誰蓋誰」的問題。
 
     state：done＝這輪確認每一腿都在保本價（含本來就已經在）；unknown＝查不到／看不懂
     （下輪重試）；no_pending＝查得到且確認一張掛單都沒有（＝這倉此刻沒有交易所端止損，
@@ -1273,7 +1276,17 @@ def move_stops_to_breakeven(rec: dict, avg_px, dry: bool) -> tuple[str, dict]:
         orig_sl = min((_pos_float(r.get("slTriggerPx")) or 0) for r in legs) \
             if side == "long" else \
             max((_pos_float(r.get("slTriggerPx")) or 0) for r in legs)
-    be = breakeven_stop_px(avg_px, orig_sl, side, rec.get("tickSz"))
+    # 最小跳動：v249 起下單時就記下來；**舊倉沒有**（MU 那筆就是），而沒有 tickSz
+    # 的改價會送出未對齊的價格 ⇒ 交易所每輪退件、保本永遠搬不成。
+    # ⛔ 這不是「量不到」——它離一次 instruments 查詢只有一步。去問，不要放棄。
+    #   問不到才退回原樣送（讓交易所當權威；未對齊只會被拒，不會改到錯的價位）。
+    tick = rec.get("tickSz")
+    if tick is None:
+        spec = fetch_inst_spec(iid) or {}
+        tick = spec.get("tickSz")
+        if tick is not None:
+            rec["tickSz"] = tick          # 補記，下輪不必再問
+    be = breakeven_stop_px(avg_px, orig_sl, side, tick)
     if be is None:
         return "unknown", {"reason": "be_px_uncomputable",
                            "avg_px": _pos_float(avg_px), "orig_sl": _pos_float(orig_sl)}
