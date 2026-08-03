@@ -158,6 +158,41 @@ async def run_health_checks(state: SupervisorState, source) -> list[HealthCheck]
     except Exception:  # noqa: BLE001 — 觀測性檢查失敗不致命
         pass
 
+    # === 1.7 訊號乾旱（v239）——上面那條的對稱缺口 ===
+    # v123 補了「開單太多」會告警，但「開單掉到零」二十四天沒有任何偵測：
+    # 2026-07-08 CoinGlass 到期 → BTC 大盤閘讀不到 → 每檔每輪 HOLD → FIRE 引擎
+    # 整包停產到 08-01。此前四天每天 16/32/24/27 筆。約 30 份 CEO 日報、監督帳本、
+    # supervisor 全部沒出聲——因為零產出和「市場很安靜」在監控面上長得一模一樣。
+    #
+    # 分三類且**互不折疊**（同物種第 58 次的治法）：
+    #   blind   讀不到才 HOLD → 失明，alert，6h 節流
+    #   gated   閘關著但是量出來的 → 濾網在做事，warn，24h 節流（真熊市不該天天吵）
+    #   unknown 活動檔缺/壞/過舊 → 我看不到引擎，alert
+    try:
+        from . import scan_activity as _sa
+        from .fire_queue import last_fire_ts as _lft
+
+        try:
+            _lf = _lft()
+        except Exception as _e:  # noqa: BLE001
+            # ⛔ 讀不到不可折成 0。0 的意思是「確認過、從來沒 FIRE 過」，
+            #    而這裡是「我讀不到這張表」——傳 None 讓它走 unknown。
+            print(f"[supervisor] last_fire_ts 讀不到：{type(_e).__name__}: {_e}")
+            _lf = None
+        _v = _sa.drought_verdict(_sa.read_activity(), _lf, now_s=now)
+        if _v:
+            _kind = f"fire_drought_{_v['cls']}"
+            _thr = 24 * 3600 if _v["cls"] == "gated" else 6 * 3600
+            if now - state.last_alert_per_kind.get(_kind, 0) >= _thr:
+                state.last_alert_per_kind[_kind] = now
+                results.append(HealthCheck(
+                    kind=_kind, severity=_v["severity"],
+                    message=_v["text"], detail=_v,
+                ))
+    except Exception as _e:  # noqa: BLE001
+        # 觀測層自己壞掉也不能靜默——那正是這次事故的形狀。
+        print(f"[supervisor] ⚠️ 乾旱偵測失效：{type(_e).__name__}: {_e}")
+
     # === 1.6 系統資源健康（v128，使用者要求「定時排查電腦狀態」）===
     # 背景：兩次「當機」驗屍無藍屏/無硬體錯誤，但 RAM 曾壓到 <11%（Chrome+多開
     # Claude+WSL）——記憶體耗盡型凍機不留事件紀錄，正是無聲當機的頭號嫌疑。

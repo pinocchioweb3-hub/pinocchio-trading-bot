@@ -630,7 +630,7 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
            demo_n, demo_live, demo_active, open_decisions, pending_outbox,
            demo_rejected=0, demo_reject_hint=None, real_output_age_sec=None,
            live_exec=None, org_digest=None, demo_stall_reason=None, pnl_gap=None,
-           org_coverage=None, live_stall=None,
+           org_coverage=None, live_stall=None, signal_drought=None,
            last_nudge_ms=0, stall_sec=STALL_SEC, nudge_cooldown_sec=NUDGE_COOLDOWN_SEC) -> dict:
     """核心判定（純函式）。回 state / next_step / blockers / should_nudge。
 
@@ -689,6 +689,20 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
                 f"模擬盤操盤手輪次狀態{'不明' if _r == 'unknown' else '過舊'}——"
                 "無法證明該 worker 還活著（未知不當在跑），須查 daemon"
             )
+
+    # v239：訊號乾旱。24 天零 FIRE 沒被任何一層看見的教訓——只推 Telegram 不算有
+    #   出口（v170 定的規矩），必須進帳本，否則下一次還是靠人翻資料庫才發現。
+    #   分類承 scan_activity.drought_verdict：
+    #     blind/unknown → system_faults（引擎瞎了或我看不到引擎，該 push CEO 修）
+    #     gated         → blockers（濾網量到 BTC 在 200MA 之下，**不是故障**；
+    #                     但零產出持續中是使用者有權每天看到的事實，且「要不要在
+    #                     熊市放寬閘」只有他能決定——⛔ 那是進場濾網數學，要走回測閘）
+    if signal_drought:
+        _sd_text = signal_drought.get("text") or "訊號引擎零產出（成因未知）"
+        if signal_drought.get("fault"):
+            system_faults.append(_sd_text)
+        else:
+            blockers.append(_sd_text)
 
     ns = next_step(paper_n=paper_n, paper_min=paper_min, live_n=live_n,
                    live_min=live_min, demo_n=demo_n, demo_active=demo_active,
@@ -1014,6 +1028,26 @@ def build_snapshot(now_ms: int | None = None) -> dict:
     except Exception:
         pass
 
+    # v239：訊號乾旱（FIRE 引擎零產出）。⛔ 這一段任何失敗都不可折成 None——
+    #   None 會被 assess 讀成「沒有乾旱」，正是 24 天無人發現的那個折疊動作。
+    signal_drought = None
+    try:
+        from . import scan_activity as _sa
+        from .fire_queue import last_fire_ts as _lft
+        try:
+            _lf = _lft()
+        except Exception:
+            _lf = None          # 讀不到 ≠ 沒 FIRE 過 → 交給 verdict 判 unknown
+        signal_drought = _sa.drought_verdict(_sa.read_activity(), _lf,
+                                             now_s=now_ms / 1000)
+    except Exception as _e:  # noqa: BLE001
+        signal_drought = {
+            "cls": "unknown", "hours": None, "severity": "alert", "fault": True,
+            "counts": {},
+            "text": f"訊號乾旱偵測本身失效（{type(_e).__name__}）"
+                    "——無法判斷 FIRE 引擎是否還在產出",
+        }
+
     verdict = assess(
         now_ms=now_ms, commit_age_sec=commit_age_sec,
         paper_n=paper_n, paper_min=paper_min, live_n=live_n, live_min=live_min,
@@ -1023,7 +1057,7 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         real_output_age_sec=real_output_age_sec,
         live_exec=live_exec, org_digest=org_digest, pnl_gap=pnl_gap,
         org_coverage=org_coverage, live_stall=live_stall,
-        demo_stall_reason=demo_stall_reason,
+        demo_stall_reason=demo_stall_reason, signal_drought=signal_drought,
         last_nudge_ms=last_nudge_ms,
     )
 
@@ -1043,6 +1077,11 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         "demo_reject_hint": demo_reject_hint,
         "open_decisions": open_decisions,
         "pending_outbox": pending_outbox,
+        # v239：乾旱本身也落欄位，不只塞進 blockers 字串——事後要能算「乾旱幾天、
+        # 哪一類」的時間序列，字串撈不出來。
+        "signal_drought_cls": (signal_drought or {}).get("cls"),
+        "signal_drought_hours": (signal_drought or {}).get("hours"),
+        "signal_drought_counts": (signal_drought or {}).get("counts"),
         "last_nudge_ms": last_nudge_ms,  # 沿用；發送後才更新
     }
     # PDP 契約區塊（task #51）：把新鮮度合約寫進帳本，讓 Layer 2 知道

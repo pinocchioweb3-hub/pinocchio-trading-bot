@@ -210,6 +210,36 @@ def stats() -> dict:
         conn.close()
 
 
+def last_fire_ts() -> int:
+    """v239：最後一筆 FIRE 進佇列的 unix 秒。**沒有任何一筆**回 0。
+
+    ⛔ 讀不到（DB 壞掉／被鎖住）時**不回 0、也不回 None**——直接讓例外往上拋。
+       「表是空的、從來沒 FIRE 過」和「我讀不到這張表」在這裡會算出同一個
+       數字，但那是兩個完全不同的事實；把後者折成前者，就會出現「已乾旱
+       N 天」這種憑空捏造的結論，或反過來把真乾旱吞掉。呼叫端自己 try。
+
+    ⚠️ active 表會被 archive_and_clean(7 天) 搬走，所以必須同時看 fires_history，
+       否則歸檔的隔天就會誤判成「從來沒 FIRE 過」。
+    """
+    conn = _conn()
+    try:
+        _init(conn)
+        best = conn.execute(
+            "SELECT COALESCE(MAX(enqueued_at), 0) FROM fires"
+        ).fetchone()[0] or 0
+        has_hist = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fires_history'"
+        ).fetchone()
+        if has_hist:
+            h = conn.execute(
+                "SELECT COALESCE(MAX(enqueued_at), 0) FROM fires_history"
+            ).fetchone()[0] or 0
+            best = max(best, h)
+        return int(best)
+    finally:
+        conn.close()
+
+
 def reset_db() -> None:
     """測試 / demo 用。生產環境別呼叫。"""
     if DB_PATH.exists():
