@@ -265,9 +265,33 @@ def _backfill_factors(symbol: str, top_ratio, sym_closes, sym_vols,
 _UNIVERSE_RETRIES = 2
 
 
+def _universe_miss_reason(r) -> str:
+    """這一幣為什麼沒抓到（v244）。成功時呼叫端不會用到本函式。
+
+    ⛔ 不得回空字串／"unknown"／"error"：四種成因的處置完全不同——
+        API 錯誤（401）→ 續訂／換源
+        回應成功但 items 空 → 查資料契約（幣不在宇宙裡？還是聚合掉了？）
+        回應型別不對 → 查端點契約
+        例外 → 查網路／限流
+    講不清楚等於沒說，而這正是這個 worker 空轉 26 天沒人看出來的原因。
+    """
+    if isinstance(r, BaseException):
+        return f"例外 {type(r).__name__}: {r}"[:160]
+    if not isinstance(r, dict):
+        return f"回應型別非 dict（{type(r).__name__}）"
+    if r.get("error"):
+        code = r.get("code") or "ERROR"
+        msg = str(r.get("message") or r.get("msg") or "").strip()
+        return f"{code}: {msg}"[:160] if msg else f"{code}（無訊息）"
+    if not (r.get("items") or []):
+        return "回應成功但 items 為空（該幣未進宇宙／上游聚合掉了）"
+    return "未知形狀的回應"
+
+
 async def _universe_factors(source, n: int,
                             pace: float = _UNIVERSE_PACE_SECONDS,
-                            retries: int = _UNIVERSE_RETRIES) -> list[dict]:
+                            retries: int = _UNIVERSE_RETRIES,
+                            reasons: dict | None = None) -> list[dict]:
     """取 universe 因子快照——**逐幣節流 + miss 補抓**呼叫 get_strength_universe。
 
     重用 live get_strength_universe 的「每幣聚合」邏輯（candidate_symbols=[sym]、
@@ -285,12 +309,22 @@ async def _universe_factors(source, n: int,
     TRADING_CANDIDATES[:limit]）→ 逐幣重現完全相同的 universe。回每幣 item（依
     canonical 順序）；個別幣最終仍失敗就誠實略過（不捏造，紅線③）。
     """
-    if source is None or not hasattr(source, "get_strength_universe"):
+    # v244：`reasons` 是給呼叫端收「每一幣為什麼沒抓到」的外參（回傳型別刻意不動，
+    # 避免動到既有 8 個測試的簽章）。⛔ 每一條 return [] 都要先留痕——接線斷了
+    # 靜默回空，在輸出上跟「宇宙裡本來就沒幣」一模一樣。
+    if reasons is None:
+        reasons = {}
+    if source is None:
+        reasons["*"] = "daemon 沒給 source（get_source() 失敗或未接線）"
+        return []
+    if not hasattr(source, "get_strength_universe"):
+        reasons["*"] = f"source（{type(source).__name__}）沒有 get_strength_universe"
         return []
     try:
         from market_intel_mcp.symbol_mapping import TRADING_CANDIDATES
         candidates = list(TRADING_CANDIDATES)[:n]
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        reasons["*"] = f"取候選幣清單失敗：{type(e).__name__}: {e}"[:160]
         return []
 
     captured: dict[str, dict] = {}
@@ -301,6 +335,7 @@ async def _universe_factors(source, n: int,
         last = len(remaining) - 1
         for i, sym in enumerate(remaining):
             ok = False
+            r = None
             try:
                 r = await source.get_strength_universe(limit=1, candidate_symbols=[sym])
                 if isinstance(r, dict) and not r.get("error"):
@@ -317,10 +352,14 @@ async def _universe_factors(source, n: int,
                             pass
                         captured[sym] = item0
                         ok = True
-            except Exception:
+            except Exception as e:  # noqa: BLE001
                 ok = False
-            if not ok:
+                r = e                # v244：例外本身就是成因，別在這裡丟掉
+            if ok:
+                reasons.pop(sym, None)   # 補抓成功 → 撤掉上一趟的成因（不留假故障）
+            else:
                 misses.append(sym)   # 429/空手/例外都進補抓清單
+                reasons[sym] = _universe_miss_reason(r)  # …但成因要留下來
             if pace and i < last:
                 await asyncio.sleep(pace)
         remaining = misses
@@ -332,26 +371,36 @@ async def _universe_factors(source, n: int,
     return [captured[s] for s in candidates if s in captured]
 
 
-async def _run_cycle(source=None, n: int = _UNIVERSE_N) -> dict:
+async def _run_cycle(source=None, n: int = _UNIVERSE_N,
+                     pace: float | None = None,
+                     retries: int | None = None) -> dict:
     """跑一輪 CVD 影子觀測，回一個可序列化摘要 dict。
 
     `source`＝daemon 主 source（backend=coinglass 時即 CoinGlassSource）；
     None → 延遲 get_source()（供一次性測試）。
+    `pace`／`retries`＝節流參數（None＝用模組預設；離線測試傳 0 才不用真的睡 3 秒 ×N 趟）。
     """
     from market_intel_mcp.sources.binance_perp import get_binance_perp
 
+    src_reasons: dict[str, str] = {}
     if source is None:
         try:
             from market_intel_mcp.sources import get_source
             source = get_source()
-        except Exception:
+        except Exception as e:  # noqa: BLE001
             source = None
+            src_reasons["*"] = f"get_source() 失敗：{type(e).__name__}: {e}"[:160]
 
     bn = get_binance_perp()
     t0 = time.monotonic()
 
     # 1) universe 因子快照（strength 排名器實際吃到的；含死值/反符號缺口）
-    factor_items = await _universe_factors(source, n)
+    factor_items = await _universe_factors(
+        source, n,
+        pace=_UNIVERSE_PACE_SECONDS if pace is None else pace,
+        retries=_UNIVERSE_RETRIES if retries is None else retries,
+        reasons=src_reasons,
+    )
     syms = [it.get("symbol") for it in factor_items if it.get("symbol")]
 
     # 2) BTC 日線收盤當 btc_corr 參考序列（取一次；BTC 對自己 corr=1.0）。
@@ -395,10 +444,13 @@ async def _run_cycle(source=None, n: int = _UNIVERSE_N) -> dict:
                         if it.get("binance_btc_corr_30d") is not None
                         or it.get("binance_top_trader_dev") is not None
                         or it.get("binance_vol_24h_vs_30d") is not None)
-    return {
+    summary = {
         "ts": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
         "universe_n": n,
         "captured": len(items),
+        # v244：syms 空 ⇒ 一次 Binance 都沒呼叫。少了這一欄，`binance_ok=0` 就同時
+        # 代表「20 幣全失敗」和「從沒問過」——用「我量到是零」冒充「我沒去量」。
+        "binance_attempted": len(syms),
         "binance_ok": n_binance_ok,
         "backfill_ok": n_backfill_ok,             # 至少補到一個因子（top_trader_dev/btc_corr/vol）的幣數
         "span_sec": _span_seconds(cap_ts_list),   # 首→末因子取到的時間跨度（同 T 橫斷面驗證；None=不足2筆）
@@ -408,6 +460,15 @@ async def _run_cycle(source=None, n: int = _UNIVERSE_N) -> dict:
                 "從不寫回 universe/strength/fire；補捉 universe 路徑死值/反符號缺口"
                 "供日後 EV 閘離線『聯合反事實重排序』；因子數學＝v61+v64 回測閘認證純函式",
     }
+    # v244：沒抓到的幣要帶成因進 sink。⛔ 去重成 {成因: [幣]}——20 幣同一句 401 時
+    #       逐幣重複會讓每小時一列的 sink 白白膨脹一倍。
+    # ⛔ 反向側：全成功時完全不加這個鍵（不製造 ⚠️ 雜訊）。
+    if src_reasons:
+        grouped: dict[str, list[str]] = {}
+        for sym, why in src_reasons.items():
+            grouped.setdefault(why, []).append(sym)
+        summary["unavailable"] = grouped
+    return summary
 
 
 async def run_cvd_shadow_loop(source=None, interval_seconds: int = 3600):
@@ -426,11 +487,20 @@ async def run_cvd_shadow_loop(source=None, interval_seconds: int = 3600):
             _append_jsonl(summary)
             span = summary.get("span_sec")
             elapsed = summary.get("elapsed_sec")
+            # v244：`captured=0 binance_ok=0` 讀起來像一個安靜的正常輪——實際上這個
+            # worker 從 2026-07-08（CG 方案到期）起空轉了 574 輪、26 天，每小時印一次
+            # 這行，沒有一次被讀成故障。成因要印在同一行上，否則等於沒印。
+            unavail = summary.get("unavailable") or {}
+            why = ""
+            if unavail:
+                why = "  ⚠️未取得：" + "；".join(
+                    f"{w}×{len(syms)}" for w, syms in unavail.items())
             print(f"[cvd_shadow] universe_n={summary['universe_n']} "
                   f"captured={summary['captured']} "
-                  f"binance_ok={summary['binance_ok']} "
+                  f"binance_ok={summary['binance_ok']}"
+                  f"/{summary.get('binance_attempted')}attempted "
                   f"backfill_ok={summary.get('backfill_ok')} "
-                  f"span_sec={span} elapsed_sec={elapsed}")
+                  f"span_sec={span} elapsed_sec={elapsed}{why}")
             # 整輪耗時逼近 interval＝補抓退避吃太久（橫斷面被拉長/下一輪要遲到），留痕示警
             if isinstance(elapsed, (int, float)) and elapsed > int(interval_seconds) * 0.9:
                 print(f"[cvd_shadow] WARN cycle elapsed={elapsed}s 逼近 interval="
