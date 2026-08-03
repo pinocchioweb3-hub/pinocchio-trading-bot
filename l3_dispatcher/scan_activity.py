@@ -112,6 +112,35 @@ def classify_holds(hold_reasons: dict | None) -> dict:
             "total": blind + gated + other}
 
 
+def blind_detail(hold_reasons: dict | None) -> str:
+    """把「失明」那幾檔的**實際 hold 鍵**列出來（純函式）。
+
+    ⛔ 只講「有 N 檔讀不到資料（btc_gate_stale／filter_stale 類）」是不夠的：
+       要修一個失明的資料源，第一件事就是知道**是哪一個源**。族群名不是源名。
+       實測：2026-08-03 帳本連續多天寫「1 檔失明」，真正的鍵是
+       filter_stale:trend_4h，但沒有任何一層把它印出來，人只能自己去翻活動檔。
+    ⛔ 回空字串代表「這一版活動檔沒留鍵」，呼叫端要照實說「未記錄」，
+       不可省略成什麼都不提。
+    """
+    if not isinstance(hold_reasons, dict):
+        return ""
+    items = []
+    for k, v in hold_reasons.items():
+        key = str(k)
+        if not key.startswith(_BLIND_PREFIXES):
+            continue
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            items.append((key, n))
+    if not items:
+        return ""
+    items.sort(key=lambda kv: -kv[1])
+    return "、".join(f"{k}×{n}" for k, n in items[:3])
+
+
 def drought_verdict(activity: dict | None, last_fire_ts, *,
                     now_s: float | None = None,
                     warn_sec: int = DROUGHT_WARN_SEC,
@@ -186,12 +215,18 @@ def drought_verdict(activity: dict | None, last_fire_ts, *,
     blocked, blocked_note = _blocked_by_check(activity)
 
     if counts["blind"] > 0:
+        detail = blind_detail(activity.get("hold_reasons"))
+        # v253：講出**是哪一個源**瞎了。族群名（「filter_stale 類」）不能拿來當源名——
+        # 要修它得先知道要去修誰，只報族群等於報了一個沒人能行動的事實。
+        detail_txt = f"，失明的是：{detail}" if detail else "（⚠️ 失明的來源鍵未記錄）"
         return _verdict(
             "blind", hours, counts,
             f"訊號引擎已 {hours:.0f}h（{hours / 24:.1f} 天）零產出，而且最近一輪有 "
-            f"{counts['blind']} 檔是**因為讀不到資料**才 HOLD"
-            f"（btc_gate_stale／filter_stale 類）——這是失明，不是市場沒機會。"
-            f"補上資料源之前，引擎不會產出任何東西。", now_s)
+            f"{counts['blind']} 檔是**因為讀不到資料**才 HOLD{detail_txt}"
+            f"——這是失明，不是市場沒機會。"
+            f"補上這個資料源之前，引擎不會產出任何東西。"
+            f"（同輪另有 {counts['gated']} 檔擋在 BTC 大盤閘、{counts['other']} 檔"
+            f"是訊號品質不足，共掃 {activity.get('scanned', '?')} 檔）", now_s)
 
     if counts["gated"] > 0 and counts["gated"] >= counts["other"]:
         return _verdict(
