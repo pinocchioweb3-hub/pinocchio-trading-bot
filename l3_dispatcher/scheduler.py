@@ -28,6 +28,27 @@ CORE_FIELDS = frozenset({
 })
 
 
+def _snap_quality(snap) -> dict:
+    """一份快照的資料品質三欄。兩處呼叫點共用，⛔ 不得各寫一份。
+
+    v241：判據一律走 snapshot 自己的 is_stale()／unknown_fields()，
+    ⛔ 不可用 `f in snap.stale_fields`。後者只涵蓋「來源回報失敗」，
+    漏掉「值是 None」那一種，於是報表會比引擎少數幾欄未知——
+    最痛的一格是 btc_gate_stale：閘的值若是 None 而沒被標 stale，
+    引擎會 HOLD 在失明分支，活動檔卻記「量到了、確實關著」，
+    v239 的乾旱分類器就會把失明降級講成閘控（fault False、warn、24h 節流）。
+
+    core_stale_count 維持只看 CORE_FIELDS——衍生欄（7d 視窗那些）長年為 None
+    是可接受降級，不可灌進 supervisor 的 data_quality_low 口徑。
+    """
+    unknown = set(snap.unknown_fields())
+    return {
+        "stale_count": len(unknown),
+        "core_stale_count": len(unknown & CORE_FIELDS),
+        "btc_gate_stale": snap.is_stale("btc_gate_open"),
+    }
+
+
 @dataclass
 class ScanSummary:
     scanned: int = 0
@@ -137,11 +158,11 @@ async def scan_once(watchlist_or_list, cooldown_seconds: int = 3600,
                 "oi_delta_pct": snap.oi_delta_pct,
                 "btc_gate_open": snap.btc_gate_open, "btc_regime": snap.btc_regime,
                 "is_hot": snap.is_hot, "strength_score": snap.strength_score,
-                "stale_count": len(snap.stale_fields),
-                "core_stale_count": len(set(snap.stale_fields) & CORE_FIELDS),
                 # v239：btc_gate_open=False 有兩種意思——真的量到 BTC 在 200MA
                 # 之下，或根本沒讀到。只記 False 的話兩者無法區分。
-                "btc_gate_stale": "btc_gate_open" in (snap.stale_fields or ()),
+                # v241：判據改走 _snap_quality（is_stale/unknown_fields），
+                #       原本的 `in stale_fields` 漏掉「值是 None」那一種。
+                **_snap_quality(snap),
             })
             # v23-5: 策略由註冊表驅動（取代寫死的 intraday）— 用戶可在 .env
             # STRATEGIES_ENABLED 自選；預設只有 intraday 為 live（行為不變）
@@ -213,8 +234,7 @@ async def scan_once(watchlist_or_list, cooldown_seconds: int = 3600,
                 "price": snap.price, "funding": snap.funding,
                 "oi_delta_pct": snap.oi_delta_pct,
                 "btc_gate_open": snap.btc_gate_open,
-                "stale_count": len(snap.stale_fields),
-                "core_stale_count": len(set(snap.stale_fields) & CORE_FIELDS),
+                **_snap_quality(snap),   # v241：與 trading 層同一個判據
             })
         except Exception as e:
             summary.errors += 1

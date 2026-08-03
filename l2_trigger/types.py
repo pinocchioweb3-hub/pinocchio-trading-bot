@@ -127,6 +127,31 @@ class MarketSnapshot:
                 return True
         return False
 
+    def unknown_fields(self) -> tuple[str, ...]:
+        """回「這一份快照裡，哪些欄位我不知道值」——is_stale() 的全體版本。
+
+        v241：⛔ 不可用 stale_fields 單獨回答這個問題。兩者的意思不一樣：
+
+            stale_fields   = 來源明確回報失敗（MCP 那端標的）
+            值是 None      = 源根本沒給這一欄（例如衍生的 7d 視窗欄）
+
+        引擎問的是 is_stale()＝兩者聯集，所以任何拿 stale_fields 生報表或
+        告警的地方，都會比引擎少數幾欄——同一份快照，兩個「未知」答案，
+        而少報的那一邊會把「我不知道」讀成「正常」。
+
+        線上實測（2026-08-03，CG 停權後）：stale_fields 3 欄，實際未知 11 欄。
+        """
+        from dataclasses import fields as _dc_fields
+        meta = {"symbol", "tf", "stale_fields", "sources_used"}
+        out = [f.name for f in _dc_fields(self)
+               if f.name not in meta and self.is_stale(f.name)]
+        seen = set(out)
+        # stale_fields 可能含 dataclass 上沒有的欄名（MCP 端的欄位集較廣）。
+        # 那些也是「我不知道」，不可因為這邊沒有對應屬性就丟掉。
+        out.extend(f for f in self.stale_fields
+                   if f not in seen and f not in meta)
+        return tuple(out)
+
 
 # =============================================================================
 # 觸發設定（每個 Setup 一份）
