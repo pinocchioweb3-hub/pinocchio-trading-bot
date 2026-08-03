@@ -269,22 +269,46 @@ def render_whale_card(tr: dict, price: float | None) -> str:
             "<i>鏈上觀察·非訊號</i>")
 
 
+async def _push(tg, text: str, *, what: str, **kw) -> bool:
+    """送一則 WLFI 卡片；推不出去一定留痕。
+
+    v253（2026-08-03）：這個模組原本 9 個推送點**全部**包在 `except Exception: pass`
+    裡。於是 v185 那個打錯的參數名（`disable_web_page_preview`，正確是 `disable_preview`）
+    讓鯨魚卡從出生就 100% 送不出去，而且觀測上與「這段時間沒有鯨魚」完全一樣——
+    實測 14 筆已標記 seen 的鯨魚交易（近 24h 內 7 筆，最大 $409K）卡片全數蒸發，兩天無人知。
+    ⛔ 這裡的 except 永遠不准變回 `pass`：推播失敗不可拖垮主迴圈，但必須出聲。
+    """
+    if not tg:
+        return False
+    try:
+        resp = await tg.send_message(text, **kw)
+    except Exception as e:  # noqa: BLE001 — 推播失敗不可拖垮鏈上掃描主迴圈
+        print(f"[wlfi] 推送失敗（{what}）：{type(e).__name__}: {e}")
+        return False
+    # 稽核器的逐字去重是**正常攔截**（它自己已印一行），不算故障、不重複刷屏
+    if isinstance(resp, dict) and not resp.get("ok"):
+        if resp.get("blocked_by_auditor"):
+            return False
+        print(f"[wlfi] 推送被拒（{what}）：{resp.get('description') or resp}")
+        return False
+    return True
+
+
 async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
     """worker：15min 鏈上+行情掃描,事件才推；每日 09:30 台北日報。"""
     print(f"[wlfi] loop online（15min 鏈上+行情;日報 {DIGEST_HOUR_TPE}:30 台北;"
           "display_only）")
     st, _st_status = _load()
     if not st.get("intro_sent") and tg:
-        try:
-            await tg.send_message(
+        if await _push(
+                tg,
                 "🦅 <b>WLFI 專屬追蹤已上線</b>\n"
                 "• 每 15 分鐘：鏈上大額轉帳（≥$200K,標注交易所流向）＋價格劇變（|1h|≥4%）\n"
                 f"• 每日 {DIGEST_HOUR_TPE}:30：深度日報（價格位置/OI/資費/持有人數/"
-                "鯨魚彙總/解鎖倒數/相關新聞）\n" + _DISCLAIMER, parse_mode="HTML")
+                "鯨魚彙總/解鎖倒數/相關新聞）\n" + _DISCLAIMER,
+                what="上線介紹", parse_mode="HTML"):
             st["intro_sent"] = True
             _save(st)
-        except Exception:  # noqa: BLE001
-            pass
     while True:
         try:
             mkt = await _market()
@@ -312,15 +336,13 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                         # v185：DEX 池流出=買入（≥$100K 即推,獨立門檻）
                         if (tr["from"] in pools and usd >= 100_000
                                 and tr["tx"] not in st.get("seen_tx", [])):
-                            if tg:
-                                try:
-                                    await tg.send_message(
-                                        f"🦅💱 <b>DEX 大額買入</b> {tr['amount']:,.0f} 枚"
-                                        f"≈${usd / 1e3:,.0f}K 自資金池流出 → "
-                                        f"<code>{label_of(tr['to'])}</code>\n"
-                                        "<i>鏈上觀察·非訊號</i>", parse_mode="HTML")
-                                except Exception:  # noqa: BLE001
-                                    pass
+                            await _push(
+                                tg,
+                                f"🦅💱 <b>DEX 大額買入</b> {tr['amount']:,.0f} 枚"
+                                f"≈${usd / 1e3:,.0f}K 自資金池流出 → "
+                                f"<code>{label_of(tr['to'])}</code>\n"
+                                "<i>鏈上觀察·非訊號</i>",
+                                what="DEX大額買入", parse_mode="HTML")
                             st.setdefault("seen_tx", []).append(tr["tx"])
                         # v185：交易所提幣收件戶→自動入追蹤名冊（空投提幣近似追蹤）
                         if tr["from"] in _EXCHANGES and usd >= 50_000:
@@ -338,13 +360,8 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                                 card = card.replace("🦅🐋", "🦅👑 <b>Top20 地址動作</b>·🐋")
                             elif tr["from"] in tracked or tr["to"] in tracked:
                                 card = card.replace("🦅🐋", "🦅📇 <b>追蹤名冊動作</b>·🐋")
-                            if tg:
-                                try:
-                                    await tg.send_message(card,
-                                                          parse_mode="HTML",
-                                                          disable_web_page_preview=True)
-                                except Exception:  # noqa: BLE001
-                                    pass
+                            await _push(tg, card, what="鯨魚卡",
+                                        parse_mode="HTML", disable_preview=True)
                             st.setdefault("seen_tx", []).append(tr["tx"])
                             st["seen_tx"] = st["seen_tx"][-300:]
                             whales_24h.append({"ts": now, "usd": usd,
@@ -359,14 +376,13 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                 if ref and ref.get("ts") and now - ref["ts"] >= 3600:
                     chg = (price / ref["px"] - 1) * 100
                     if abs(chg) >= PRICE_MOVE_PCT and tg:
-                        try:
-                            await tg.send_message(
-                                f"🦅⚡ <b>WLFI 價格劇變</b> 1h {chg:+.1f}% → "
-                                f"${price:.5f}\n資費 {mkt.get('funding_pct8h')}%/8h　"
-                                f"OI ${(mkt.get('oi_usd') or 0) / 1e6:.1f}M\n"
-                                "<i>觀察·非訊號</i>", parse_mode="HTML")
-                        except Exception:  # noqa: BLE001
-                            pass
+                        await _push(
+                            tg,
+                            f"🦅⚡ <b>WLFI 價格劇變</b> 1h {chg:+.1f}% → "
+                            f"${price:.5f}\n資費 {mkt.get('funding_pct8h')}%/8h　"
+                            f"OI ${(mkt.get('oi_usd') or 0) / 1e6:.1f}M\n"
+                            "<i>觀察·非訊號</i>",
+                            what="價格劇變", parse_mode="HTML")
                     st["px_1h_ref"] = {"ts": now, "px": price}
                 elif not ref:
                     st["px_1h_ref"] = {"ts": now, "px": price}
@@ -395,21 +411,20 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                             if abs(d) >= supply * 0.0005:
                                 moves.append((a, d))
                         for a, d in moves[:3]:
-                            try:
-                                await tg.send_message(
-                                    f"🦅👑 <b>Top20 持倉變動</b> "
-                                    f"<code>{label_of(a)}</code> "
-                                    f"{'增持' if d > 0 else '減持'} {abs(d):,.0f} 枚"
-                                    f"（{abs(d) / supply * 100:.2f}% 供給）\n"
-                                    "<i>鏈上觀察·非訊號</i>", parse_mode="HTML")
-                            except Exception:  # noqa: BLE001
-                                pass
+                            await _push(
+                                tg,
+                                f"🦅👑 <b>Top20 持倉變動</b> "
+                                f"<code>{label_of(a)}</code> "
+                                f"{'增持' if d > 0 else '減持'} {abs(d):,.0f} 枚"
+                                f"（{abs(d) / supply * 100:.2f}% 供給）\n"
+                                "<i>鏈上觀察·非訊號</i>",
+                                what="Top20持倉變動", parse_mode="HTML")
                     if cur_top:
                         st["top_holders"] = cur_top
                         top10_share = sum(sorted(cur_top.values())[-10:]) / 1e11 * 100
                         st["top10_share"] = round(top10_share, 2)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    print(f"[wlfi] Top20 持倉差分失敗（下小時再試）：{type(e).__name__}: {e}")
                 # ── v185：每小時 WLFI 新聞掃描（新條目才推,最多 1 則/時）──
                 try:
                     from news_feed.okx_news import _okx_news, parse_items
@@ -423,14 +438,16 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                             if nid and nid not in seen_news:
                                 t = (it.get("title") or "").strip()
                                 if t and tg:
-                                    await tg.send_message(
+                                    await _push(
+                                        tg,
                                         f"🦅📰 <b>WLFI 動態</b>\n{t[:200]}\n"
-                                        "<i>OKX News·僅供參考</i>", parse_mode="HTML")
+                                        "<i>OKX News·僅供參考</i>",
+                                        what="WLFI動態", parse_mode="HTML")
                                 seen_news.append(nid)
                                 break
                         st["seen_news"] = seen_news[-50:]
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    print(f"[wlfi] WLFI 新聞掃描失敗（下小時再試）：{type(e).__name__}: {e}")
                 try:
                     from market_intel_mcp.sources.binance_perp import get_binance_perp
                     bsrc = get_binance_perp()
@@ -480,11 +497,9 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                         if squeeze:
                             lines.append("🧨 軋空燃料觀察：OI升+價滯+負資費=空方擁擠（觀察非預測）")
                         lines.append("<i>幣安+OKX 雙池觀察·非訊號</i>")
-                        try:
-                            await tg.send_message("\n".join(lines), parse_mode="HTML")
+                        if await _push(tg, "\n".join(lines),
+                                       what="小時深度卡", parse_mode="HTML"):
                             st["hourly_card_ts"] = now
-                        except Exception:  # noqa: BLE001
-                            pass
                     st["hourly_ref"] = {"ts": now, "px": price, "fr": fr}
                 except Exception as e:  # noqa: BLE001
                     print(f"[wlfi] hourly 深度失敗（下小時再試）：{type(e).__name__}: {e}")
@@ -541,11 +556,9 @@ async def run_wlfi_watch_loop(tg=None, poll_seconds: int = POLL_S):
                 if news_lines:
                     card.append("📰 相關動態：\n" + "\n".join(news_lines))
                 card.append(_DISCLAIMER)
-                try:
-                    await tg.send_message("\n".join(card), parse_mode="HTML")
+                if await _push(tg, "\n".join(card),
+                               what="每日日報", parse_mode="HTML"):
                     st["digest_day"] = day_key
-                except Exception:  # noqa: BLE001
-                    pass
             _save(st)
         except Exception as e:  # noqa: BLE001
             print(f"[wlfi] loop 例外（不致命）：{type(e).__name__}: {e}")

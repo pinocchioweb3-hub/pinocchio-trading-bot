@@ -35,13 +35,32 @@
    ```
    只接受「全綠，或僅剩既有已知紅（如 stale 環境相關）」。新出現的紅 → **停**，先修。
 
-5. **唯一一次切換** — 用 `start_bot.ps1`（它自己會冪等地先殺舊 run_bot、再起新的）：
+5. **先架煞車閂**（watchdog 每 3 分鐘一輪；切換窗內它若看到 daemon 不見了會拿**舊碼**
+   把它拉回來，跟 `start_bot.ps1` 互相踩踏 → 兩個 daemon 搶同一個 Telegram bot＝409）：
+   ```bash
+   : > "$LOCALAPPDATA/TradingBot/watchdog.disabled"
+   ```
+
+6. **唯一一次切換** — 用 `start_bot.ps1`（它自己會冪等地先殺舊 run_bot、再起新的）：
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\start_bot.ps1
    ```
    ⚠️ `start_bot.ps1` **必須是 UTF-8 BOM 編碼**，否則 Big5/950 會解析失敗 → 整晚斷線。
 
-6. **重啟後驗證（4 點全綠才算成功）**：
+   ⚠️ **不要把它的輸出接到 `| tail` 之類的管道上跑前景**：腳本會佔住 stdout，
+   工具端逾時被 SIGTERM 砍掉，`trap ... EXIT` 那種「保證清理」也不會執行
+   （2026-08-03 實測 exit 143，旗標留在原地）。要嘛丟背景，要嘛直接跑不接管道。
+
+7. **拔掉煞車閂**（⚠️ 這步最常被忘）：
+   ```bash
+   rm -f "$LOCALAPPDATA/TradingBot/watchdog.disabled"
+   ```
+   **旗標留著＝daemon 掛了沒有任何東西會把它拉回來。** 歷史上被忘記至少 6 次
+   （06-18、07-29、08-01 兩次、08-02、08-03），最長一次橫跨 15 小時。
+   v237 起 watchdog 每輪會推一則 TG 告警並附「已持續 N 小時」，但它
+   ⛔ **不會自己刪**（因為分不出是部署窗還是你刻意關的）——所以只能靠這一步。
+
+8. **重啟後驗證（4 點全綠才算成功）**：
    - **單一進程**：`Get-WmiObject Win32_Process -Filter "Name='python.exe'" | ? {$_.CommandLine -match 'run_bot'}` 只回 1 筆（不是 0、不是 2+）。
    - **真解譯器**：該進程的 CommandLine 指向 `pythoncore-3.14-64\python.exe`，非 WindowsApps shim。
    - **err.log 乾淨**：`bot.err.log` 無新的 traceback / 409 Conflict（409＝有兩個 daemon 搶同一 Telegram bot）。

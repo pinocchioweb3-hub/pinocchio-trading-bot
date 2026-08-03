@@ -109,7 +109,7 @@ async def run_coindesk_loop(tg, poll_seconds: int = POLL_S):
                        "<i>資訊僅供參考，非交易訊號</i>")
                 try:
                     await tg.send_message(msg, parse_mode="HTML",
-                                          disable_web_page_preview=True)
+                                          disable_preview=True)
                     mark_seen(source=SOURCE, handle="coindesk", post_id=pid, pushed=True, push_reason="pushed")
                     recent_titles.append(it["title"])   # 同輪內也去重
                     pushed += 1
