@@ -32,7 +32,15 @@ CORE_FIELDS = frozenset({
 class ScanSummary:
     scanned: int = 0
     fires_enqueued: int = 0
+    # ⚠️ v240 起語意收窄成「**只有**真的還在冷卻期」。在那之前，「cross-check 把這筆
+    # 單否決了」也加在這個數字上（原碼註解白紙黑字寫「視同被擋」）。兩件事的意思
+    # 差很多：一個是規則量到東西、主動否決；一個是這檔剛出過單、時間還沒到。
     fires_in_cooldown: int = 0
+    # v240：被 cross-check 擋下的 FIRE 數與**是哪一項擋的**。沒有這兩欄的話，
+    # 「真的有 FIRE、但每一筆都被擋掉」在 v239 的乾旱偵測器眼中會消失得無影無蹤，
+    # 於是它只好指著一個不相干的濾網說「gated、濾網在做事」——歸因錯人。
+    fires_blocked_check: int = 0
+    check_block_reasons: dict[str, int] = field(default_factory=dict)
     holds: int = 0
     # v239：hold 的**理由分布**。舊版只有上面那個 holds 計數，於是
     # 「濾網量到 BTC 在 200MA 之下、盡責擋單」和「資料源掛了、引擎瞎掉」
@@ -154,7 +162,23 @@ async def scan_once(watchlist_or_list, cooldown_seconds: int = 3600,
                         if not chk.pass_:
                             print(f"[scheduler] {sym}/{cfg.setup_name}/{decision.direction.value} "
                                   f"FIRE blocked by cross-check (conf={chk.confidence}): {chk.reason}")
-                            summary.fires_in_cooldown += 1   # 視同被擋
+                            # ⛔ v240：這裡**不可**再加到 fires_in_cooldown。
+                            #    「規則否決」和「還在冷卻」折成同一個數字，等於把
+                            #    「引擎為什麼沒產出」的答案親手擦掉。
+                            summary.fires_blocked_check += 1
+                            _named = False
+                            for _c in (chk.checks or []):
+                                if not _c.get("pass"):
+                                    _k = str(_c.get("name") or "unnamed")[:64]
+                                    summary.check_block_reasons[_k] = \
+                                        summary.check_block_reasons.get(_k, 0) + 1
+                                    _named = True
+                            if not _named:
+                                # 每項都 pass、卻靠負 delta 把分數壓到 30 以下。
+                                # 這也是一種成因，不可留白。
+                                _k = "score_below_min"
+                                summary.check_block_reasons[_k] = \
+                                    summary.check_block_reasons.get(_k, 0) + 1
                             continue
                         # 把 confidence 注入 enqueue 用的 decision metadata
                         if enqueue(decision, cooldown_seconds=cooldown_seconds,
@@ -223,6 +247,8 @@ def _write_scan_activity(summary: ScanSummary) -> None:
             "scanned": summary.scanned,
             "fires_enqueued": summary.fires_enqueued,
             "fires_in_cooldown": summary.fires_in_cooldown,
+            "fires_blocked_check": summary.fires_blocked_check,
+            "check_block_reasons": dict(summary.check_block_reasons),
             "holds": summary.holds,
             "hold_reasons": dict(summary.hold_reasons),
             "errors": summary.errors,
@@ -247,10 +273,12 @@ async def run_scheduler(
         summary = await scan_once(watchlist, cooldown_seconds=cooldown_seconds)
         n_fire = summary.fires_enqueued
         n_cd = summary.fires_in_cooldown
+        n_blk = summary.fires_blocked_check
         n_hold = summary.holds
         n_err = summary.errors
         n_mon = sum(1 for s in summary.snapshots if s.get("tier") == "monitor")
-        print(f"[scheduler] fire_scan={summary.scanned}({n_fire} fires, {n_cd} cooldown, {n_hold} holds)  monitor={n_mon}  err={n_err}")
+        print(f"[scheduler] fire_scan={summary.scanned}({n_fire} fires, {n_cd} cooldown, "
+              f"{n_blk} blocked-by-check, {n_hold} holds)  monitor={n_mon}  err={n_err}")
         if summary_callback:
             summary_callback(summary)
         await asyncio.sleep(interval_seconds)

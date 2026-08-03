@@ -183,6 +183,7 @@ def drought_verdict(activity: dict | None, last_fire_ts, *,
     counts = classify_holds(activity.get("hold_reasons"))
     gate_open = activity.get("btc_gate_open")
     hours = elapsed / 3600.0
+    blocked, blocked_note = _blocked_by_check(activity)
 
     if counts["blind"] > 0:
         return _verdict(
@@ -199,9 +200,19 @@ def drought_verdict(activity: dict | None, last_fire_ts, *,
             f"{counts['gated']}/{counts['total']} 檔 HOLD 在 BTC 大盤閘"
             f"（btc_gate_open={gate_open}，來源 {activity.get('btc_gate_source') or '?'}）。"
             f"閘是**量出來的**、不是讀不到——濾網在正常做事，非故障。"
-            f"但零產出持續中，這件事本身你有權每天看到。", now_s)
+            f"但零產出持續中，這件事本身你有權每天看到。{blocked_note}", now_s)
 
     if counts["total"] == 0:
+        # v240：零 hold 不一定是成因不明——「每檔都 FIRE 了、但每筆都被 cross-check
+        # 擋下」也長這樣。這種情況成因一清二楚，指名它，別歸到 unknown 去。
+        if blocked is not None and blocked > 0:
+            return _verdict(
+                "gated", hours, counts,
+                f"訊號引擎已 {hours:.0f}h（{hours / 24:.1f} 天）零產出：最近一輪有 "
+                f"{blocked} 筆 FIRE 被 cross-check 擋下"
+                f"（{_top_reason(activity.get('check_block_reasons'), '（擋單理由未記錄）')}）"
+                f"——**不是冷卻、也不是市場沒機會**，是一致性檢查量到東西否決了它們。",
+                now_s)
         # 有乾旱、卻連一筆 hold 都沒有。⛔ 不可讓它掉進下面那句含糊的
         #    「最大宗 HOLD 理由：（無）」——那讀起來像「市場很安靜」，
         #    但真相通常是**一檔都沒掃到**（watchlist refresh 失敗／宇宙來源掛了）。
@@ -227,12 +238,34 @@ def drought_verdict(activity: dict | None, last_fire_ts, *,
     return _verdict(
         "gated", hours, counts,
         f"訊號引擎已 {hours:.0f}h（{hours / 24:.1f} 天）零產出，"
-        f"最大宗 HOLD 理由：{top}", now_s)
+        f"最大宗 HOLD 理由：{top}{blocked_note}", now_s)
 
 
-def _top_reason(hold_reasons) -> str:
+def _blocked_by_check(activity: dict) -> tuple[int | None, str]:
+    """讀「本輪被 cross-check 擋下幾筆」。回 (數量或 None, 要附進訊息的字串)。
+
+    三種狀態要分清楚，⛔ 一種都不准折成另一種：
+      * 欄位不存在  → None。意思是「這一版活動檔量不到」，**不是**「確認 0 筆被擋」。
+                      這時訊息不加任何字——不宣稱有、也不宣稱沒有。
+      * 讀不出來    → None，但訊息要明講讀不出，否則又變成靜默。
+      * 有值        → int。>0 才附上「被擋了幾筆、是哪一項擋的」。
+    """
+    if "fires_blocked_check" not in activity:
+        return None, ""
+    raw = activity.get("fires_blocked_check")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None, f"（⚠️ cross-check 擋單數讀不出：{raw!r}，本輪成因可能不完整）"
+    if n <= 0:
+        return n, ""
+    return n, (f"（另有 {n} 筆 FIRE 被 cross-check 擋下："
+               f"{_top_reason(activity.get('check_block_reasons'), '（擋單理由未記錄）')}）")
+
+
+def _top_reason(hold_reasons, empty: str = "（無 hold 理由紀錄）") -> str:
     if not isinstance(hold_reasons, dict) or not hold_reasons:
-        return "（無 hold 理由紀錄）"
+        return empty
     items = sorted(hold_reasons.items(), key=lambda kv: -int(kv[1] or 0))
     return "、".join(f"{k}×{v}" for k, v in items[:3])
 
