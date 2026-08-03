@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -44,6 +45,17 @@ RISK_USD_CAP = 150.0             # 風險絕對上限
 NOTIONAL_CAP_USD = 3000.0        # 單筆名義值上限（防張數換算出錯爆倉）
 LEVERAGE = 5                     # 保守槓桿（美股代幣永續上限 25x，取遠低於上限）
 TIMEOUT_HOURS = 24.0             # 持倉逾時強制平倉（對齊紙上 us_breakout 24h 口徑）
+# ── TP1 後保本移損（v249；使用者 2026-08-03 明確指示） ────────────────
+# 開關預設 ON＝使用者要的行為。⛔ 誠實揭露：自家 1366 訊號的止損管理 A/B（task#13，
+# memory/stop-management-ab-verdict.md）判定「TP1 後保本」在**加密突破訊號**上
+# 淨 R 期望 −0.027（A_fixed −0.000），配對 PSR P=0% 顯著劣於不搬；勝率從 41.5%
+# 抬到 52.0% 是砍掉右尾換來的幻覺。該 A/B **沒有**涵蓋美股引擎、也沒用 deepdive
+# 真訊號 ⇒ 對這條路徑只是先驗、不是定論。使用者已知此結論仍要求落地（保住已浮盈
+# 的部位優先於期望值最大化），照做並留下量測欄位，日後可用真樣本回頭裁決。
+BE_ENABLED = True                # TP1（任一 TP 腿）成交後，把剩餘腿的止損搬到保本
+BE_BUFFER_R = 0.1                # 保本緩衝（R）：⛔ 不設 0——剛好成本價扣完雙邊手續費
+                                 #   仍是淨虧，而且貼著均價＝噪音磁鐵（A/B 同此設定）
+BE_GAP_RECENT_MAX = 20           # 健康檔內保留的「該保本卻沒搬成」明細筆數上限
 DAILY_STOP_USD = 300.0           # 日虧熔斷（≈3R）：當日已實現虧損達此值→今日不再接新單
 OUTBOX = Path(os.path.expandvars(r"%LOCALAPPDATA%\TradingBot\intent_outbox"))
 STATE = Path(os.path.expandvars(r"%LOCALAPPDATA%\TradingBot\atk_consumer_state.json"))
@@ -128,6 +140,13 @@ PNL_GAP_RECENT_MAX = 20             # 健康檔內保留的漏記明細筆數上
 # 放棄前先重試幾輪。⛔ 用「輪數」不用牆鐘：每輪都是獨立行程（schtasks 每分鐘一次），
 # 牆鐘門檻會在排程漏跑／休眠時把重試窗白白吃掉，反而更容易走到不可逆那一步。
 PNL_RETRY_MAX = 5
+# v249：本輪「已吃到 TP1、但剩餘腿的止損沒能搬到保本」的部位；每輪開頭清空。
+# ⛔ 刻意**不**走 _note_fail：那是「輪級故障」的通道，而這是**部位狀態**。
+#   v171 的 lev_mismatch 正是踩了這個坑——倉活著就每輪記一次故障 ⇒
+#   consecutive_fail_rounds 永不歸零、last_ok_ts 凍住、蓋掉其他類別，
+#   帳本因此把「執行器照跑」誤報成「管線實質停擺」。這裡比照 _ROUND_PNL_GAPS
+#   走獨立結構化通道：計數、明細、時間戳都進健康檔，但不污染故障連續輪。
+_ROUND_BE_GAPS: list[dict] = []
 
 
 # Windows 陷阱：npm 全域裝的 okx 是 okx.cmd shim，subprocess 不走 shell 找不到裸名
@@ -349,8 +368,33 @@ def _account_pnl_gap(h: dict, gaps, now_s: float) -> None:
     h["pnl_unaccounted_recent"] = recent[-PNL_GAP_RECENT_MAX:]
 
 
+def _account_be_gap(h: dict, gaps, now_s: float) -> None:
+    """把本輪「已吃到 TP1、但剩餘腿的止損沒搬成保本」的部位記進健康帳（就地改 h）。
+
+    v249：保本這件事只有兩個時刻有意義——TP1 成交後、剩餘腿還在場的那段。搬不動
+    （查不到掛單／amend 被拒／回應看不懂）時，倉位仍掛在**原始止損**上，也就是使用者
+    以為已經保住的利潤其實還在風險裡。這個落差只以一行 log 存在就等於不存在
+    （v164/v166/v167/v169/v170 同一物種）。
+
+    ⛔ 不寫「已保本」的正向計數進這裡：這本帳只記缺口。正向證據落在部位檔的
+    be.state/be.px（含實際搬到的價位），一平倉就跟著消失是刻意的——保本成功不是
+    需要跨輪追蹤的風險，保本失敗才是。"""
+    drops = list(gaps or [])
+    if not drops:
+        return                                  # 沒事不生欄位＝帳本不長出一排 0
+    h["breakeven_unmoved_total"] = int(h.get("breakeven_unmoved_total", 0)) + len(drops)
+    h["breakeven_unmoved_last_ts"] = now_s
+    recent = list(h.get("breakeven_unmoved_recent") or [])
+    for d in drops:
+        recent.append({"inst_id": d.get("inst_id"), "pos_side": d.get("pos_side"),
+                       "symbol": d.get("symbol"), "intent_id": d.get("intent_id"),
+                       "reason": d.get("reason"), "tries": d.get("tries"),
+                       "want_px": d.get("want_px"), "ts": now_s})
+    h["breakeven_unmoved_recent"] = recent[-BE_GAP_RECENT_MAX:]
+
+
 def update_health(h: dict, fails: dict, now_s: float, oks: int = 0,
-                  expired=None, pnl_gaps=None) -> dict:
+                  expired=None, pnl_gaps=None, be_gaps=None) -> dict:
     """把本輪結果併進健康狀態（純函式，不做 I/O）。
 
     connsecutive_fail_rounds 只在「有故障的輪」累加；乾淨輪歸零並在曾告警過時
@@ -380,6 +424,9 @@ def update_health(h: dict, fails: dict, now_s: float, oks: int = 0,
     # v170（r68）：同理，記在空轉輪提早 return 之前。漏記不必然發生在空轉輪，但只要
     #   有一次落在那條路徑上就永久記不到，而這種東西只會在事後才被發現。
     _account_pnl_gap(h, pnl_gaps, now_s)
+    # v249：同理擺在空轉輪提早 return 之前。搬不動保本最典型的成因就是查詢類故障，
+    #   而那種輪很可能一次成功呼叫都沒有（oks==0）＝正好落在空轉輪分支上。
+    _account_be_gap(h, be_gaps, now_s)
     if not fails and int(oks or 0) <= 0:
         # 空轉輪：沒故障也沒成功呼叫＝本輪對「是否已恢復」零資訊，維持原判
         h["idle_rounds"] = int(h.get("idle_rounds", 0)) + 1
@@ -623,7 +670,7 @@ def send_alert(text: str, dry: bool = False) -> tuple[str, str | None]:
 
 def finish_round(fails: dict, now_s: float | None = None,
                  dry: bool = False, oks: int = 0, expired=None,
-                 pnl_gaps=None) -> dict:
+                 pnl_gaps=None, be_gaps=None) -> dict:
     """每輪收尾：更新健康檔、必要時告警。永不對外拋例外——
     告警層絕不可以把交易執行器弄掛（它的職責只是「讓失敗有出口」）。
 
@@ -642,7 +689,7 @@ def finish_round(fails: dict, now_s: float | None = None,
             print(f"⚠️ 健康檔讀取失敗（{HEALTH.name}）——連續故障計數視為未知，"
                   f"本輪若有故障即告警，不從零重數")
         h = update_health(base, fails, now_s, oks, expired=expired,
-                          pnl_gaps=pnl_gaps)
+                          pnl_gaps=pnl_gaps, be_gaps=be_gaps)
         if h.get("recovered_from"):
             ch, err = send_alert(recovery_text(h), dry=dry)
             h["last_alert_channel"], h["last_alert_error"] = ch, err
@@ -704,6 +751,43 @@ def sizing_retryable(reason: str | None) -> bool:
     return reason not in _SIZING_TERMINAL
 
 
+def fetch_inst_spec(inst_id: str, *, out: dict | None = None) -> dict | None:
+    """查合約規格。回 None＝這輪讀不出來／交易所沒這個 instId，原因寫進 out["reason"]。
+
+    v249 從 contracts_for 抽出來：同一份回應裡本來就帶著 tickSz（保本改價要對齊
+    最小跳動）與 lever（該合約的**最大**槓桿），舊碼只留 ctVal/lotSz/minSz 就丟掉。
+    ⛔ 張數換算的數學一個字都沒動——只是多留兩個欄位；sizing 仍只讀 ctVal/lotSz/minSz。
+    ⚠️ tickSz/maxLever 解不出來時留 None（**不猜**），呼叫端各自決定要不要因此止步。
+    """
+    def _fail(reason: str) -> None:
+        if out is not None:
+            out["reason"] = reason
+        return None
+
+    code, cli_out = _okx(["market", "instruments", "--instType", "SWAP",
+                          "--instId", inst_id])
+    if code != 0:
+        return _fail("spec_cli_failed")   # _okx 那層已記了連線類故障
+    try:
+        # CLI --json 頂層可能是 list（實測 v1.4.2）或 {"data":[...]}，兩者都容；
+        # v209：其餘形狀＝認不得＝未知（舊碼的 raw.get("data") 會回 None，
+        # 接著 None[0] 拋 TypeError，與「這筆單不成立」得到同一個答案）
+        items = parse_okx_rows(json.loads(cli_out))
+        if items is None:
+            return _fail("spec_unreadable")
+        if not items:
+            # {"data": []}＝交易所**確認**沒有這個 instId（v208 的邊界線）：
+            # 重試一百次也不會長出來 ⇒ 終局，不可當未知每輪重試
+            return _fail("spec_not_found")
+        item = items[0]
+        return {"ctVal": float(item["ctVal"]), "lotSz": float(item["lotSz"]),
+                "minSz": float(item["minSz"]),
+                "tickSz": _pos_float(item.get("tickSz")),
+                "maxLever": _pos_float(item.get("lever"))}
+    except Exception:  # noqa: BLE001
+        return _fail("spec_unreadable")
+
+
 def contracts_for(inst_id: str, entry: float, stop: float, ct_val_cache: dict,
                   *, out: dict | None = None) -> float | None:
     """風險預算→張數。sz=風險USD÷|entry−stop|÷ctVal，向下取整到 lotSz。錯→None 不下單。
@@ -717,27 +801,11 @@ def contracts_for(inst_id: str, entry: float, stop: float, ct_val_cache: dict,
 
     spec = ct_val_cache.get(inst_id)
     if spec is None:
-        code, cli_out = _okx(["market", "instruments", "--instType", "SWAP",
-                              "--instId", inst_id])
-        if code != 0:
-            return _fail("spec_cli_failed")   # _okx 那層已記了連線類故障
-        try:
-            # CLI --json 頂層可能是 list（實測 v1.4.2）或 {"data":[...]}，兩者都容；
-            # v209：其餘形狀＝認不得＝未知（舊碼的 raw.get("data") 會回 None，
-            # 接著 None[0] 拋 TypeError，與「這筆單不成立」得到同一個答案）
-            items = parse_okx_rows(json.loads(cli_out))
-            if items is None:
-                return _fail("spec_unreadable")
-            if not items:
-                # {"data": []}＝交易所**確認**沒有這個 instId（v208 的邊界線）：
-                # 重試一百次也不會長出來 ⇒ 終局，不可當未知每輪重試
-                return _fail("spec_not_found")
-            item = items[0]
-            spec = {"ctVal": float(item["ctVal"]), "lotSz": float(item["lotSz"]),
-                    "minSz": float(item["minSz"])}
-            ct_val_cache[inst_id] = spec
-        except Exception:  # noqa: BLE001
-            return _fail("spec_unreadable")
+        why: dict = {}
+        spec = fetch_inst_spec(inst_id, out=why)
+        if spec is None:
+            return _fail(why.get("reason") or "spec_unreadable")
+        ct_val_cache[inst_id] = spec
     risk = min(RISK_USD, RISK_USD_CAP)
     dist = abs(entry - stop)
     if dist <= 0 or spec["ctVal"] <= 0:
@@ -1099,6 +1167,199 @@ def _realized_pnl_since(inst_id: str,
         return None
 
 
+# ── TP1 後保本移損（v249；使用者 2026-08-03 指示） ──────────────────────
+def _tick_round(px: float, tick: float | None, *, up: bool) -> float:
+    """對齊最小跳動。tick 未知→原樣回（⛔ 不猜小數位數，讓 OKX 自己回 51006）。"""
+    if not tick or tick <= 0:
+        return px
+    n = px / tick
+    k = math.ceil(n - 1e-9) if up else math.floor(n + 1e-9)
+    return round(k * tick, 10)
+
+
+def breakeven_stop_px(avg_px, orig_sl, pos_side: str, tick: float | None = None,
+                      buffer_r: float = BE_BUFFER_R) -> float | None:
+    """TP1 後的保本止損價（純函式）。回 None＝算不出來（⛔ 不得退回猜一個值）。
+
+    ① 基準是**實際成交均價**，不是 intent 裡的計畫進場價。真錢上這兩個數差很多：
+       2026-08-03 MU 空單計畫進場 822.88、實際成交 815.83——拿計畫價當「保本」，
+       等於把止損擺在每單位虧 7.06 的位置，名字叫保本、行為是認賠出場。
+    ② R 距離取「均價 ↔ 原始止損」＝這筆單**實際**承擔的風險（同理不用計畫價算）。
+    ③ 緩衝往獲利側推 buffer_r 個 R：⛔ 不用 0。剛好停在均價，扣完進出雙邊手續費
+       仍是淨虧，而且貼著均價＝雜訊磁鐵（自家 A/B 的 MIN_BE_BUFFER_R 同此理由）。
+    ④ 取整往「離現價較遠」那側（空單進位、多單捨去）：寧可少鎖一點利，也不要因為
+       取整反而更貼身被掃掉。
+    ⑤ 結果必定嚴格優於原始止損；不是的話回 None（⛔ 保本永遠不該讓風險變大）。
+    """
+    a, s = _pos_float(avg_px), _pos_float(orig_sl)
+    if a is None or s is None:
+        return None
+    bull = pos_side == "long"
+    dist = abs(a - s)
+    if dist <= 0:
+        return None
+    if (bull and s >= a) or (not bull and s <= a):
+        return None                       # 原始止損擺在獲利側＝形狀不對，不動它
+    buf = dist * max(0.0, float(buffer_r))
+    raw = a + buf if bull else a - buf
+    px = _tick_round(raw, tick, up=not bull)
+    if bull and not (s < px < a + dist):
+        return None
+    if not bull and not (a - dist < px < s):
+        return None
+    return px
+
+
+def stop_is_at_least_breakeven(cur_sl, be_px, pos_side: str) -> bool | None:
+    """現有止損是否已達（或優於）保本價。回 None＝讀不出來（⛔ 不得當成「已經到了」）。"""
+    c, b = _pos_float(cur_sl), _pos_float(be_px)
+    if c is None or b is None:
+        return None
+    return c >= b if pos_side == "long" else c <= b
+
+
+def pending_stop_legs(rows, pos_side: str) -> list | None:
+    """從 algo orders 回應挑出「這一邊、還掛著、帶止損」的腿。
+
+    回 None＝形狀認不得（**未知**）；回 []＝查得到且**確認**沒有掛單。
+    ⛔ 這兩者不可再合用 []——「查不到掛單」和「這倉真的沒有止損」在風險上是相反的兩件事
+    （後者是裸奔、要立刻喊；前者只是下輪重試）。v162/v208 同一紀律。"""
+    if rows is None:
+        return None
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            return None
+        if r.get("posSide") not in (pos_side, None, ""):
+            continue
+        if r.get("state") not in ("live", "effective", "pause"):
+            continue
+        if not r.get("algoId") or not r.get("slTriggerPx"):
+            continue
+        out.append(r)
+    return out
+
+
+def move_stops_to_breakeven(rec: dict, avg_px, dry: bool) -> tuple[str, dict]:
+    """把該倉**剩餘腿**的止損搬到保本價。回 (state, info)；⛔ 不就地改 rec。
+
+    state：done＝這輪確認每一腿都在保本價（含本來就已經在）；unknown＝查不到／看不懂
+    （下輪重試）；no_pending＝查得到且確認一張掛單都沒有（＝這倉此刻沒有交易所端止損，
+    是比搬不動更嚴重的事，要出聲）；amend_failed＝改價被拒。
+
+    為什麼要逐腿改而不是重下一張：三腿各自帶著自己的附掛 OCO（見 place() 的註解），
+    先撤再下會出現「舊的撤了、新的還沒成」的裸奔窗，而 amend 是交易所端原子操作。
+    """
+    iid, side = rec.get("inst_id"), rec.get("pos_side")
+    code, out = _okx(["swap", "algo", "orders", "--instId", iid,
+                      "--ordType", "oco"])
+    if code != 0 or not out.strip().startswith(("[", "{")):
+        return "unknown", {"reason": "algo_query_failed"}
+    try:
+        rows = parse_okx_rows(json.loads(out))
+    except Exception:  # noqa: BLE001
+        return "unknown", {"reason": "algo_unreadable"}
+    legs = pending_stop_legs(rows, side)
+    if legs is None:
+        return "unknown", {"reason": "algo_unreadable"}
+    if not legs:
+        return "no_pending", {"reason": "no_pending_algo"}
+    # 原始止損：優先用下單時記下的（v249 起每筆都留），舊紀錄沒有時退回讀掛單上的值。
+    # ⚠️ 退回路徑只在「還沒搬過」時是對的——搬過之後掛單上的值就是保本價，再拿它當
+    #   基準算一次會得到更貼身的止損（棘輪）。所以 rec["be"]["state"]=="done" 一律
+    #   不再進來（呼叫端負責），且下面每腿都會先檢查「是否已達保本」。
+    orig_sl = rec.get("stop")
+    if orig_sl is None:
+        orig_sl = min((_pos_float(r.get("slTriggerPx")) or 0) for r in legs) \
+            if side == "long" else \
+            max((_pos_float(r.get("slTriggerPx")) or 0) for r in legs)
+    be = breakeven_stop_px(avg_px, orig_sl, side, rec.get("tickSz"))
+    if be is None:
+        return "unknown", {"reason": "be_px_uncomputable",
+                           "avg_px": _pos_float(avg_px), "orig_sl": _pos_float(orig_sl)}
+    moved, already, failed = 0, 0, []
+    for r in legs:
+        done = stop_is_at_least_breakeven(r.get("slTriggerPx"), be, side)
+        if done is True:
+            already += 1
+            continue
+        if done is None:
+            failed.append({"algoId": r.get("algoId"), "err": "sl_unreadable"})
+            continue
+        if dry:
+            print(f"DRY-RUN: okx algo amend {iid} algoId={r.get('algoId')} "
+                  f"--newSlTriggerPx {be:g}")
+            moved += 1
+            continue
+        c2, o2 = _okx(["swap", "algo", "amend", "--instId", iid,
+                       "--algoId", str(r.get("algoId")),
+                       "--newSlTriggerPx", f"{be:g}"])
+        if c2 == 0 and ('"sCode": "0"' in o2 or '"sCode":"0"' in o2
+                        or '"algoId"' in o2):
+            moved += 1
+        else:
+            failed.append({"algoId": r.get("algoId"),
+                           "err": redact_secrets(o2)[:120]})
+    info = {"px": be, "moved": moved, "already": already,
+            "legs": len(legs), "failed": failed}
+    if failed:
+        info["reason"] = "amend_rejected"
+        return "amend_failed", info
+    return "done", info
+
+
+def maybe_breakeven(rec: dict, live_sz: float, avg_px, dry: bool,
+                    iid_key: str) -> None:
+    """TP1（任一 TP 腿）成交後把剩餘腿的止損搬到保本。就地改 rec；缺口進 _ROUND_BE_GAPS。
+
+    觸發判定＝「交易所上剩下的張數 < 下單時送出去的張數」。三腿 40/30/30 的階梯下，
+    第一次成立必然是 TP1 成交那一刻（止損若先觸發，整倉會被平掉、走的是另一條分支）。
+    ⛔ 不用「現價是否越過 tp1」判斷：那是拿代理值當事實，掛單成沒成交只有交易所知道。
+    """
+    if not BE_ENABLED:
+        return
+    st = dict(rec.get("be") or {})
+    if st.get("state") == "done":
+        return                                   # 已保本，⛔ 不再算第二次（防棘輪）
+    placed = _pos_float(rec.get("contracts"))
+    if placed is None:
+        # 下單張數沒記錄＝連「有沒有吃到 TP1」都判不出來。⛔ 不得默認「沒吃到」——
+        # 那會讓保本永遠不觸發，而且完全無聲。出聲並記缺口，由人工接手。
+        st.update({"state": "blocked", "reason": "placed_size_unknown",
+                   "ts": time.time()})
+        rec["be"] = st
+        _ROUND_BE_GAPS.append({"intent_id": iid_key, "inst_id": rec.get("inst_id"),
+                               "pos_side": rec.get("pos_side"),
+                               "symbol": rec.get("symbol"),
+                               "reason": "placed_size_unknown", "tries": 0})
+        return
+    if live_sz + 1e-9 >= placed:
+        return                                   # 一腿都還沒成交＝還輪不到保本
+    state, info = move_stops_to_breakeven(rec, avg_px, dry)
+    tries = int(st.get("tries", 0) or 0) + 1
+    st.update({"state": state, "tries": tries, "ts": time.time(),
+               "px": info.get("px"), "reason": info.get("reason")})
+    rec["be"] = {k: v for k, v in st.items() if v is not None}
+    if state == "done":
+        if info.get("moved"):
+            print(f"🛡 {rec.get('inst_id')} {rec.get('pos_side')} 已吃到 TP1 "
+                  f"（{placed:g}→{live_sz:g} 張），剩餘 {info['moved']} 腿的止損"
+                  f"已搬到保本 {info['px']:g}"
+                  + (f"（另有 {info['already']} 腿本來就到位）" if info.get("already") else ""))
+        return
+    msg_head = {"unknown": "查不到／看不懂掛單",
+                "no_pending": "⚠️ 交易所上一張掛單都沒有（此倉此刻沒有交易所端止損）",
+                "amend_failed": "改價被拒"}.get(state, state)
+    print(f"🚨 {rec.get('inst_id')} {rec.get('pos_side')} 已吃到 TP1，但止損沒能搬到"
+          f"保本：{msg_head}（{info.get('reason')}，第 {tries} 輪）——剩餘腿仍掛在"
+          f"**原始止損**上，下輪重試")
+    _ROUND_BE_GAPS.append({"intent_id": iid_key, "inst_id": rec.get("inst_id"),
+                           "pos_side": rec.get("pos_side"),
+                           "symbol": rec.get("symbol"),
+                           "reason": info.get("reason") or state, "tries": tries,
+                           "want_px": info.get("px")})
+
+
 def manage_positions(dry: bool) -> list | None:
     """每輪管理：①反向對帳（交易所有、本地帳沒有＝孤兒部位）②對帳（OKX 上已消失＝
     TP/SL 已了結→記日損益）③逾時強平。任何查詢失敗→本輪什麼都不做（下輪重試）。
@@ -1161,12 +1422,18 @@ def manage_positions(dry: bool) -> list | None:
     #   零額外呼叫、零新故障面。
     live_lever = {(p.get("instId"), p.get("posSide")): p.get("lever")
                   for p in plist}
+    # v249：同一份回應也帶著**實際成交均價**——保本價唯一正確的基準（計畫進場價
+    #   在真錢上會差好幾個 tick，見 breakeven_stop_px 註解①）。一樣是零額外呼叫。
+    live_avg = {(p.get("instId"), p.get("posSide")): p.get("avgPx")
+                for p in plist}
     now_s = time.time()
     for iid, rec in list(ps["open"].items()):
         key = (rec["inst_id"], rec["pos_side"])
         if live.get(key, 0.0) != 0.0:
             # 在場才讀回（已了結的倉交易所不會再回它的槓桿）
             _record_leverage_readback(rec, live_lever.get(key), now_s)
+            # v249：TP1 成交後把剩餘腿的止損搬到保本（使用者 2026-08-03 指示）
+            maybe_breakeven(rec, live.get(key, 0.0), live_avg.get(key), dry, iid)
         if live.get(key, 0.0) == 0.0:
             # 已了結（TP/SL/手動）→ 記日損益後移出
             res = _realized_pnl_since(rec["inst_id"], rec["placed_at"])
@@ -1518,6 +1785,7 @@ def main() -> int:
         _ROUND_OKS["ok"] = 0             # v151：成功帳同步歸零（分辨空轉輪用）
         _ROUND_EXPIRED.clear()           # v169：本輪丟棄帳從零開始
         _ROUND_PNL_GAPS.clear()          # v170：本輪熔斷漏記帳從零開始
+        _ROUND_BE_GAPS.clear()           # v249：本輪保本缺口從零開始
         # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
         # v159（r47）：manage_positions 同時做反向對帳，回本輪的孤兒部位鍵
         # v162（r53）：None＝本輪掃描沒跑成（查不到交易所部位）⇒ 擋單閘等於瞎掉，
@@ -1641,6 +1909,13 @@ def main() -> int:
                                            "pos_side": intent["pos_side"],
                                            "symbol": intent.get("symbol"),
                                            "contracts": sz,
+                                           # v249：保本要用「原始止損」當 R 基準。
+                                           # 不記下來就只能回頭讀掛單上的值，而那個
+                                           # 值在搬過一次之後就是保本價本身 ⇒ 會愈
+                                           # 算愈貼身（棘輪）。tickSz 同理，改價要對齊。
+                                           "stop": float(intent["stop"]),
+                                           "tickSz": (ct_cache.get(
+                                               intent["inst_id"]) or {}).get("tickSz"),
                                            # v171（r69）：留下「打算用的槓桿」，
                                            # 否則下輪讀回交易所的值沒有比較基準
                                            # ⇒ 只能永遠判 unknown。
@@ -1659,7 +1934,8 @@ def main() -> int:
         # v143：本輪收尾——把 fail-closed 記帳並在連續失敗時告警（dry-run 不真送）
         finish_round(dict(_ROUND_FAILS), dry=a.dry_run, oks=_ROUND_OKS["ok"],
                      expired=list(_ROUND_EXPIRED),
-                     pnl_gaps=list(_ROUND_PNL_GAPS))
+                     pnl_gaps=list(_ROUND_PNL_GAPS),
+                     be_gaps=list(_ROUND_BE_GAPS))
         if a.once or a.dry_run:
             return 0
         time.sleep(60)
