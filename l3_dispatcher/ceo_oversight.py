@@ -145,12 +145,29 @@ ORG_HEADER_LINES = 12
 #    那是如假包換的代補產，整行判會把它洗成自產＝缺報被蓋成痊癒（本 marker 的病根）。
 ORG_BACKFILL_NEGATIONS = ("非", "不是", "未")
 ORG_BACKFILL_LOOKBEHIND = 6
+# r130：否定詞不是唯一一種「這句話不是在講自己」。實測（2026-08-03 10:2x 台北）：
+# PM 席**自產**的 pm-2026-08-03.md 第 3 行已正確聲明「**本席自產**（非監督員代補）」
+# 並被否定詞擋下，卻栽在第 5 行——它在交代沿革時提到**上一份**：
+#     **涵蓋區間**：2026-07-30 ～ 08-03（上一份為 `pm-2026-07-30.md`，
+#                   該份為監督員代補產；本席自產最新為 `pm-2026-07-06`）
+# 「該份為監督員代補產」講的是**別份**檔，前面沒有否定詞 ⇒ 舊判法命中 ⇒ 這份自產檔
+# 被歸成代補產。後果是活的、且正好打在最不該打的地方：r123 起連四輪把組織排程列為
+# 「已修待驗、要等該席**自產**檔落地才算痊癒」，8/03 09:44 那份自產檔真的落地了，
+# 卻被這支判定吃掉 ⇒ 帳本當天仍印「PM 席排程仍未自產＝未驗收」＝**驗收訊號被驗收
+# 工具自己擋掉**，且會慢性化（往後每份提到沿革的自產報告都會再踩一次）。
+# 判法沿用同一個窄窗：marker 前一小段若出現「指涉別份文件」的詞，這一命中不算數。
+# ⛔ 窗仍維持 ORG_BACKFILL_LOOKBEHIND（窄）——放寬窗會把隔壁子句的詞吃進來，
+#    方向上等於少判代補產＝缺報被蓋成痊癒，那是本 marker 的病根，寧可誤判成代補產。
+# ⛔ 也不可改成「整行提到別的日期就跳過」：真代補產常會寫明自己在補哪一期
+#    （「本檔為監督員代補產，補 07-20 那一期」），整行判會把它洗成自產。
+ORG_BACKFILL_OTHERDOC = ("該份", "該篇", "該檔", "上一份", "上一期", "前一份", "前一期", "那一份")
 
 
 def is_backfill_header(head: str) -> bool:
     """檔頭是否**聲明**自己是監督員代補產（純函式，永不拋）。
 
-    只要有任何一個未被否定的 marker 出現就算代補產；全部都被否定才算自產。
+    只要有任何一個「未被否定、且不是在講別份文件」的 marker 出現就算代補產；
+    全部都被排除掉才算自產。
     """
     try:
         text = head or ""
@@ -162,8 +179,9 @@ def is_backfill_header(head: str) -> bool:
             # 只往回看同一行的一小段——跨行的「非」與本行的「代補」無關。
             line_start = text.rfind("\n", 0, i) + 1
             ctx = text[max(line_start, i - ORG_BACKFILL_LOOKBEHIND):i]
-            if not any(n in ctx for n in ORG_BACKFILL_NEGATIONS):
-                return True          # 有一個沒被否定 ⇒ 是代補產
+            if not any(n in ctx for n in ORG_BACKFILL_NEGATIONS) \
+                    and not any(o in ctx for o in ORG_BACKFILL_OTHERDOC):
+                return True          # 沒被否定、也不是在講別份 ⇒ 是代補產
             start = i + len(ORG_BACKFILL_MARKER)
     except Exception:
         return False                 # 判不出來就當自產（沿用既有口徑：不誤報斷檔）
