@@ -147,6 +147,16 @@ PNL_RETRY_MAX = 5
 #   帳本因此把「執行器照跑」誤報成「管線實質停擺」。這裡比照 _ROUND_PNL_GAPS
 #   走獨立結構化通道：計數、明細、時間戳都進健康檔，但不污染故障連續輪。
 _ROUND_BE_GAPS: list[dict] = []
+# v252：本輪「名義值夾層把張數砍小、單筆風險因此低於預算」的下單；每輪開頭清空。
+# 2026-08-03 使用者實測發現的破口：他預期每單風險＝帳戶 2%，實際只有 1/6。成因不是
+# 風險預算設錯，而是 NOTIONAL_CAP_USD 先咬住（INTC 換算 14.6 張／名義值 1286U >
+# 600U ⇒ 砍到 6.8 張、有效風險 20U→9.3U）。夾層本身是對的（它擋張數換算爆掉），
+# 錯在**砍完不說話**：舊碼只在「砍完連 minSz 都不到」時回報，砍到一半＝靜音 ⇒
+# 「這筆的 1R 是多少」帳上永遠是設定值、實際是另一個數。同一物種（把量到的降級
+# 折成正常）。⛔ 比照 _ROUND_PNL_GAPS／_ROUND_BE_GAPS 走獨立結構化通道，**不**走
+# _note_fail——這不是輪級故障，而且下單本身是成功的。
+_ROUND_RISK_CUTS: list[dict] = []
+CAP_CUT_RECENT_MAX = 20            # 健康檔內保留的砍倉明細筆數上限
 
 
 # Windows 陷阱：npm 全域裝的 okx 是 okx.cmd shim，subprocess 不走 shell 找不到裸名
@@ -393,8 +403,31 @@ def _account_be_gap(h: dict, gaps, now_s: float) -> None:
     h["breakeven_unmoved_recent"] = recent[-BE_GAP_RECENT_MAX:]
 
 
+def _account_risk_cut(h: dict, cuts, now_s: float) -> None:
+    """把本輪「名義值夾層砍小張數 ⇒ 單筆風險低於預算」的下單記進健康帳（就地改 h）。
+
+    v252：這是**成功**的下單，只是規模不是設定值。不記的話，風險預算與實際曝險的
+    落差只有交易所的保證金欄位知道——使用者 2026-08-03 就是靠手機截圖才看出來的。
+    ⛔ 不歸類成故障：夾層咬住是設計行為，要治的是它無聲。"""
+    drops = list(cuts or [])
+    if not drops:
+        return                                  # 沒事不生欄位＝帳本不長出一排 0
+    h["risk_capped_total"] = int(h.get("risk_capped_total", 0)) + len(drops)
+    h["risk_capped_last_ts"] = now_s
+    recent = list(h.get("risk_capped_recent") or [])
+    for d in drops:
+        recent.append({"inst_id": d.get("inst_id"), "symbol": d.get("symbol"),
+                       "pos_side": d.get("pos_side"), "intent_id": d.get("intent_id"),
+                       "risk_intended": d.get("risk_intended"),
+                       "risk_effective": d.get("risk_effective"),
+                       "sz_uncapped": d.get("sz_uncapped"), "sz": d.get("sz"),
+                       "notional_cap": d.get("notional_cap"), "ts": now_s})
+    h["risk_capped_recent"] = recent[-CAP_CUT_RECENT_MAX:]
+
+
 def update_health(h: dict, fails: dict, now_s: float, oks: int = 0,
-                  expired=None, pnl_gaps=None, be_gaps=None) -> dict:
+                  expired=None, pnl_gaps=None, be_gaps=None,
+                  risk_cuts=None) -> dict:
     """把本輪結果併進健康狀態（純函式，不做 I/O）。
 
     connsecutive_fail_rounds 只在「有故障的輪」累加；乾淨輪歸零並在曾告警過時
@@ -427,6 +460,10 @@ def update_health(h: dict, fails: dict, now_s: float, oks: int = 0,
     # v249：同理擺在空轉輪提早 return 之前。搬不動保本最典型的成因就是查詢類故障，
     #   而那種輪很可能一次成功呼叫都沒有（oks==0）＝正好落在空轉輪分支上。
     _account_be_gap(h, be_gaps, now_s)
+    # v252：同理擺在空轉輪提早 return 之前。砍張數發生在**算完張數、還沒送出**那一刻，
+    #   那一輪很可能一次成功呼叫都沒有（下單失敗／規格查詢不算 ok）＝正好落在空轉輪
+    #   分支上。v169/v170/v249 三次都栽在這條路徑，這次直接照抄結論。
+    _account_risk_cut(h, risk_cuts, now_s)
     if not fails and int(oks or 0) <= 0:
         # 空轉輪：沒故障也沒成功呼叫＝本輪對「是否已恢復」零資訊，維持原判
         h["idle_rounds"] = int(h.get("idle_rounds", 0)) + 1
@@ -670,7 +707,7 @@ def send_alert(text: str, dry: bool = False) -> tuple[str, str | None]:
 
 def finish_round(fails: dict, now_s: float | None = None,
                  dry: bool = False, oks: int = 0, expired=None,
-                 pnl_gaps=None, be_gaps=None) -> dict:
+                 pnl_gaps=None, be_gaps=None, risk_cuts=None) -> dict:
     """每輪收尾：更新健康檔、必要時告警。永不對外拋例外——
     告警層絕不可以把交易執行器弄掛（它的職責只是「讓失敗有出口」）。
 
@@ -689,7 +726,8 @@ def finish_round(fails: dict, now_s: float | None = None,
             print(f"⚠️ 健康檔讀取失敗（{HEALTH.name}）——連續故障計數視為未知，"
                   f"本輪若有故障即告警，不從零重數")
         h = update_health(base, fails, now_s, oks, expired=expired,
-                          pnl_gaps=pnl_gaps, be_gaps=be_gaps)
+                          pnl_gaps=pnl_gaps, be_gaps=be_gaps,
+                          risk_cuts=risk_cuts)
         if h.get("recovered_from"):
             ch, err = send_alert(recovery_text(h), dry=dry)
             h["last_alert_channel"], h["last_alert_error"] = ch, err
@@ -817,9 +855,19 @@ def contracts_for(inst_id: str, entry: float, stop: float, ct_val_cache: dict,
     if sz < spec["minSz"]:
         return _fail("below_min_size")
     if sz * spec["ctVal"] * entry > NOTIONAL_CAP_USD:   # 名義值夾層
+        sz_uncapped = sz
         sz = int(NOTIONAL_CAP_USD / (spec["ctVal"] * entry) / lot) * lot
         if sz < spec["minSz"]:
             return _fail("below_min_after_cap")
+        # v252：夾層砍到一半也要留下痕跡。⛔ 上面的數學一個字都沒動——這裡只是把
+        #   「本來幾張、實際幾張、有效風險掉到多少」交回呼叫端。不寫進 out 的話，
+        #   這筆單的真實 1R 就只存在於交易所的保證金欄位裡，本地任何一本帳都查不到。
+        if out is not None:
+            out["capped"] = True
+            out["sz_uncapped"] = round(sz_uncapped, 8)
+            out["risk_intended"] = risk
+            out["risk_effective"] = sz * spec["ctVal"] * dist
+            out["notional_cap"] = NOTIONAL_CAP_USD
     return round(sz, 8)
 
 
@@ -1829,6 +1877,7 @@ def main() -> int:
         _ROUND_EXPIRED.clear()           # v169：本輪丟棄帳從零開始
         _ROUND_PNL_GAPS.clear()          # v170：本輪熔斷漏記帳從零開始
         _ROUND_BE_GAPS.clear()           # v249：本輪保本缺口從零開始
+        _ROUND_RISK_CUTS.clear()         # v252：本輪名義值夾層砍倉帳從零開始
         # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
         # v159（r47）：manage_positions 同時做反向對帳，回本輪的孤兒部位鍵
         # v162（r53）：None＝本輪掃描沒跑成（查不到交易所部位）⇒ 擋單閘等於瞎掉，
@@ -1933,6 +1982,22 @@ def main() -> int:
                     print(f"❌ {iid} 張數換算不成立（{why}）——跳過（不猜）")
                     done.add(iid)
                 continue
+            # v252：夾層砍小了這筆的規模 ⇒ 實際 1R 不是設定值。出聲＋進健康帳。
+            #   ⛔ 不擋單：砍小是保守方向，擋掉反而讓一筆合格訊號憑空消失。
+            if sz_why.get("capped"):
+                _ROUND_RISK_CUTS.append(
+                    {"intent_id": iid, "inst_id": intent["inst_id"],
+                     "symbol": intent.get("symbol"),
+                     "pos_side": intent.get("pos_side"),
+                     "risk_intended": sz_why.get("risk_intended"),
+                     "risk_effective": sz_why.get("risk_effective"),
+                     "sz_uncapped": sz_why.get("sz_uncapped"), "sz": sz,
+                     "notional_cap": sz_why.get("notional_cap")})
+                print(f"📉 {iid} {intent['inst_id']} 名義值夾層咬住："
+                      f"{sz_why.get('sz_uncapped')}→{sz} 張，"
+                      f"本筆實際風險 ≈{sz_why.get('risk_effective'):.2f}U"
+                      f"（預算 {sz_why.get('risk_intended'):.2f}U，"
+                      f"上限 {sz_why.get('notional_cap'):.0f}U）")
             # 只在成功時記已處理：失敗留給下輪重試（OKX clOrdId 冪等擋重複成交，
             # intent 過期窗兜底——永久性錯誤最多重試到 expires_at）
             if place(intent, sz, a.dry_run, spec=ct_cache.get(intent["inst_id"])):
@@ -1957,6 +2022,12 @@ def main() -> int:
                                            # 值在搬過一次之後就是保本價本身 ⇒ 會愈
                                            # 算愈貼身（棘輪）。tickSz 同理，改價要對齊。
                                            "stop": float(intent["stop"]),
+                                           # v252：這筆單**實際**押了多少風險。
+                                           # 沒有夾層時就是預算值；被砍時才是真相。
+                                           "risk_usd": (
+                                               sz_why.get("risk_effective")
+                                               if sz_why.get("capped")
+                                               else min(RISK_USD, RISK_USD_CAP)),
                                            "tickSz": (ct_cache.get(
                                                intent["inst_id"]) or {}).get("tickSz"),
                                            # v171（r69）：留下「打算用的槓桿」，
@@ -1978,7 +2049,8 @@ def main() -> int:
         finish_round(dict(_ROUND_FAILS), dry=a.dry_run, oks=_ROUND_OKS["ok"],
                      expired=list(_ROUND_EXPIRED),
                      pnl_gaps=list(_ROUND_PNL_GAPS),
-                     be_gaps=list(_ROUND_BE_GAPS))
+                     be_gaps=list(_ROUND_BE_GAPS),
+                     risk_cuts=list(_ROUND_RISK_CUTS))
         if a.once or a.dry_run:
             return 0
         time.sleep(60)
