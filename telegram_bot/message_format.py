@@ -291,14 +291,25 @@ def render_fire_with_checks(decision_dict: dict, check_result) -> tuple[str, lis
     base_text, buttons = render_fire_message(decision_dict)
     # 加 cross-check 區塊
     badge = render_confidence_badge(check_result.confidence)
+    # v238：分數是「有量到的那幾項」算出來的。四項資料源掛掉時舊版照印
+    # 「🟢 高信心（100/100）」，讀的人會理解成七項全過 —— 分數旁必須帶涵蓋率。
+    n_unknown = sum(1 for c in check_result.checks if c.get("unknown"))
+    qualifier = (f"・{len(check_result.checks)} 項中 {n_unknown} 項未能量測、未計分"
+                 if n_unknown else "")
     addon = [
         "",
-        f"🔍 <b>Cross-Check：{badge}（{check_result.confidence}/100）</b>",
+        f"🔍 <b>Cross-Check：{badge}（{check_result.confidence}/100"
+        f"{_esc(qualifier)}）</b>",
     ]
     for c in check_result.checks:
         passed = c.get("pass", True)
         delta = c.get("delta", 0)
-        icon = "✅" if passed and delta >= 0 else ("⚠️" if not passed else "ℹ️")
+        if c.get("unknown"):
+            # ⛔ 未知列是 pass=True/delta=0，走舊式判斷會拿到 ✅ —— 「✅ 資料讀不到」
+            #    正是把「量不到」畫成「沒問題」。獨立分支，不得併回上面。
+            icon = "❓"
+        else:
+            icon = "✅" if passed and delta >= 0 else ("⚠️" if not passed else "ℹ️")
         addon.append(f"   {icon} {_esc(c.get('note', ''))}")
     return base_text + "\n".join(addon), buttons
 

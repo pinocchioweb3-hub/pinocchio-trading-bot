@@ -11,6 +11,12 @@
     5. ETF 流向背離（BTC FIRE 時 ETF 流出 = 跟機構反向）
     6. 情緒極端值（極度貪婪時 FIRE BULL 風險升高）
     7. 新聞敘事偏向（task#66 Q2 Phase 1；**delta 恆 0 純觀測**，不參與計分）
+
+v238：外部資料讀不到時，該項不再從卡上無聲消失。舊行為是整段 `if` 跳過 ⇒
+七項只印三項、結論仍印 `all checks passed`、confidence 100，讀卡的人分不出
+「這項通過」與「這項沒跑過」。現在一律留一列 `unknown=True`（delta 恆 0）。
+⛔ 未知**不扣分**：讓未知保守降分是進場濾網數學的改動，要走回測閘（PSR/DSR）。
+⛔ 「不適用」不是「量不到」：山寨幣沒有現貨 ETF，不得標未知（見 Check 5）。
 """
 from __future__ import annotations
 
@@ -18,6 +24,23 @@ from dataclasses import dataclass
 from typing import Any
 
 from l2_trigger.types import TriggerDecision, TriggerAction, SignalState
+
+
+def _unknown_row(name: str, note: str) -> dict:
+    """「這項量不到」的觀測列（v238）。
+
+    舊行為是資料缺失就整段 `if` 跳過 —— 卡上連一列都不會出現，於是七項檢查
+    只印三項、結論還是 `all checks passed`／confidence 100。讀卡的人（和 CEO
+    報告）無從分辨「這項通過」與「這項沒跑過」。
+
+    ⛔ delta 恆 0：本層只治可見性。「未知是否該像 Check 2 的 BTC 閘那樣保守
+       扣分」屬於進場濾網數學的改動，要走回測閘（PSR/DSR），不得在此順手做。
+    ⛔ pass 維持 True：這一列不是「檢查失敗」，是「沒有結論」。標成 False 會讓
+       下游把它算成扣分項，等於偷偷改了計分。可見性靠 `unknown` 這個獨立旗標。
+    """
+    # note 本身不帶符號：渲染端會依 `unknown` 旗標補 ❓，重複前綴會變成「❓ ❓ …」。
+    return {"name": name, "pass": True, "delta": 0, "unknown": True,
+            "note": f"{note}（未計分）"}
 
 
 @dataclass
@@ -29,6 +52,10 @@ class ConsistencyResult:
 
     def downgraded(self) -> bool:
         return self.pass_ and self.confidence < 60
+
+    def unknown_names(self) -> list[str]:
+        """量不到的檢查名（由 checks 列即時算出，不另存欄位以免兩處漂移）。"""
+        return [c["name"] for c in self.checks if c.get("unknown")]
 
 
 async def cross_check_fire(
@@ -74,7 +101,10 @@ async def cross_check_fire(
                        "note": f"BTC gate {snap.btc_gate_open}"})
 
     # === Check 3: Funding 極端值 ===
-    if snap.funding is not None:
+    if snap.funding is None:
+        checks.append(_unknown_row(
+            "funding_check", "funding 讀不到（stale/缺欄）→ 過熱與否無法確認"))
+    else:
         f_pct = snap.funding * 100
         if direction == SignalState.BULL and snap.funding >= 0.0008:
             checks.append({"name": "funding_check", "pass": False, "delta": -15,
@@ -109,9 +139,21 @@ async def cross_check_fire(
         else:
             checks.append({"name": "liquidation_alignment", "pass": True, "delta": 0,
                            "note": "標的不在前 20 大清算榜（量小）"})
+    else:
+        # ⛔「榜上沒有它」（上面那列，量到了、答案是量小）與「整份榜單讀不到」
+        #    是兩件事，不可共用同一列措辭。
+        checks.append(_unknown_row(
+            "liquidation_alignment", "清算榜讀不到 → 多空清算失衡無法確認"))
 
     # === Check 5: ETF 流向（僅 BTC/ETH）===
-    if etf_flows and sym in ("BTC", "ETH") and not etf_flows.get("error"):
+    # ⛔ 山寨幣沒有現貨 ETF 這回事 ⇒ 那是「不適用」，不是「量不到」，不得標未知；
+    #    否則每張山寨幣卡都會多一列假警訊，❓ 這個符號很快就沒人看了。
+    if sym not in ("BTC", "ETH"):
+        pass
+    elif not etf_flows or etf_flows.get("error"):
+        checks.append(_unknown_row(
+            "etf_alignment", f"{sym} ETF 流向讀不到 → 機構同向與否無法確認"))
+    else:
         cum_7d = etf_flows.get("cumulative_7d_flow_usd", 0)
         # 7d 累計流出 > $500M = 機構在減倉
         if direction == SignalState.BULL and cum_7d < -500_000_000:
@@ -127,22 +169,35 @@ async def cross_check_fire(
                            "note": f"ETF 7d ${cum_7d/1e6:.0f}M"})
 
     # === Check 6: 情緒極端值 ===
-    if sentiment and not sentiment.get("error"):
-        fg = sentiment.get("fear_greed_now")
-        ahr = sentiment.get("ahr999_now")
-        if fg is not None:
-            if direction == SignalState.BULL and fg >= 85:
-                checks.append({"name": "sentiment_check", "pass": False, "delta": -15,
-                               "note": f"BULL 但 F&G {fg}（極度貪婪）"})
-                score -= 15
-            elif direction == SignalState.BULL and fg <= 20:
-                checks.append({"name": "sentiment_check", "pass": True, "delta": +10,
-                               "note": f"BULL + F&G {fg}（極度恐懼，反向有利）"})
-                score = min(100, score + 10)
-            else:
-                checks.append({"name": "sentiment_check", "pass": True, "delta": 0,
-                               "note": f"F&G {fg}"})
-        if ahr is not None and direction == SignalState.BULL and ahr > 1.2:
+    # F&G 與 AHR999 是全系統唯二會量化影響開單的情緒/估值接點；讀不到時無聲跳過，
+    # 等於「極度貪婪該扣的 15 分」永遠不會扣，而且卡上看不出來少扣了。
+    _sent_ok = bool(sentiment) and not sentiment.get("error")
+    fg = sentiment.get("fear_greed_now") if _sent_ok else None
+    ahr = sentiment.get("ahr999_now") if _sent_ok else None
+    if fg is None and ahr is None:
+        # ⛔ 包含「連上了、dict 回來了、但兩個欄位都是 None」——有回應不等於有讀數。
+        checks.append(_unknown_row(
+            "sentiment_check", "F&G／AHR999 皆讀不到 → 情緒與估值極端值無法確認"))
+    else:
+        if fg is None:
+            checks.append(_unknown_row(
+                "sentiment_check", "F&G 讀不到 → 情緒極端值無法確認"))
+        elif direction == SignalState.BULL and fg >= 85:
+            checks.append({"name": "sentiment_check", "pass": False, "delta": -15,
+                           "note": f"BULL 但 F&G {fg}（極度貪婪）"})
+            score -= 15
+        elif direction == SignalState.BULL and fg <= 20:
+            checks.append({"name": "sentiment_check", "pass": True, "delta": +10,
+                           "note": f"BULL + F&G {fg}（極度恐懼，反向有利）"})
+            score = min(100, score + 10)
+        else:
+            checks.append({"name": "sentiment_check", "pass": True, "delta": 0,
+                           "note": f"F&G {fg}"})
+
+        if ahr is None:
+            checks.append(_unknown_row(
+                "valuation_check", "AHR999 讀不到 → 估值高低無法確認"))
+        elif direction == SignalState.BULL and ahr > 1.2:
             checks.append({"name": "valuation_check", "pass": False, "delta": -10,
                            "note": f"AHR999 {ahr}（高估區）"})
             score -= 10
@@ -175,11 +230,26 @@ async def cross_check_fire(
     pass_ = score >= 30  # 低於 30 直接擋
     reason_parts = []
     for c in checks:
-        if not c.get("pass") or (c.get("delta") and c["delta"] != 0):
+        # ⛔ 未知列 pass=True/delta=0，兩個既有條件都抓不到它 —— 必須顯式納入，
+        #    否則「量不到」照樣被結論那行吞掉（那正是本次要治的東西）。
+        if c.get("unknown"):
+            # reason 是純文字串（會單獨進 log／payload／CEO 報告，看不到 ❓ 圖示），
+            # 所以這裡自己帶上「未能量測」四個字，不依賴渲染端。
+            reason_parts.append(f"未能量測：{c['note']}")
+        elif not c.get("pass") or (c.get("delta") and c["delta"] != 0):
             reason_parts.append(c["note"])
+
+    n_unknown = sum(1 for c in checks if c.get("unknown"))
+    if reason_parts:
+        reason = " | ".join(reason_parts)
+    elif n_unknown:                      # 理論上不會走到（未知列已進 reason_parts）
+        reason = f"{n_unknown} 項未能量測，其餘通過"
+    else:
+        reason = "all checks passed"     # ⛔ 只有真的每項都量到了才准這樣講
+
     return ConsistencyResult(
         confidence=score,
         pass_=pass_,
         checks=checks,
-        reason=" | ".join(reason_parts) if reason_parts else "all checks passed",
+        reason=reason,
     )
