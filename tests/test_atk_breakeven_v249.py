@@ -184,6 +184,48 @@ def test_move_reports_no_pending_separately_from_unknown(monkeypatch):
     assert state == "no_pending" and info["reason"] == "no_pending_algo"
 
 
+def test_rejected_amend_that_echoes_algoid_is_not_success():
+    """⛔ v251：OKX 的**失敗**回應照樣帶 algoId。舊判準『回應裡有 algoId 就算成功』
+    會把被拒的改價記成 moved、狀態寫 done，而 done 是黏著的 ⇒ 這倉從此不再重試，
+    帳上寫「已保本」、交易所上的止損還在原處。這一次是靠事後回交易所對帳才確認
+    沒中招，⛔ 不能繼續靠運氣。"""
+    rejected = json.dumps({"code": "1", "data": [
+        {"algoId": "3799902930107846656", "sCode": "51279",
+         "sMsg": "The Stop loss trigger price cannot be higher than the last price"}]})
+    assert ci.amend_succeeded(0, rejected) is False
+    assert ci.amend_succeeded(0, json.dumps({"code": "0", "data": [
+        {"algoId": "x", "sCode": "0", "sMsg": ""}]})) is True
+    # 看不懂／空的 ⇒ ⛔ 不得樂觀當成功
+    for bad in ("", "Error: HTTP 500", "<html>", "null",
+                '{"code": "0", "data": []}'):
+        assert ci.amend_succeeded(0, bad) is False, bad
+    assert ci.amend_succeeded(1, '[{"sCode": "0"}]') is False
+    # ⛔ 退回路徑必須沿用 leg_ok 那個已在真錢上驗證過的字串判準，否則改嚴之後
+    #   保本會從「會動」退化成「永遠不動」——比原本的洞更糟。
+    assert ci.amend_succeeded(0, '{"sCode": "0"}') is True
+
+
+def test_rejected_amend_does_not_mark_the_position_done(monkeypatch):
+    """迴圈級：被拒之後狀態不得是 done，否則下輪不會重試（黏著）。"""
+    rejected = json.dumps({"code": "1", "data": [
+        {"algoId": "3799902930107846656", "sCode": "51279", "sMsg": "rejected"}]})
+
+    def _f(args, timeout=None):
+        if args[:3] == ["swap", "algo", "orders"]:
+            return 0, json.dumps([_algo_row()])
+        if args[:3] == ["swap", "algo", "amend"]:
+            return 0, rejected            # CLI exit 0，但交易所說 sCode=51279
+        raise AssertionError(f"未預期：{args}")
+
+    monkeypatch.setattr(ci, "_okx", _f)
+    ci._ROUND_BE_GAPS.clear()
+    rec = _rec()
+    ci.maybe_breakeven(rec, 0.23, MU_AVG, dry=False, iid_key="i1")
+    assert rec["be"]["state"] == "amend_failed"
+    assert rec["be"]["state"] != "done"
+    assert ci._ROUND_BE_GAPS[0]["reason"] == "amend_rejected"
+
+
 def test_move_reports_amend_rejection(monkeypatch):
     _fake_okx(monkeypatch, [_algo_row()], amend_ok=False)
     state, info = ci.move_stops_to_breakeven(_rec(), MU_AVG, dry=False)
@@ -201,8 +243,13 @@ def test_move_uses_recorded_stop_not_the_live_one_to_avoid_ratchet(monkeypatch):
 
 def test_legacy_record_without_ticksz_asks_the_exchange(monkeypatch):
     """線上唯一那筆真錢倉（MU）就是這個形狀：v249 之前下的單，部位檔裡
-    stop=None、tickSz=None。沒有 tickSz 就送出未對齊的價格 ⇒ 交易所每輪退件、
-    保本永遠搬不成。⛔ 這不是『量不到』——離一次 instruments 查詢只有一步。"""
+    stop=None、tickSz=None ⇒ 送出的是未對齊的 813.571。
+
+    ⚠️ v251 更正：我在 v250 斷言那會被交易所退件——**線上實測推翻了**。
+    OKX 收下了 813.571（slTriggerPx 是觸發價不是掛單價，slOrdPx=-1 市價出場，
+    不受 tickSz 約束）。所以本測試鎖的是「價格乾淨、與下單側一致」，
+    ⛔ **不是**「不這樣做就會失敗」。去問 tickSz 的理由仍成立（它不是量不到，
+    離一次查詢只有一步），但嚴重度是整潔，不是功能。"""
     def _f(args, timeout=None):
         if args[:2] == ["market", "instruments"]:
             return 0, json.dumps([{"ctVal": "1", "lotSz": "0.01", "minSz": "0.01",

@@ -1240,6 +1240,33 @@ def pending_stop_legs(rows, pos_side: str) -> list | None:
     return out
 
 
+def amend_succeeded(code: int, out: str) -> bool:
+    """改價到底成沒成。⛔ 只認交易所自己說的 sCode == "0"。
+
+    v251：原本的判準是「回應裡出現 algoId 就算成功」——那是拿代理值當事實。
+    OKX 的失敗回應**照樣**帶著 algoId（`data[0] = {algoId, sCode: "51279", sMsg}`），
+    於是一筆被拒的改價會被記成 moved、狀態寫 done，而 done 是黏著的 ⇒ 這倉從此
+    再也不會重試，帳上寫著「已保本」而交易所上的止損還在原處。整個功能會在
+    最需要它的時候無聲失效。這一次是靠事後回交易所對帳才確認沒中招，
+    ⛔ 不能繼續靠運氣。
+    """
+    if code != 0 or not out:
+        return False
+    try:
+        rows = parse_okx_rows(json.loads(out))
+    except Exception:  # noqa: BLE001
+        rows = None
+    if rows is not None:
+        if not rows:
+            return False          # 認得形狀但零筆結果＝不知道成沒成 ⇒ 下輪重試
+        return all(isinstance(r, dict) and str(r.get("sCode", "0")) == "0"
+                   for r in rows)
+    # 形狀認不得 ⇒ 退回 leg_ok 用的那個字串判準。⛔ 這個判準是**已在真錢上驗證過**的
+    # （下單腿一直靠它，MU/SOXL/QQQ 都是這樣認的），所以不會因為改嚴而讓保本從
+    # 「會動」退化成「永遠不動」；被拿掉的只有 algoId 那個不成立的 fallback。
+    return '"sCode": "0"' in out or '"sCode":"0"' in out
+
+
 def move_stops_to_breakeven(rec: dict, avg_px, dry: bool) -> tuple[str, dict]:
     """把該倉**剩餘腿**的止損搬到保本價。回 (state, info)。
 
@@ -1276,10 +1303,14 @@ def move_stops_to_breakeven(rec: dict, avg_px, dry: bool) -> tuple[str, dict]:
         orig_sl = min((_pos_float(r.get("slTriggerPx")) or 0) for r in legs) \
             if side == "long" else \
             max((_pos_float(r.get("slTriggerPx")) or 0) for r in legs)
-    # 最小跳動：v249 起下單時就記下來；**舊倉沒有**（MU 那筆就是），而沒有 tickSz
-    # 的改價會送出未對齊的價格 ⇒ 交易所每輪退件、保本永遠搬不成。
-    # ⛔ 這不是「量不到」——它離一次 instruments 查詢只有一步。去問，不要放棄。
-    #   問不到才退回原樣送（讓交易所當權威；未對齊只會被拒，不會改到錯的價位）。
+    # 最小跳動：v249 起下單時就記下來；**舊倉沒有**（MU 那筆就是）。
+    # ⚠️ v251 更正 v250 的說法：我當時斷言未對齊的價格「交易所必退」，
+    #   線上實測**推翻**了它——2026-08-03 18:38 送出 813.571（MU 的 tickSz 是 0.01），
+    #   OKX 照單全收，slTriggerPx 現在就是 813.571。合理：slTriggerPx 是**觸發價**
+    #   不是掛單價（slOrdPx=-1＝市價出場），不受 tickSz 約束。
+    #   ⇒ 補問 tickSz 的理由降級為「價格乾淨、與下單側一致」，不是防退件。
+    # ⛔ 但仍然去問：這不是「量不到」，離一次 instruments 查詢只有一步。
+    #   問不到就退回原樣送（已實測可行）。
     tick = rec.get("tickSz")
     if tick is None:
         spec = fetch_inst_spec(iid) or {}
@@ -1307,8 +1338,7 @@ def move_stops_to_breakeven(rec: dict, avg_px, dry: bool) -> tuple[str, dict]:
         c2, o2 = _okx(["swap", "algo", "amend", "--instId", iid,
                        "--algoId", str(r.get("algoId")),
                        "--newSlTriggerPx", f"{be:g}"])
-        if c2 == 0 and ('"sCode": "0"' in o2 or '"sCode":"0"' in o2
-                        or '"algoId"' in o2):
+        if amend_succeeded(c2, o2):
             moved += 1
         else:
             failed.append({"algoId": r.get("algoId"),
