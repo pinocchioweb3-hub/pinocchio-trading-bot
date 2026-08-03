@@ -112,15 +112,25 @@ def test_etf_full_window_reports_both(monkeypatch):
 
 
 def test_etf_too_short_window_is_skipped(monkeypatch):
-    """連 5 日窗口都湊不齊（3 天）→ 該資產整個不報，不可拿 3 天冒充 5 日。"""
+    """連 5 日窗口都湊不齊（3 天）→ 不可拿 3 天冒充 5 日。
+
+    v243 起這裡不再回 None（None 讓整行從報告消失＝「死了」和「本來就沒有」
+    同一個下場）。⛔ 本案例守的是**原本的意圖**：不得出現任何捏造的淨流數字。
+    """
     monkeypatch.setenv("COINGLASS_API_KEY", "dummy")
     monkeypatch.setattr(bf.httpx, "Client",
                         lambda *a, **k: _FakeCGClient({"bitcoin": _flows(3)}))
-    assert bf.fetch_etf_overlay() is None
+    s = bf.fetch_etf_overlay()
+    assert "5日+" not in s and "30日+" not in s, f"3 天被冒充成完整窗口：{s}"
+    assert "僅3日" in s, f"窗口不足要講清楚差多少：{s}"
 
 
 def test_etf_data_key_missing_is_not_zero_flow(monkeypatch):
-    """data 讀不出來＝未知，不可折成「淨流為零」——該資產直接不報。"""
+    """data 讀不出來＝未知，不可折成「淨流為零」。
+
+    v243：同上，改守意圖——不得出現 +0M 這種「量不到當成零」的數字，
+    且要說得出成因（此例是 50011 rate limit）。
+    """
     monkeypatch.setenv("COINGLASS_API_KEY", "dummy")
 
     class _NoData(_FakeCGClient):
@@ -128,4 +138,6 @@ def test_etf_data_key_missing_is_not_zero_flow(monkeypatch):
             return _Resp({"code": "50011", "msg": "rate limit"})
 
     monkeypatch.setattr(bf.httpx, "Client", lambda *a, **k: _NoData({}))
-    assert bf.fetch_etf_overlay() is None
+    s = bf.fetch_etf_overlay()
+    assert "+0M" not in s and "5日" not in s, f"未知被折成零淨流：{s}"
+    assert "50011" in s and "rate limit" in s, f"成因被吞掉：{s}"

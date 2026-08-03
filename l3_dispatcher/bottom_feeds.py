@@ -241,8 +241,11 @@ def fetch_etf_overlay() -> Optional[str]:
         return cached
     key = os.getenv("COINGLASS_API_KEY", "").strip()
     if not key:
+        # ⛔「沒接這個源」不是「量不到」（v238 邊界）：沒金鑰就不該在報告上多一列
+        #    假警訊，否則 ⚠️ 這個符號會貶值，等於用另一種方式製造失明。
         return None
     parts: list[str] = []
+    missing: list[str] = []            # v243：死掉的資產要具名，不得靜默 continue
     try:
         with httpx.Client(base_url="https://open-api-v4.coinglass.com", timeout=30,
                           headers={"CG-API-KEY": key, "accept": "application/json"}) as cli:
@@ -250,9 +253,12 @@ def fetch_etf_overlay() -> Optional[str]:
                               ("xrp", "XRP"), ("solana", "SOL")):
                 try:
                     r = cli.get(f"/api/etf/{coin}/flow-history")
-                    data = (r.json() or {}).get("data")
+                    body = r.json() or {}
+                    data = body.get("data")
                     if not isinstance(data, list) or len(data) < 5:
-                        continue          # 連 5 日窗口都湊不齊＝該資產不報（未知≠零淨流）
+                        # 連 5 日窗口都湊不齊＝該資產不報（未知≠零淨流）——但要說為什麼。
+                        missing.append(f"{tag}({_etf_miss_reason(r, body, data)})")
+                        continue
                     def _flow(x):
                         v = x.get("flow_usd")
                         return float(v) if v is not None else 0.0
@@ -264,15 +270,41 @@ def fetch_etf_overlay() -> Optional[str]:
                         parts.append(f"{tag} 5日{d5:+,.0f}M/30日{d30:+,.0f}M")
                     else:
                         parts.append(f"{tag} 5日{d5:+,.0f}M/30日資料不足(僅{len(data)}日)")
-                except Exception:  # noqa: BLE001 — 單一資產失敗不拖累其他
+                except Exception as e:  # noqa: BLE001 — 單一資產失敗不拖累其他
+                    missing.append(f"{tag}(例外 {type(e).__name__})")
                     continue
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception as e:  # noqa: BLE001
+        return f"ETF淨流：讀不到（連線層 {type(e).__name__}: {e}）"[:200]
     if not parts:
-        return None
+        # v243：⛔ 不再回 None。消費端是 `if etf: overlay["🏦"] = etf`，None 等於
+        # 整行從報告上消失——於是「這源沒資料」和「這源死了」長得一模一樣。
+        # ⛔ 這一行不得帶任何看似淨流的金額（v212 鐵則不倒退）。
+        # ⛔ 不寫進 _put：失敗若進了 20 小時快取，源恢復了報告還在說它死著。
+        return "ETF淨流：讀不到（" + "；".join(missing or ["無成因可回報"]) + "）"
     s = "ETF淨流(機構動向,n=0無熊底校準僅參考)：" + " ｜ ".join(parts)
+    if missing:
+        s += "　⚠️未取得：" + "；".join(missing)
     _put("etf_multi", s)
     return s
+
+
+def _etf_miss_reason(resp, body: dict, data) -> str:
+    """這一個資產為什麼沒有結果（v243）。
+
+    ⛔ 三種成因要能分辨，因為處置完全不同：
+        窗口不足 → 等資料累積（正常，新上市 ETF 就是這樣）
+        API 錯誤 → 續訂／換源
+        回應無 data → 查端點契約
+    """
+    if isinstance(data, list):
+        return f"僅{len(data)}日<5日窗口"
+    # ⚠️ 這個端點在方案到期時是「HTTP 200 + 錯誤 body」（2026-08-03 線上實證）——
+    #    只看 raise_for_status() 永遠抓不到。所以狀態碼與 body code 兩個都要報。
+    status = getattr(resp, "status_code", None)
+    bits = [f"HTTP{status}" if status else None, body.get("code")]
+    code = "/".join(str(b) for b in bits if b) or "無狀態碼"
+    msg = str(body.get("msg") or body.get("message") or "").strip()
+    return f"{code}: {msg}"[:60] if msg else f"回應無 data（{code}）"
 
 
 def collect_bottom_inputs(price_now: Optional[float], mayer: Optional[float],
