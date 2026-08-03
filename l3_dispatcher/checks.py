@@ -174,14 +174,32 @@ async def cross_check_fire(
     _sent_ok = bool(sentiment) and not sentiment.get("error")
     fg = sentiment.get("fear_greed_now") if _sent_ok else None
     ahr = sentiment.get("ahr999_now") if _sent_ok else None
+
+    # v242：源那層（coinglass.get_sentiment）現在會說出「哪一個子請求死了、
+    # 為什麼」。⛔ 這句話要一路帶到卡上——只寫「讀不到」的話，讀卡的人分不出
+    # 金鑰到期（要續訂／換源）和端點回空清單（要查資料契約）。
+    # 舊形狀（沒有這個鍵）→ _why 回空字串，note 維持原樣，不得憑空生成成因。
+    _unavail = (sentiment or {}).get("unavailable") or {}
+
+    def _why(*keys: str) -> str:
+        seen: list[str] = []
+        for k in keys:
+            r = str(_unavail.get(k) or "").strip()
+            if r and r not in seen:
+                seen.append(r)
+        return "：" + "；".join(seen) if seen else ""
+
     if fg is None and ahr is None:
         # ⛔ 包含「連上了、dict 回來了、但兩個欄位都是 None」——有回應不等於有讀數。
         checks.append(_unknown_row(
-            "sentiment_check", "F&G／AHR999 皆讀不到 → 情緒與估值極端值無法確認"))
+            "sentiment_check",
+            "F&G／AHR999 皆讀不到 → 情緒與估值極端值無法確認"
+            + _why("fear_greed", "ahr999")))
     else:
         if fg is None:
             checks.append(_unknown_row(
-                "sentiment_check", "F&G 讀不到 → 情緒極端值無法確認"))
+                "sentiment_check",
+                "F&G 讀不到 → 情緒極端值無法確認" + _why("fear_greed")))
         elif direction == SignalState.BULL and fg >= 85:
             checks.append({"name": "sentiment_check", "pass": False, "delta": -15,
                            "note": f"BULL 但 F&G {fg}（極度貪婪）"})
@@ -196,7 +214,8 @@ async def cross_check_fire(
 
         if ahr is None:
             checks.append(_unknown_row(
-                "valuation_check", "AHR999 讀不到 → 估值高低無法確認"))
+                "valuation_check",
+                "AHR999 讀不到 → 估值高低無法確認" + _why("ahr999")))
         elif direction == SignalState.BULL and ahr > 1.2:
             checks.append({"name": "valuation_check", "pass": False, "delta": -10,
                            "note": f"AHR999 {ahr}（高估區）"})

@@ -755,7 +755,36 @@ class CoinGlassSource:
     # =====================================================================
     # 情緒：Fear-Greed + AHR999
     # =====================================================================
+    @staticmethod
+    def _fetch_failure_reason(r) -> str | None:
+        """這一個子請求為什麼沒有結果？成功回 None。
+
+        v242：⛔ 不得回空字串／"unknown"／"error"。呼叫端要靠這句話分辨
+        「金鑰到期（要續訂或換源）」和「端點回了空清單（要查資料契約）」——
+        兩者的處置天差地遠，講不清楚等於沒說。
+        """
+        if isinstance(r, BaseException):
+            return f"例外 {type(r).__name__}: {r}"[:160]
+        if not isinstance(r, dict):
+            return f"回應型別非 dict（{type(r).__name__}）"
+        if r.get("error"):
+            code = r.get("code") or "ERROR"
+            msg = str(r.get("message") or "").strip()
+            return f"{code}: {msg}"[:160] if msg else f"{code}（無訊息）"
+        return None
+
     async def get_sentiment(self) -> dict:
+        """F&G + AHR999。任一邊沒讀到 → out["unavailable"][該欄] 寫明成因。
+
+        v242（同物種第 62 次，源層實例）：舊碼對每一邊各有五條讓結果無聲消失的
+        路徑（例外／error 字典／data 空／data_list 空／解析失敗），五條的下場
+        完全一樣——鍵不出現、回 {"source": "coinglass"}、沒有 error 旗標。
+        呼叫端的 `bool(sentiment) and not sentiment.get("error")` 因此是 True，
+        於是「源整個掛了」被讀成「源活著，只是沒有讀數」。
+
+        ⛔ 只治可見性：不加 top-level error（會翻掉 checks.py 的 _sent_ok 分支）、
+           不動任何閾值與 label 邏輯。
+        """
         fg, ah = await asyncio.gather(
             self._get("/api/index/fear-greed-history", {"limit": 7},
                       tool="mi_get_sentiment"),
@@ -765,27 +794,52 @@ class CoinGlassSource:
         )
 
         out: dict = {"source": "coinglass"}
+        unavailable: dict[str, str] = {}
 
         # Fear-Greed
-        if isinstance(fg, dict) and not fg.get("error"):
+        why = self._fetch_failure_reason(fg)
+        if why is None:
             d = fg.get("data") or {}
-            values = d.get("data_list", [])
-            if values:
+            values = d.get("data_list") or []
+            if not values:
+                why = "回應成功但無資料列（data.data_list 為空）"
+            else:
                 latest_fg = self._to_float(values[-1])
-                out["fear_greed_now"] = latest_fg
-                out["fear_greed_label"] = self._fear_greed_label(latest_fg)
-                if len(values) >= 7:
-                    week_avg = sum(self._to_float(v) or 0 for v in values[-7:]) / 7
-                    out["fear_greed_7d_avg"] = round(week_avg, 1)
+                if latest_fg is None:
+                    # ⛔ 舊碼在這裡寫 out["fear_greed_now"]=None，等於宣稱
+                    #    「有這一欄、值就是沒有」。解析不出來是契約問題，要說。
+                    why = f"最新值解析失敗：{values[-1]!r}"
+                else:
+                    out["fear_greed_now"] = latest_fg
+                    out["fear_greed_label"] = self._fear_greed_label(latest_fg)
+                    if len(values) >= 7:
+                        week_avg = sum(self._to_float(v) or 0 for v in values[-7:]) / 7
+                        out["fear_greed_7d_avg"] = round(week_avg, 1)
+        if why:
+            unavailable["fear_greed"] = why
 
         # AHR999（< 0.45 適合定投、> 1.2 偏高估）
-        if isinstance(ah, dict) and not ah.get("error"):
+        why = self._fetch_failure_reason(ah)
+        if why is None:
             data = ah.get("data") or []
-            if data:
-                latest_ah = self._to_float(data[-1].get("ahr999_value"))
-                out["ahr999_now"] = round(latest_ah, 3) if latest_ah else None
-                out["ahr999_label"] = self._ahr999_label(latest_ah)
+            if not data:
+                why = "回應成功但無資料列（data 為空）"
+            else:
+                raw = data[-1].get("ahr999_value")
+                latest_ah = self._to_float(raw)
+                if latest_ah is None:
+                    why = f"最新值解析失敗：{raw!r}"
+                else:
+                    # 舊碼是 `if latest_ah`（falsy）→ 0.0 會被寫成 None 但 label
+                    # 仍照 0.0 算，自相矛盾。改成 is None，唯一行為差異落在
+                    # AHR999 恰為 0.0（現實中不存在）。
+                    out["ahr999_now"] = round(latest_ah, 3)
+                    out["ahr999_label"] = self._ahr999_label(latest_ah)
+        if why:
+            unavailable["ahr999"] = why
 
+        if unavailable:
+            out["unavailable"] = unavailable
         return out
 
     @staticmethod
