@@ -157,6 +157,16 @@ _ROUND_BE_GAPS: list[dict] = []
 # _note_fail——這不是輪級故障，而且下單本身是成功的。
 _ROUND_RISK_CUTS: list[dict] = []
 CAP_CUT_RECENT_MAX = 20            # 健康檔內保留的砍倉明細筆數上限
+# v254：本輪「成交均價與計畫進場價不同 ⇒ 實際 1R 不是帳上那個數」的部位；每輪開頭清空。
+# 張數是用**計畫進場價**算的，但風險由**成交價**到止損的距離決定 ⇒ 滑價往不利方向
+# 走時，這筆單的實際風險會超出預算而帳上完全看不出來。實測 SNDK：計畫 ~1193、成交
+# 1180.39、止損 1228.38 ⇒ 實際 1R≈24.1U，比 20U 預算高 20%。夾層（v252）量的是
+# 「送出前被砍小」，這裡量的是「送出後被滑掉」——同一個數字的另一半，缺一半就等於
+# 沒量。⛔ 一律唯讀：不改倉、不補單、不調參數（真錢部位大小只有使用者能定）。
+_ROUND_RISK_DRIFTS: list[dict] = []
+RISK_DRIFT_RECENT_MAX = 20         # 健康檔內保留的滑價偏移明細筆數上限
+RISK_DRIFT_ALERT_PCT = 0.10        # 實際 1R 偏離帳上值超過 ±10% 才出聲（小滑價不刷屏）
+CTVAL_RETRY_MAX = 5                # 舊紀錄沒記 ctVal 時，回頭查合約規格的重試上限
 
 
 # Windows 陷阱：npm 全域裝的 okx 是 okx.cmd shim，subprocess 不走 shell 找不到裸名
@@ -425,9 +435,43 @@ def _account_risk_cut(h: dict, cuts, now_s: float) -> None:
     h["risk_capped_recent"] = recent[-CAP_CUT_RECENT_MAX:]
 
 
+def _account_risk_drift(h: dict, drifts, now_s: float) -> None:
+    """把本輪「成交均價讓實際 1R 偏離帳上值」的部位記進健康帳（就地改 h）。
+
+    v254：v252 讓「送出前被夾層砍小」可見，但風險的另一半在**送出後**才定案——
+    張數是用計畫進場價換算的，實際押多少錢卻是由成交均價到止損的距離決定。往不利
+    方向滑就是超出預算，而帳上的 risk_usd 仍是下單那一刻寫死的值 ⇒ 超額曝險只存在
+    於交易所的保證金欄位裡。與 v252 同一個數字的另一半。
+
+    ⛔ 不歸類成故障（下單是成功的，滑價是市場行為，不是系統壞掉）；也記
+    **未知**（ctVal／均價讀不出來 ⇒ 算不出實際 1R），⛔ 未知不得折成「沒有偏移」。"""
+    drops = list(drifts or [])
+    if not drops:
+        return                                  # 沒事不生欄位＝帳本不長出一排 0
+    over = [d for d in drops if (d.get("drift_pct") or 0) > 0]
+    unknown = [d for d in drops if d.get("state") == "unknown"]
+    h["risk_drift_total"] = int(h.get("risk_drift_total", 0)) + len(drops)
+    h["risk_drift_over_total"] = int(h.get("risk_drift_over_total", 0)) + len(over)
+    if unknown:
+        h["risk_drift_unknown_total"] = \
+            int(h.get("risk_drift_unknown_total", 0)) + len(unknown)
+    h["risk_drift_last_ts"] = now_s
+    recent = list(h.get("risk_drift_recent") or [])
+    for d in drops:
+        recent.append({"inst_id": d.get("inst_id"), "symbol": d.get("symbol"),
+                       "pos_side": d.get("pos_side"), "intent_id": d.get("intent_id"),
+                       "state": d.get("state"), "reason": d.get("reason"),
+                       "risk_booked": d.get("risk_booked"),
+                       "risk_fill": d.get("risk_fill"),
+                       "drift_pct": d.get("drift_pct"),
+                       "entry_planned": d.get("entry_planned"),
+                       "avg_px": d.get("avg_px"), "ts": now_s})
+    h["risk_drift_recent"] = recent[-RISK_DRIFT_RECENT_MAX:]
+
+
 def update_health(h: dict, fails: dict, now_s: float, oks: int = 0,
                   expired=None, pnl_gaps=None, be_gaps=None,
-                  risk_cuts=None) -> dict:
+                  risk_cuts=None, risk_drifts=None) -> dict:
     """把本輪結果併進健康狀態（純函式，不做 I/O）。
 
     connsecutive_fail_rounds 只在「有故障的輪」累加；乾淨輪歸零並在曾告警過時
@@ -464,6 +508,10 @@ def update_health(h: dict, fails: dict, now_s: float, oks: int = 0,
     #   那一輪很可能一次成功呼叫都沒有（下單失敗／規格查詢不算 ok）＝正好落在空轉輪
     #   分支上。v169/v170/v249 三次都栽在這條路徑，這次直接照抄結論。
     _account_risk_cut(h, risk_cuts, now_s)
+    # v254：同理擺在空轉輪提早 return 之前。偏移是在「管理在場部位」那一步算出來的，
+    #   那一輪完全可能沒有任何新單、也沒有成功的下單呼叫（oks==0）＝空轉輪分支。
+    #   v169/v170/v249/v252 四次都栽在這裡，這次照抄結論，不再重犯第五次。
+    _account_risk_drift(h, risk_drifts, now_s)
     if not fails and int(oks or 0) <= 0:
         # 空轉輪：沒故障也沒成功呼叫＝本輪對「是否已恢復」零資訊，維持原判
         h["idle_rounds"] = int(h.get("idle_rounds", 0)) + 1
@@ -707,7 +755,8 @@ def send_alert(text: str, dry: bool = False) -> tuple[str, str | None]:
 
 def finish_round(fails: dict, now_s: float | None = None,
                  dry: bool = False, oks: int = 0, expired=None,
-                 pnl_gaps=None, be_gaps=None, risk_cuts=None) -> dict:
+                 pnl_gaps=None, be_gaps=None, risk_cuts=None,
+                 risk_drifts=None) -> dict:
     """每輪收尾：更新健康檔、必要時告警。永不對外拋例外——
     告警層絕不可以把交易執行器弄掛（它的職責只是「讓失敗有出口」）。
 
@@ -727,7 +776,7 @@ def finish_round(fails: dict, now_s: float | None = None,
                   f"本輪若有故障即告警，不從零重數")
         h = update_health(base, fails, now_s, oks, expired=expired,
                           pnl_gaps=pnl_gaps, be_gaps=be_gaps,
-                          risk_cuts=risk_cuts)
+                          risk_cuts=risk_cuts, risk_drifts=risk_drifts)
         if h.get("recovered_from"):
             ch, err = send_alert(recovery_text(h), dry=dry)
             h["last_alert_channel"], h["last_alert_error"] = ch, err
@@ -1451,6 +1500,107 @@ def maybe_breakeven(rec: dict, live_sz: float, avg_px, dry: bool,
                            "want_px": info.get("px")})
 
 
+def fill_risk_verdict(contracts, ct_val, avg_px, stop, risk_booked) -> tuple[str, dict]:
+    """實際 1R vs 帳上 1R 的三態判定（純函式，永不 raise）。
+
+    實際風險 ＝ 張數 × ctVal × |成交均價 − 止損|。張數是用**計畫進場價**換算出來的，
+    但這筆單真正押了多少錢，是由**成交均價**到止損的距離決定的——兩者在真錢上必然
+    有差（v249 的保本基準已經為了同一個理由改吃 avgPx）。
+
+    ⛔ 任一項讀不出來一律 "unknown"，絕不用計畫進場價頂替成交均價：那正是這個洞
+    本身（拿代理值當事實）。⛔ 也絕不把 unknown 折成「沒有偏移」。
+    """
+    sz, cv = _pos_float(contracts), _pos_float(ct_val)
+    px, sl = _pos_float(avg_px), _pos_float(stop)
+    booked = _pos_float(risk_booked)
+    missing = [n for n, v in (("contracts", sz), ("ct_val", cv), ("avg_px", px),
+                              ("stop", sl), ("risk_booked", booked)) if v is None]
+    if missing:
+        return "unknown", {"reason": "missing:" + ",".join(missing)}
+    dist = abs(px - sl)
+    if dist <= 0:
+        # 成交價就在止損上＝這筆單沒有可衡量的 1R（也代表它隨時會被掃掉）
+        return "unknown", {"reason": "zero_stop_distance"}
+    risk_fill = sz * cv * dist
+    return "ok", {"risk_fill": round(risk_fill, 4),
+                  "drift_pct": round((risk_fill - booked) / booked, 6)}
+
+
+def _rec_ct_val(rec: dict) -> float | None:
+    """取這筆倉的 ctVal：優先讀紀錄（v254 起下單時就寫），舊紀錄才回頭查交易所。
+
+    ⛔ 查不到不猜：回 None（呼叫端判 unknown）。重試有上限，計數寫回紀錄才活得過
+    下一輪（每輪都是獨立行程）——否則舊倉會每輪多發一次查詢直到平倉。"""
+    cv = _pos_float(rec.get("ct_val"))
+    if cv is not None:
+        return cv
+    tries = int(rec.get("ct_val_retry", 0) or 0)
+    if tries >= CTVAL_RETRY_MAX:
+        return None
+    rec["ct_val_retry"] = tries + 1
+    spec = fetch_inst_spec(rec.get("inst_id") or "")
+    if not spec:
+        return None
+    cv = _pos_float(spec.get("ctVal"))
+    if cv is not None:
+        rec["ct_val"] = cv                       # 補回紀錄：下輪起零額外呼叫
+        rec.pop("ct_val_retry", None)
+    return cv
+
+
+def maybe_risk_drift(rec: dict, avg_px, iid_key: str) -> None:
+    """量一次「成交後的實際 1R」並在偏離帳上值時出聲。就地改 rec；明細進 _ROUND_RISK_DRIFTS。
+
+    只量一次：成交均價定案後就不會再變（本執行器從不加倉），每輪重算只是重複刷屏。
+    ⛔ 純唯讀觀測：不改倉、不補單、不動任何風險參數——真錢部位大小只有使用者能定。
+    """
+    if rec.get("risk_fill_checked"):
+        return
+    # 其他輸入已經缺了（舊倉沒記 risk_usd＝永遠補不回來）就別去查規格：補到 ctVal
+    # 也算不出來，那次呼叫買不到任何答案，而「等下輪重試」也只是把當場就確定的
+    # unknown 往後拖 CTVAL_RETRY_MAX 輪，路上多打幾次白費查詢。
+    retryable = all(_pos_float(rec.get(k)) is not None
+                    for k in ("contracts", "stop", "risk_usd")) \
+        and _pos_float(avg_px) is not None
+    ct_val = _rec_ct_val(rec) if retryable else _pos_float(rec.get("ct_val"))
+    state, info = fill_risk_verdict(rec.get("contracts"), ct_val,
+                                    avg_px, rec.get("stop"), rec.get("risk_usd"))
+    booked = _pos_float(rec.get("risk_usd"))
+    row = {"intent_id": iid_key, "inst_id": rec.get("inst_id"),
+           "symbol": rec.get("symbol"), "pos_side": rec.get("pos_side"),
+           "state": state, "reason": info.get("reason"),
+           "risk_booked": booked, "risk_fill": info.get("risk_fill"),
+           "drift_pct": info.get("drift_pct"),
+           "entry_planned": _pos_float(rec.get("entry_planned")),
+           "avg_px": _pos_float(avg_px)}
+    if state == "unknown":
+        # 未知也要留痕，但可重試的成因（規格查詢失敗）留給下輪，別現在就定案
+        if retryable and str(info.get("reason") or "").startswith("missing:ct_val") \
+                and int(rec.get("ct_val_retry", 0) or 0) < CTVAL_RETRY_MAX:
+            return
+        rec["risk_fill_checked"] = True
+        rec["risk_fill"] = {"state": state, "reason": info.get("reason"),
+                            "ts": time.time()}
+        print(f"⚠️ {rec.get('inst_id')} {rec.get('pos_side')} 算不出這筆單的實際 1R"
+              f"（{info.get('reason')}）——帳上的 {booked if booked else '未知'} 只是"
+              "下單當下的預期值，實際押了多少錢本地無從得知")
+        _ROUND_RISK_DRIFTS.append(row)
+        return
+    rec["risk_fill_checked"] = True
+    rec["risk_fill"] = {"state": "ok", "risk_usd": info["risk_fill"],
+                        "drift_pct": info["drift_pct"],
+                        "avg_px": _pos_float(avg_px), "ts": time.time()}
+    if abs(info["drift_pct"]) < RISK_DRIFT_ALERT_PCT:
+        return                                   # 小滑價＝正常，不刷屏也不進帳
+    _ROUND_RISK_DRIFTS.append(row)
+    arrow = "超出" if info["drift_pct"] > 0 else "低於"
+    print(f"🎯 {rec.get('inst_id')} {rec.get('pos_side')} 成交後的實際風險 "
+          f"≈{info['risk_fill']:.2f}U，{arrow}帳上的 {booked:.2f}U "
+          f"（{info['drift_pct'] * 100:+.1f}%）——成交均價 {_pos_float(avg_px)} "
+          f"與計畫進場價 {rec.get('entry_planned') or '未記錄'} 的差距造成，"
+          "張數是用計畫價換算的。此為觀測，不改倉。")
+
+
 def manage_positions(dry: bool) -> list | None:
     """每輪管理：①反向對帳（交易所有、本地帳沒有＝孤兒部位）②對帳（OKX 上已消失＝
     TP/SL 已了結→記日損益）③逾時強平。任何查詢失敗→本輪什麼都不做（下輪重試）。
@@ -1525,6 +1675,8 @@ def manage_positions(dry: bool) -> list | None:
             _record_leverage_readback(rec, live_lever.get(key), now_s)
             # v249：TP1 成交後把剩餘腿的止損搬到保本（使用者 2026-08-03 指示）
             maybe_breakeven(rec, live.get(key, 0.0), live_avg.get(key), dry, iid)
+            # v254：同一個 avgPx 也是「這筆單實際押了多少錢」唯一的正確基準
+            maybe_risk_drift(rec, live_avg.get(key), iid)
         if live.get(key, 0.0) == 0.0:
             # 已了結（TP/SL/手動）→ 記日損益後移出
             res = _realized_pnl_since(rec["inst_id"], rec["placed_at"])
@@ -1878,6 +2030,7 @@ def main() -> int:
         _ROUND_PNL_GAPS.clear()          # v170：本輪熔斷漏記帳從零開始
         _ROUND_BE_GAPS.clear()           # v249：本輪保本缺口從零開始
         _ROUND_RISK_CUTS.clear()         # v252：本輪名義值夾層砍倉帳從零開始
+        _ROUND_RISK_DRIFTS.clear()       # v254：本輪成交滑價偏移帳從零開始
         # v139：先管理在場倉位（對帳/逾時平倉），再看要不要接新單
         # v159（r47）：manage_positions 同時做反向對帳，回本輪的孤兒部位鍵
         # v162（r53）：None＝本輪掃描沒跑成（查不到交易所部位）⇒ 擋單閘等於瞎掉，
@@ -2022,6 +2175,14 @@ def main() -> int:
                                            # 值在搬過一次之後就是保本價本身 ⇒ 會愈
                                            # 算愈貼身（棘輪）。tickSz 同理，改價要對齊。
                                            "stop": float(intent["stop"]),
+                                           # v254：實際 1R ＝ 張數×ctVal×|成交均價
+                                           # −止損|。ctVal 這裡不記，之後就得為每一
+                                           # 筆舊倉多發一次規格查詢；計畫進場價不記，
+                                           # 就算得出偏移也講不出成因（滑了多少）。
+                                           "ct_val": (ct_cache.get(
+                                               intent["inst_id"]) or {}).get("ctVal"),
+                                           "entry_planned": _pos_float(
+                                               intent.get("entry")),
                                            # v252：這筆單**實際**押了多少風險。
                                            # 沒有夾層時就是預算值；被砍時才是真相。
                                            "risk_usd": (
@@ -2050,7 +2211,8 @@ def main() -> int:
                      expired=list(_ROUND_EXPIRED),
                      pnl_gaps=list(_ROUND_PNL_GAPS),
                      be_gaps=list(_ROUND_BE_GAPS),
-                     risk_cuts=list(_ROUND_RISK_CUTS))
+                     risk_cuts=list(_ROUND_RISK_CUTS),
+                     risk_drifts=list(_ROUND_RISK_DRIFTS))
         if a.once or a.dry_run:
             return 0
         time.sleep(60)

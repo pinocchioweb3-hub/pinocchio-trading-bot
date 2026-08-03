@@ -474,6 +474,69 @@ def live_stall_verdict(health: dict | None, *, now_s: float | None = None,
             "text": text}
 
 
+RISK_SIZING_WINDOW_SEC = 24 * 3600
+
+
+def risk_sizing_verdict(health: dict | None, *, now_s: float | None = None,
+                        window_sec: int = RISK_SIZING_WINDOW_SEC) -> dict | None:
+    """把「單筆實際風險 ≠ 風險預算」翻成阻塞（純函式，可離線測）。
+
+    v252 量到送出前被名義值夾層砍小（risk_capped_*），v254 量到送出後被滑價推開
+    （risk_drift_*）。兩者都只寫進執行器的健康檔——而「只存在於一個沒人開的 json」
+    與「只存在於一行 log」是同一件事（v170 定的規矩）。使用者 2026-08-03 是靠手機
+    截圖才發現每單只押了他預期的 1/6。
+
+    ⛔ 歸 blockers 不歸 system_faults：⛔ 真錢部位大小參數只有使用者能定，CEO 改碼
+    不能也不該把它改掉。
+
+    ⚠️ 與 pnl_gap_verdict 的**刻意差異**：這裡套時間窗，那裡不套。漏記的損益是
+    **不可逆的既成事實**（執行器停了也補不回來）；夾層／滑價則是**現況條件**——
+    參數一改、或單純沒有新單，它就不再發生。拿累計數當永久阻塞，等於使用者選了
+    「維持現狀」之後帳本還永遠掛著一條他已經裁決過的事（r71 org_coverage 踩過的坑）。
+    """
+    if not health:
+        return None
+
+    def _int(key: str) -> int:
+        try:
+            return int(health.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _ts(key: str) -> float:
+        try:
+            return float(health.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    now_s = now_s if now_s is not None else time.time()
+    capped, cap_ts = _int("risk_capped_total"), _ts("risk_capped_last_ts")
+    drift_over, drift_ts = _int("risk_drift_over_total"), _ts("risk_drift_last_ts")
+    unknown = _int("risk_drift_unknown_total")
+    fresh_cap = capped > 0 and cap_ts > 0 and (now_s - cap_ts) <= window_sec
+    fresh_drift = (drift_over > 0 or unknown > 0) and drift_ts > 0 \
+        and (now_s - drift_ts) <= window_sec
+    if not (fresh_cap or fresh_drift):
+        return None
+    parts: list[str] = []
+    if fresh_cap:
+        recent = health.get("risk_capped_recent")
+        last = recent[-1] if isinstance(recent, list) and recent else {}
+        eff, want = last.get("risk_effective"), last.get("risk_intended")
+        detail = (f"（最近一筆 {last.get('inst_id')}：預算 {want}U → 實際 {eff}U）"
+                  if isinstance(last, dict) and eff and want else "")
+        parts.append(f"名義值上限先咬住風險預算，累計 {capped} 筆{detail}")
+    if fresh_drift and drift_over > 0:
+        parts.append(f"成交滑價讓實際 1R 超出帳上值逾 10%，累計 {drift_over} 筆")
+    if fresh_drift and unknown > 0:
+        parts.append(f"另有 {unknown} 筆算不出實際 1R（未知，⛔ 不等於沒有偏移）")
+    text = ("真錢單的**實際**單筆風險與風險預算不一致：" + "；".join(parts)
+            + "——⛔ 部位大小參數只有你能定（維持現狀／提高名義值上限／夾層咬住就整筆"
+              "不下），在你裁決前執行器一律照現況跑、只做觀測不自行調整")
+    return {"capped": capped, "drift_over": drift_over, "unknown": unknown,
+            "text": text}
+
+
 def pnl_gap_verdict(health: dict | None, *, now_s: float | None = None,
                     max_age_sec: int = LIVE_HEALTH_MAX_AGE_SEC) -> dict | None:
     """把「已了結但損益查不到、已放棄」的累計筆數翻成阻塞（純函式，可離線測）。
@@ -631,6 +694,7 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
            demo_rejected=0, demo_reject_hint=None, real_output_age_sec=None,
            live_exec=None, org_digest=None, demo_stall_reason=None, pnl_gap=None,
            org_coverage=None, live_stall=None, signal_drought=None,
+           risk_sizing=None,
            last_nudge_ms=0, stall_sec=STALL_SEC, nudge_cooldown_sec=NUDGE_COOLDOWN_SEC) -> dict:
     """核心判定（純函式）。回 state / next_step / blockers / should_nudge。
 
@@ -667,6 +731,10 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
     #   兩者要做的事完全不同（一個是補白名單，一個是補帳）。
     if pnl_gap:
         blockers.append(pnl_gap["text"])
+    # v254：單筆實際風險 ≠ 風險預算。歸 blockers 的理由與 pnl_gap 同源（只有人能決定），
+    #   但它套 24h 窗（現況條件，非既成事實）——理由見 risk_sizing_verdict 的 docstring。
+    if risk_sizing:
+        blockers.append(risk_sizing["text"])
     # r30：組織產出斷檔＝系統故障（該 push CEO／監督員代補產），球不在使用者。
     if org_digest:
         system_faults.append(org_digest["text"])
@@ -742,6 +810,9 @@ def assess(*, now_ms, commit_age_sec, paper_n, paper_min, live_n, live_min,
         #      「這版還沒有這個偵測」。⛔ 勿改成只在有值時才塞。
         "live_stall": live_stall,
         "pnl_gap": pnl_gap,
+        # v254：欄位恆存在（沒偏移時為 None）——比照 live_stall／org_coverage，
+        #       讓 Layer 2 分得出「這輪沒偏移」與「這版還沒有這個量測」。
+        "risk_sizing": risk_sizing,
         "org_digest": org_digest,
         # r71：欄位恆存在（無缺報時為 None）——Layer 2 才分得出「沒缺報」與「這版沒這功能」。
         "org_coverage": org_coverage,
@@ -987,6 +1058,7 @@ def build_snapshot(now_ms: int | None = None) -> dict:
     live_exec = None
     live_stall = None
     pnl_gap = None
+    risk_sizing = None
     try:
         _live_health = _read_live_exec_health()
         live_exec = live_exec_verdict(_live_health, now_s=now_ms / 1000)
@@ -996,6 +1068,8 @@ def build_snapshot(now_ms: int | None = None) -> dict:
                                         ac_online=ac_power_online())
         # r68：熔斷口徑漏記（累計既成事實，不套新鮮度閘——理由見 pnl_gap_verdict）
         pnl_gap = pnl_gap_verdict(_live_health, now_s=now_ms / 1000)
+        # v254：單筆實際風險 vs 風險預算（夾層砍小＋成交滑價）。套 24h 窗＝現況條件。
+        risk_sizing = risk_sizing_verdict(_live_health, now_s=now_ms / 1000)
     except Exception:
         pass
 
@@ -1058,6 +1132,7 @@ def build_snapshot(now_ms: int | None = None) -> dict:
         live_exec=live_exec, org_digest=org_digest, pnl_gap=pnl_gap,
         org_coverage=org_coverage, live_stall=live_stall,
         demo_stall_reason=demo_stall_reason, signal_drought=signal_drought,
+        risk_sizing=risk_sizing,
         last_nudge_ms=last_nudge_ms,
     )
 

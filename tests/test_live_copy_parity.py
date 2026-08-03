@@ -34,6 +34,20 @@ _SUB_LINE = re.compile(
 # 新增這類常數卻忘了加代換 → test_no_risk_critical_constant_escapes_the_table 會紅。
 _RISK_CRITICAL = re.compile(r"^(PROFILE|.*RISK.*|.*NOTIONAL.*|LEVERAGE|.*STOP_USD)$")
 
+# 名字命中 _RISK_CRITICAL、但**刻意**兩邊同值的常數（觀測門檻，不是規模參數）。
+# ⚠️ 列進這張表＝宣告「這個數字在真錢副本裡必須跟模板一模一樣」。
+# 改名去閃過上面那條正則是最壞的解法（把碼折彎去迎合代理值）；這裡改成把「為什麼
+# 兩邊同值」寫下來。而白名單本身就是逃生門，所以下面 _NEVER_SHARED 是硬否決：
+# 不論誰把規模參數寫進白名單，那幾個名字一律仍須走代換表。
+_SHARED_BY_DESIGN = {
+    "RISK_DRIFT_RECENT_MAX": "健康檔保留幾筆滑價明細＝觀測量，與部位大小無關",
+    "RISK_DRIFT_ALERT_PCT": "偏離幾 % 才出聲的門檻；真錢側同樣要 ±10% 才有意義",
+}
+
+# ⛔ 這幾個名字永遠不得「兩邊同值」——同值就是把 demo 級規模送上真錢。
+_NEVER_SHARED = ("PROFILE", "RISK_USD", "RISK_USD_CAP", "NOTIONAL_CAP_USD",
+                 "DAILY_STOP_USD", "WEEKLY_STOP_USD", "LEVERAGE")
+
 # 必須指向獨立檔案的狀態檔（真錢帳與模擬帳絕不可共用）。
 # ⛔ intent_outbox 是**刻意**共用的（訊號來源同一份），故不在此列。
 _STATE_FILES = ("atk_consumer_state.json", "atk_positions.json",
@@ -122,12 +136,39 @@ def test_checker_catches_a_digit_extended_anchor():
         "數字被延長後仍判定命中——邊界規則沒生效，代換會算出離譜槓桿"
 
 
+def uncovered_risk_constants(template_text: str, covered, shared=None) -> list:
+    """純函式：回報「名字是風險級、卻既沒進代換表也沒被列為刻意同值」的常數。"""
+    shared = _SHARED_BY_DESIGN if shared is None else shared
+    allowed = set(shared) - set(_NEVER_SHARED)      # ⛔ 硬否決壓過白名單
+    return [name for name in _module_constants(template_text)
+            if _RISK_CRITICAL.match(name)
+            and name not in covered and name not in allowed]
+
+
 def test_no_risk_critical_constant_escapes_the_table():
     """模板新增風險級常數卻沒進代換表 → 真錢副本會沿用 demo 級數值，這裡先擋下。"""
     covered = {a.split("=")[0].strip() for a, _b, _lab in _subs()}
-    escaped = [name for name in _module_constants(TEMPLATE.read_text(encoding="utf-8"))
-               if _RISK_CRITICAL.match(name) and name not in covered]
+    escaped = uncovered_risk_constants(TEMPLATE.read_text(encoding="utf-8"), covered)
     assert not escaped, f"風險級常數沒有對應代換：{escaped}"
+
+
+def test_shared_allowlist_cannot_absorb_a_real_scale_constant():
+    """負向檢定：有人把 RISK_USD 寫進「刻意同值」白名單（真錢會沿用 demo 級 100U）。
+    硬否決名單必須讓這種寫法無效——否則白名單本身就是繞過整支守門測試的門。"""
+    covered = {a.split("=")[0].strip() for a, _b, _lab in _subs()} - {"RISK_USD"}
+    escaped = uncovered_risk_constants(TEMPLATE.read_text(encoding="utf-8"), covered,
+                                       shared={"RISK_USD": "藉口"})
+    assert "RISK_USD" in escaped, \
+        "規模參數被白名單吸收掉了——白名單成了逃生門，這支守門測試等於失效"
+
+
+def test_shared_allowlist_has_no_stale_entries():
+    """白名單只能列模板裡真的還在的常數，且每筆都要寫得出理由。
+    留著已刪常數＝下次有人新增同名常數時，它一出生就被默許兩邊同值。"""
+    names = _module_constants(TEMPLATE.read_text(encoding="utf-8"))
+    for name, why in _SHARED_BY_DESIGN.items():
+        assert name in names, f"{name} 已不在模板裡，白名單該一起清掉"
+        assert why.strip(), f"{name} 沒寫「為什麼兩邊同值」"
 
 
 def test_state_files_are_redirected_to_separate_live_files():
