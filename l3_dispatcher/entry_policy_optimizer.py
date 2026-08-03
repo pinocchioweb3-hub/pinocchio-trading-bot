@@ -187,7 +187,13 @@ async def load_plans_and_candles(rows: list[dict], *, get_ohlc=None
     #   empty      ＝回空清單。⚠️ 成因分不出來：可能真的無源（美股/黃金 OKX 無永續），
     #                也可能是 data_loader.get_ohlc 自己把取用失敗吞成 []。不得單方面
     #                宣稱是前者——那正是把「讀不出來」講成「本來就沒有」。
-    diag: dict = {"fetch_error": {}, "empty": [], "n_rows_dropped": 0}
+    # v247：上面兩格只涵蓋「整個 symbol 掉出樣本」。**per-row** 的兩個 continue
+    #   （訊號早於序列起點／訊號後完整窗不足）從來沒被算過——2026-08-03 實測 16 筆
+    #   同代樣本 100% 掉在後者，而 candles_diag 誠實地回報「零筆掉隊」，因為掉隊發生
+    #   在它涵蓋不到的那一層。⇒ 報告上「還沒熟」與「今天沒單」完全同形。
+    diag: dict = {"fetch_error": {}, "empty": [], "n_rows_dropped": 0,
+                  "n_rows_signal_too_early": 0, "n_rows_forward_window_short": 0}
+    _fw_max_have = -1                     # 最成熟一筆已有幾根前向 K（用來算還要等多久）
 
     for sym, items in by_symbol.items():
         entries = [int(r["entry_at"]) for r, _ in items]
@@ -209,8 +215,12 @@ async def load_plans_and_candles(rows: list[dict], *, get_ohlc=None
         for row, (direction, limit_px, stop_px, tp_px) in items:
             si = _signal_idx(ts_list, int(row["entry_at"]))
             if si < 0:
+                diag["n_rows_signal_too_early"] += 1      # v247：略過仍對，但要留數字
                 continue                      # 訊號早於序列起點
             if n - si - 1 < _FORWARD_BARS:    # 訊號後完整窗不足（多為太新）→ 公平起見略過
+                # ⛔ 不得為了讓桶長出來而放寬窗（章程：不為湊樣本改策略）；只要說得出來。
+                diag["n_rows_forward_window_short"] += 1
+                _fw_max_have = max(_fw_max_have, n - si - 1)
                 continue
             pid = str(row["id"])
             reality_filled = (row.get("exit_reason") or "") != "entry_expired"
@@ -219,6 +229,9 @@ async def load_plans_and_candles(rows: list[dict], *, get_ohlc=None
                                    tp_px=tp_px, reality_filled=reality_filled))
             quad_by_pid[pid] = _quadrant_of(row)
             candles_by_pid[pid] = bars        # 共用參照（同 symbol 同序列）
+    # v247：⛔ 反向側——沒有任何一筆因窗不足掉隊時不得多出這個鍵（避免 sink 膨脹）。
+    if diag["n_rows_forward_window_short"]:
+        diag["forward_window"] = {"need": _FORWARD_BARS, "max_have": _fw_max_have}
     return plans, quad_by_pid, candles_by_pid, diag
 
 
@@ -378,9 +391,29 @@ async def run_entry_optimization(*, days: int = 120, at_ms: int | None = None,
     #   在報告上完全同形，而 n_aligned 差門檻幾筆正是每輪唯一被讀的數字。
     res["candles_diag"] = _cdiag
     res["n_excluded_no_candles"] = int(_cdiag.get("n_rows_dropped") or 0)
+    # v247：per-row 掉隊（訊號太早／訊號後窗不足）也要上到 res——否則呼叫端只看得到
+    #   「0 桶」這個結果，看不到它是**還沒熟**還是**壞了**。
+    res["n_excluded_forward_window_short"] = int(_cdiag.get("n_rows_forward_window_short") or 0)
+    res["n_excluded_signal_too_early"] = int(_cdiag.get("n_rows_signal_too_early") or 0)
     res["cohort"] = {"active_generation": _cohort_gen, "mix": _cohort_mix,
                      "n_in": _n_in, "n_kept": len(rows),
                      "n_excluded_other_generation": _n_in - len(rows)}
+    # v247：0 桶＝_optimize_bucket 一次都不跑＝稽核檔一列都不長（實測連續四天）。
+    #   ⇒ 補一列「輪級」留痕，讓「跑了、0 桶、成因是 X」與「根本沒跑」分得開。
+    #   ⛔ 反向側：有桶時不寫（桶級留痕本來就會長，多寫只會讓 sink 膨脹）。
+    if not res["buckets"]:
+        eps.append_run_audit({
+            "at_ms": at_ms, "action": "run_no_buckets",
+            "cause": _zero_bucket_cause(res),
+            "n_rows": res["n_rows"], "n_eligible": res["n_eligible"],
+            "n_in": _n_in, "n_kept": len(rows), "active_generation": _cohort_gen,
+            "n_excluded_other_generation": _n_in - len(rows),
+            "n_excluded_unreadable_snapshot": res["n_excluded_unreadable_snapshot"],
+            "n_excluded_no_candles": res["n_excluded_no_candles"],
+            "n_excluded_forward_window_short": res["n_excluded_forward_window_short"],
+            "n_excluded_signal_too_early": res["n_excluded_signal_too_early"],
+            "forward_window": _cdiag.get("forward_window"),
+        }, audit_path)
     return res
 
 
@@ -431,6 +464,59 @@ def _render_cohort_line(result: dict) -> str:
             f"全窗分佈 {mix or '—'}）")
 
 
+def _zero_bucket_cause(result: dict) -> str:
+    """v247：0 桶的成因分類。⛔ 湊不出來時回 "unknown"，**不得**挑一個最像的填上去。
+
+    只有 "no_samples"（真的一筆都沒載到）是「本來就該安靜」的那一種；其餘每一種都是
+    「樣本在、卻沒建起桶」，把它們折成同一個靜音正是本專案獵捕了 67 次的物種。
+    """
+    c = (result or {}).get("cohort") or {}
+    n_rows = result.get("n_rows") or 0
+    n_in = c.get("n_in", n_rows) or 0
+    n_kept = c.get("n_kept", n_rows) or 0
+    if not n_in:
+        return "no_samples"
+    if not n_kept:
+        return "generation_filter"
+    if result.get("n_excluded_unreadable_snapshot"):
+        return "unreadable_snapshot"
+    if result.get("n_excluded_no_candles"):
+        return "no_candles"
+    if result.get("n_excluded_forward_window_short"):
+        return "forward_window_short"
+    if result.get("n_excluded_signal_too_early"):
+        return "signal_too_early"
+    return "unknown"
+
+
+def _render_zero_bucket_line(result: dict, cause: str) -> str:
+    """v247：把「0 桶」的成因講成人話。⛔ 一律不得寫成「今天沒樣本」。"""
+    c = (result or {}).get("cohort") or {}
+    d = (result or {}).get("candles_diag") or {}
+    if cause == "generation_filter":
+        return (f"🌐 同代樣本 <b>0</b> 筆：全窗載到 {c.get('n_in')} 筆，但現行生產宇宙代"
+                f"（{c.get('active_generation')}）一筆都沒有，全數被世代閘排除。"
+                "⚠️ 這是 v144/v178 的 fail-closed **正確**生效（混代＝拿上一代的成交行為"
+                "替這一代背書），不是沒訊號——換源後需重新累積樣本。")
+    if cause == "forward_window_short":
+        fw = d.get("forward_window") or {}
+        need = int(fw.get("need") or _FORWARD_BARS)
+        have = int(fw.get("max_have") if fw.get("max_have") is not None else -1)
+        gap = need - have if have >= 0 else None
+        gap_txt = (f"，最成熟一筆已有 <b>{have}</b> 根，還差 <b>{gap}</b> 根"
+                   f"（{TF} K ⇒ 約 {gap} 小時）" if gap is not None else "")
+        return (f"⏳ 同代 {c.get('n_kept', result.get('n_rows'))} 筆樣本**全部尚未滿完整重放窗**："
+                f"重放需訊號後 <b>{need}</b> 根 {TF} K{gap_txt}。"
+                "⚠️ 這不是故障、也不是沒訊號——是樣本還沒熟，會自己解；"
+                "⛔ 在滿窗前不得把 0 桶讀成「策略沒發訊號」或「優化器停擺」。")
+    if cause == "signal_too_early":
+        return (f"⏪ {result.get('n_excluded_signal_too_early')} 筆訊號早於取得的 K 線序列起點"
+                "＝回補窗不夠深，非樣本不存在。⚠️ 請查 _LOOKBACK_DAYS 與 data_loader 的回補深度。")
+    return ("⚠️ 0 桶的成因**不明**：同代樣本還在（"
+            f"{c.get('n_kept', result.get('n_rows'))} 筆），四個已知排除計數卻全為 0，"
+            "桶仍一個都沒建起來。⛔ 不臆測成因——請查 load_plans_and_candles 的分組與計畫建構。")
+
+
 def render_report(result: dict | None = None, *, active_path=None) -> str | None:
     if result is None:
         result = asyncio.run(run_entry_optimization(active_path=active_path))
@@ -453,7 +539,19 @@ def render_report(result: dict | None = None, *, active_path=None) -> str | None
                     + _render_no_candles_line(result) + "\n"
                     "<i>這不是『今天沒樣本』——是取不到 K 線。請查 backtest/data_loader "
                     "的 Binance 補檔與 OKX 備援是否雙雙失敗（ohlc 快取亦無涵蓋）。</i>")
-        return None
+        # v247：剩下的成因舊碼一律 return None（靜音）——包含實測到的那一種：
+        #   樣本都在、資料都好、只是**還沒滿窗**。那不是「今天沒單」，
+        #   而「跑了但還沒熟」與「worker 死了四天」在畫面上完全同形（我自己讀錯過）。
+        #   ⛔ 唯一仍安靜的是 no_samples（真的一筆都沒載到）＝不製造 ⚠️ 雜訊。
+        _cause = _zero_bucket_cause(result)
+        if _cause == "no_samples":
+            return None
+        return ("🎚️ <b>入場積極度自動優化器</b>\n"
+                f"掃 {result.get('n_rows', '?')} 筆，但**可用桶數為 0**：\n"
+                + (_render_cohort_line(result) + "\n" if _render_cohort_line(result) else "")
+                + _render_zero_bucket_line(result, _cause) + "\n"
+                "<i>純驅動模擬盤 paper／demo，真錢執行層永不讀（紅線①）；"
+                "本輪覆寫表零變更。</i>")
     # v82：0 晉升日（常態）每桶皆「⏸️維持」零資訊 → 收斂為結論一行＋收斂進度，
     #   把每日 ~4800 字洗版牆壓成可掃讀的一則；全文明細仍可由 active 覆寫表/帳本回溯。
     if result["n_promoted"] == 0:

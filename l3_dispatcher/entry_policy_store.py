@@ -168,6 +168,15 @@ def _atomic_write_active(buckets: dict, at_ms: int,
         raise
 
 
+def append_run_audit(rec: dict, path: str | Path | None = None) -> None:
+    """v247：供優化器寫「輪級」稽核列（0 桶時的成因留痕）。
+
+    既有留痕全是**桶級**的（promote/hold/rollback 皆由 _optimize_bucket 觸發），於是
+    「一桶都沒建起來」那幾天稽核檔一列都不長 ⇒ 與「worker 死了」永久同形。
+    """
+    _append_audit(rec, path)
+
+
 def _append_audit(rec: dict, path: str | Path | None = None) -> None:
     """append 一行稽核。fail-safe：寫不進去也不擋主流程（只是少一行留痕）。"""
     p = audit_path(path)
