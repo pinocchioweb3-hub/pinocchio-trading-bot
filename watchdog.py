@@ -25,8 +25,11 @@
     - 本 watchdog 只重啟「訊號/紙上 daemon」（run_bot.py），它**不下任何真錢單**。
       真錢路徑是另一條（人工逐筆確認的 trade-intent），watchdog 永不碰。
     - 重啟＝純本機行為，不推送公開、不碰金鑰（只讀 .env 取 Telegram token 發告警）。
-    - 暫停開關：data_dir 下若存在 `watchdog.disabled` 檔，watchdog 直接退出、不重啟
+    - 暫停開關：data_dir 下若存在 `watchdog.disabled` 檔，watchdog **不重啟 daemon**
       （讓你能「刻意關掉 bot」而不被 watchdog 一直拉起來）。
+      ⚠️ v237 起，這個開關的射程僅限「自動重啟」：記憶體防衛照常執行（它清的是
+      Claude 排程殭屍，與 daemon 重不重啟無關），且處於暫停狀態這件事會定期
+      推播出來（見 PAUSE_ALERT_COOLDOWN_SEC）。⛔ watchdog 永不自己刪除這個檔。
 
 純標準庫，零第三方依賴 → 即使 bot 的程式壞掉，watchdog 仍能跑、仍能把它拉回來。
 """
@@ -81,6 +84,16 @@ _RUNNER_MARK = os.path.join("Roaming", "Claude", "claude-code")            # 唯
 # ⛔ 這裡只動通知，不動 MEM_COOLDOWN_SEC（清理本體的節奏）。
 MEM_ALERT_COOLDOWN_SEC = int(os.getenv("WATCHDOG_MEM_ALERT_COOLDOWN_SEC", "21600"))  # 6h
 MEM_ALERT_ESCALATE_PCT = float(os.getenv("WATCHDOG_MEM_ALERT_ESCALATE_PCT", "3"))    # 惡化穿透
+
+# --- 暫停狀態的推播節流（2026-08-03 事故後補）---
+# watchdog 每 3 分觸發一次，暫停狀態若每輪推一則就是每小時 20 則＝洗版，會把
+# 真錢路徑的告警埋掉（memguard 節流學過的同一課）。本機 log 仍每輪全寫。
+PAUSE_ALERT_COOLDOWN_SEC = int(os.getenv("WATCHDOG_PAUSE_ALERT_COOLDOWN_SEC", "21600"))  # 6h
+# 寬限期：部署窗（建旗標→重啟→驗證→移除）本來就會讓旗標存在數分鐘，那是正常流程。
+# 每次部署都推一則＝把使用者訓練成忽略這則告警，那正是我們要治的失明本身。
+# 只有「留下來了」才出聲——08-01 11:13→08-02 02:13 那次留了 15 小時，事後才被
+# CEO 日報回溯發現，期間 daemon 掛掉不會有任何東西拉它起來。
+PAUSE_ALERT_GRACE_SEC = int(os.getenv("WATCHDOG_PAUSE_ALERT_GRACE_SEC", "3600"))  # 1h
 
 
 def _commit_pct() -> float | None:
@@ -233,6 +246,55 @@ def _memguard_notify(state: dict, pct: float, text: str, now: float) -> None:
     state["memguard_alert_ts"] = now
     state["memguard_alert_pct"] = pct
     state["memguard_alert_suppressed"] = 0
+
+
+def _paused_notify(state: dict, now: float) -> None:
+    """「自動重啟目前是關閉的」推播（節流）。本機 log 由呼叫端每輪無條件寫。
+
+    ⛔ 對「誰建的」這件事，本檔沒有任何證據——全 repo 只有 watchdog.py 會讀這個
+    旗標，沒有任何程式會建立它。所以措辭一律用條件句，只附上它出現的時間讓
+    使用者自己認領，不得斷言是他設的。
+    ⛔ 也不得順手把它刪掉：使用者刻意關掉的 bot 被自動拉回來，比旗標留著更糟。
+    """
+    try:
+        mtime: float | None = DISABLED_FLAG.stat().st_mtime
+    except OSError:
+        mtime = None
+
+    # 寬限期內＝正在跑的部署窗，安靜；⛔ 但「讀不到出現時間」不折成「剛建的」，
+    # 未知一律當成可能留很久了 → 照常出聲。
+    if mtime is not None and (now - mtime) < PAUSE_ALERT_GRACE_SEC:
+        return
+
+    last_ts = float(state.get("paused_alert_ts", 0) or 0)
+    if last_ts and (now - last_ts) < PAUSE_ALERT_COOLDOWN_SEC:
+        state["paused_alert_suppressed"] = \
+            int(state.get("paused_alert_suppressed", 0) or 0) + 1
+        write_state(state)
+        return
+
+    if mtime is None:
+        when, age = "未知", ""
+    else:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+        age = f"（已持續 {max(0.0, (now - mtime) / 3600.0):.1f} 小時）"
+
+    n = int(state.get("paused_alert_suppressed", 0) or 0)
+    tail = (f"\n（過去 {int((now - last_ts) / 60)} 分鐘內另有 {n} 則同類提醒未推播，"
+            "已完整寫入本機 watchdog.log）") if n else ""
+
+    telegram_alert(
+        "⏸️ <b>daemon 自動重啟目前是關閉的</b>\n"
+        f"偵測到暫停旗標 <code>watchdog.disabled</code>，"
+        f"出現於 <code>{when}</code> 台北{age}。\n"
+        "在它存在期間，daemon 若當掉或心跳停滯，<b>不會有任何東西把它拉回來</b>。\n"
+        "記憶體防衛（清 Claude 排程殭屍）不受影響，仍照常執行。\n"
+        f"若這不是你刻意設的，刪除 <code>{DISABLED_FLAG}</code> 即可恢復自動重啟。"
+        + tail
+    )
+    state["paused_alert_ts"] = now
+    state["paused_alert_suppressed"] = 0
+    write_state(state)
 
 
 def _taskkill(pid: int) -> tuple[bool, str]:
@@ -576,10 +638,19 @@ def daemon_process_alive():
 def main() -> int:
     now = time.time()
 
-    # 暫停開關：使用者刻意關 bot 時，建這個檔就不會被拉起來
-    if DISABLED_FLAG.exists():
-        log("[skip] 偵測到 watchdog.disabled → 暫停自動重啟（這是刻意的）")
-        return 0
+    # 暫停開關：使用者刻意關 bot 時，建這個檔就不會被拉起來。
+    #
+    # ⚠️ v237 收斂射程（2026-08-03 線上實證）：舊碼在這裡直接 return 0，於是這個
+    #    寫著「不要自動重啟」的開關，順手把**記憶體防衛**也一起關掉了——而且
+    #    「被關掉」只寫進一行沒人會讀的本機 log。當天旗標 12:09 出現後 memguard
+    #    歸零，2.5 小時內 commit 從 67% 爬到 71.4%、11 個 runner 堆積（最老 34.8h）、
+    #    可用實體記憶體只剩 1.16GB，而系統對外表現得完全正常。
+    #    memguard 清的是 Claude 排程殭屍，跟 daemon 要不要重啟無關 ⇒ 不該被連坐。
+    #    ⛔ 但暫停「重啟」這件事本身不得弱化，也⛔不得自己把旗標刪掉。
+    paused = DISABLED_FLAG.exists()
+    if paused:
+        log("[skip] 偵測到 watchdog.disabled → 暫停自動重啟"
+            "（這是刻意的；記憶體防衛不受影響，仍照常執行）")
 
     # v195：狀態檔健檢擺在最前面——memory_guard 與下面的重啟煞車都吃這個檔，
     # 壞檔要在任何人讀它之前就處理掉（隔離+重建+出聲），而不是各自折成 {}。
@@ -595,6 +666,12 @@ def main() -> int:
         memory_guard()
     except Exception as e:  # noqa: BLE001 — 防衛失敗不可拖垮重啟主功能
         log(f"[memguard] 例外（不影響主功能）：{type(e).__name__}: {e}")
+
+    # 暫停中：記憶體防衛已經跑過了，重啟這一段就此打住（但要讓人知道它關著）。
+    if paused:
+        _pstate, _perr = read_state()
+        _paused_notify({} if (_perr and _perr != "missing") else _pstate, now)
+        return 0
 
     # 健康訊號：liveness 新鮮度
     live = read_json(LIVENESS)
