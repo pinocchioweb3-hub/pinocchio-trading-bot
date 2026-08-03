@@ -135,6 +135,11 @@ class WatchlistManager:
         # 閘的分寸：EV 回測閘管的是「取代活著的 CG」；此處只在 CG 給零檔（=全盲）
         # 時頂上——有東西永遠勝過失明。CG 若復活（items 非空）自動回主源，
         # 屆時「免費源當主源」仍須過回測閘。provenance 全程留痕（紅線③）。
+        # v245：源說得出「哪些幣為什麼沒進來」時就抄下來——⛔ 必須在降級之前抄，
+        # 否則免費源一頂上 items 就非空，源死掉的成因會跟著消失（這正是 26 天
+        # 沒人發現的形狀：降級讓系統看起來還活著，於是沒人去看源死了）。
+        unavailable = universe.get("unavailable") if isinstance(universe, dict) else None
+
         universe_source = "coinglass"
         if not items:
             try:
@@ -163,6 +168,10 @@ class WatchlistManager:
         universe_telemetry = {"n_pool": n_pool, "n_universe": n_universe,
                               "n_dropped": n_dropped, "errored": False,
                               "universe_source": universe_source}
+        # v245：⛔ errored 的語意不動（既有測試鎖著它在全成功時為 False）——加欄位，
+        # 不改語意。全數成功時不得多出這個鍵。
+        if unavailable:
+            universe_telemetry["unavailable"] = unavailable
 
         # 硬性過濾（低流動性、極端漲跌、過熱費率）
         # 註：ret_7d_pct 由 mi_get_strength_universe 用 ret_24h × 5 估算

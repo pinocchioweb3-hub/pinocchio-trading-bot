@@ -27,6 +27,24 @@ from ..symbol_mapping import to_coinglass
 from .base import RatioType
 
 
+def _drop_reason(r: dict) -> str:
+    """這一檔為什麼沒進宇宙（v245）。成功時呼叫端不會用到本函式。
+
+    ⛔ 不得回空字串／"unknown"／"error"：四種成因的處置完全不同——
+        AUTH_FAILED（401/403）  → 續訂／換金鑰
+        RATE_LIMITED（429）     → 降速，等一下就好
+        TIMEOUT/NETWORK_ERROR   → 查網路
+        回應成功但無 data 列     → 查資料契約（這幣在此端點沒有交易對）
+    講不清楚等於沒說，而這正是 CoinGlass 停權後「宇宙全空」被上層讀成
+    「一切正常，只是沒東西」整整 26 天的原因。
+    """
+    if r.get("error"):
+        code = r.get("code") or "ERROR"
+        msg = str(r.get("message") or r.get("msg") or "").strip()
+        return f"{code}: {msg}"[:160] if msg else f"{code}（無訊息）"
+    return "回應成功但無 data 列（該幣在此端點沒有交易對）"
+
+
 # ===========================================================================
 # Sliding-window rate limiter (per process)
 # ===========================================================================
@@ -668,6 +686,7 @@ class CoinGlassSource:
             candidates = list(TRADING_CANDIDATES)[:limit]
 
         items: list[dict] = []
+        unavailable: dict[str, list[str]] = {}   # v245：{成因: [幣]}
         for sym in candidates:
             r = await self._get(
                 "/api/futures/pairs-markets",
@@ -675,9 +694,11 @@ class CoinGlassSource:
                 tool="mi_get_strength_rank", symbol=sym,
             )
             if r.get("error"):
+                unavailable.setdefault(_drop_reason(r), []).append(sym)
                 continue
             rows = r.get("data") or []
             if not rows:
+                unavailable.setdefault(_drop_reason(r), []).append(sym)
                 continue
             # 聚合所有交易所的數字（sum / mean）→ 一個 symbol 一行
             total_vol = sum(self._to_float(x.get("volume_usd")) or 0 for x in rows)
@@ -705,7 +726,12 @@ class CoinGlassSource:
                 "funding": funding,
             })
 
-        return {"source": "coinglass", "ts": 0, "items": items}
+        out = {"source": "coinglass", "ts": 0, "items": items}
+        # v245：⛔ 反向側——全數成功時不得多出這個鍵（避免遙測/log 膨脹、⚠️ 貶值）。
+        # ⛔ 也不加 error 旗標：watchlist 看到 error 會走早退路徑，等於偷偷改行為。
+        if unavailable:
+            out["unavailable"] = unavailable
+        return out
 
     # =====================================================================
     # Setup B 7d 結構：從 price/OI/positioning/CVD 時序推導

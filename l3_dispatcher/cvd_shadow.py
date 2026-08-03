@@ -283,6 +283,12 @@ def _universe_miss_reason(r) -> str:
         code = r.get("code") or "ERROR"
         msg = str(r.get("message") or r.get("msg") or "").strip()
         return f"{code}: {msg}"[:160] if msg else f"{code}（無訊息）"
+    # v245：源自己說得出成因就**轉述**，⛔ 不得覆蓋成下面那句自己的推測。
+    # v244 上線後的線上實證就卡在這裡：源回 401，影子卻講「該幣未進宇宙」，
+    # 把讀的人指去查資料契約——說得出話但說錯方向，比沉默更貴。
+    up = r.get("unavailable")
+    if isinstance(up, dict) and up:
+        return "上游：" + "；".join(str(k) for k in up)[:150]
     if not (r.get("items") or []):
         return "回應成功但 items 為空（該幣未進宇宙／上游聚合掉了）"
     return "未知形狀的回應"

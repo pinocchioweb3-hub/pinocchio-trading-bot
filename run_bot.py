@@ -132,8 +132,13 @@ async def amain(args: argparse.Namespace) -> int:
     # /pairs-markets，遇 429/空 data 會 silently 丟）。純觀測，零訊號數學影響。
     _utel = refresh_result.get("universe_telemetry") or {}
     if _utel:
+        # v245：只印 0/60 errored=False 的那一行，正是 CoinGlass 停權後「全滅」被
+        # 讀成「一切正常，只是沒東西」的地方。源說得出成因就一起印。
+        _un = _utel.get("unavailable") or {}
+        _why = ("  ⚠️未取得：" + "；".join(f"{w}×{len(s)}" for w, s in _un.items())) if _un else ""
         print(f"[startup] universe truncation: {_utel.get('n_universe')}/{_utel.get('n_pool')} "
-              f"returned (dropped {_utel.get('n_dropped')}, errored={_utel.get('errored')})")
+              f"returned (dropped {_utel.get('n_dropped')}, errored={_utel.get('errored')})"
+              f"{_why}")
 
     # === 開機訊息（v23-6: 30 分鐘內重啟不重推，避免部署期洗版系統主題）===
     if not args.no_startup_msg:
