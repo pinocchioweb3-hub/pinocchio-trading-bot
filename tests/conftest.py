@@ -124,3 +124,156 @@ def pytest_runtest_call(item):
     res = yield
     assert_data_dir_not_live("測試結束後（monkeypatch 尚未還原）")
     return res
+
+
+# ── 3. 線上資料目錄「寫入」總閘（監督員 r129／v234）──────────────────────
+"""為什麼 §1/§2 還不夠（實測，非推測）
+
+§1/§2 是**沿著 `botpaths` 那條路**設的閘：改 `BOT_DATA_DIR`、驗
+`botpaths.data_dir()`。但這個專案裡解析資料目錄的路**不只一條**：
+
+  * `botpaths.data_dir()`           ← env `BOT_DATA_DIR`，§1/§2 已守
+  * `watchdog.py:47`                ← env `TRADINGBOT_DATA_DIR`（**另一個** env）
+  * `tools/atk_consumer/consume_intents.py:48-51`      ← 直接 `os.path.expandvars`
+  * `tools/atk_consumer/consume_intents_live.py:48-51` ← 直接 `os.path.expandvars`
+  * `tools/atk_consumer/consume_intents_live.py:935`   ← `ACKED_POS`
+
+後三者在 **import 期**就把 `%LOCALAPPDATA%\\TradingBot\\...` 綁進 module 常數，
+**沒有任何 env 可以改它**——§1 把 `BOT_DATA_DIR` 指到臨時目錄，對它們毫無作用。
+其中 `atk_positions_live.json`（真錢部位帳）、`atk_consumer_live_health.json`
+（真錢健康檔）、`atk_acknowledged_positions.json` 都在這條路上；r53-r57／v162-v166
+追過的「自製壞檔再自誤讀」，如果由一個測試親手做出來，後果與那幾次同級。
+
+⚠️ 更要緊的是：r128 當初那次「151 檔逐檔實測、找出 11 個會留檔的」量測，
+**看不見這條路**——量測是把 `BOT_DATA_DIR` 指到臨時目錄、再看臨時目錄長出什麼；
+沒經過 `botpaths` 的寫入根本不會出現在被觀察的那個目錄裡。也就是說那次量測的
+涵蓋範圍被當成了全部涵蓋範圍（本專案追了 53 次的同一物種，這次落在量測工具本身）。
+
+⚠️ 誠實範圍：目前 13 個 import 到 atk consumer 的測試檔，多數**有**用
+`monkeypatch.setattr(ci, "POS_STATE", ...)` 把常數改掉——那是**人工紀律**，
+不是閘；`HEALTH` 則從沒有任何一個測試改過。本閘落地前線上檔案未見測試指紋
+（`atk_positions_live.json` 停在 08-03 04:18＝真錢管線自己寫的），
+所以這是**潛伏風險，不是已發生的污染**，⛔ 不得寫成「資料已被污染」。
+
+這個閘做什麼
+------------
+把「寫入」攔在原語層（`open(...,'w')`／`os.replace`／`os.rename`／`os.remove`），
+只要目標落在線上資料目錄那棵樹裡就當場丟例外。與 §2 的差別是它**不看是誰要寫**、
+也不管走的是哪個 env——涵蓋所有解析路徑，將來新增第四條路也自動被守。
+
+⛔ 刻意**不含**專案根：pytest 自己要在 repo 寫 `.pytest_cache`／`__pycache__`，
+把 repo 納入會製造慢性假警報（§1 的 `is_live_data_dir` 含專案根是對的，那是
+「解析結果不該落在這」的判定，與「這次寫入該不該擋」是兩回事）。
+⛔ 刻意**不擋** `mkdir`：`mkdir(exist_ok=True)` 靠攔 `FileExistsError` 運作，
+擋它會讓合法的 no-op 爆掉；留下一個空目錄的害處遠小於誤擋。
+⚠️ 擋不到 C 層直接開檔（如 `sqlite3.connect` 建 .db）——那條路走 `botpaths`，
+已由 §1 改道，兩道閘合起來才完整。
+"""
+import builtins as _builtins
+import io as _io
+from contextlib import contextmanager
+
+
+class LiveDataDirWriteError(AssertionError):
+    """測試試圖寫入線上正式資料目錄。"""
+
+
+def live_write_guard_roots() -> list[Path]:
+    """要保護的樹：只有 %LOCALAPPDATA%\\TradingBot。"""
+    localapp = os.getenv("LOCALAPPDATA", "").strip()
+    if not localapp:
+        return []
+    return [Path(localapp) / "TradingBot"]
+
+
+LIVE_WRITE_GUARD_ROOTS: list[Path] = live_write_guard_roots()
+_extra_guard_roots: list[Path] = []
+
+
+@contextmanager
+def guard_extra_root(path: Path | str):
+    """暫時把另一棵樹也納入保護（給本閘自己的測試用，免得非拿真目錄試不可）。"""
+    p = Path(path)
+    _extra_guard_roots.append(p)
+    try:
+        yield p
+    finally:
+        _extra_guard_roots.remove(p)
+
+
+def _guarded(target) -> Path | None:
+    """target 若落在被保護的樹裡就回那棵樹的根，否則 None。"""
+    roots = LIVE_WRITE_GUARD_ROOTS + _extra_guard_roots
+    if not roots:
+        return None
+    try:
+        rp = Path(os.path.abspath(os.fsdecode(target)))
+    except (TypeError, ValueError, OSError):
+        return None            # 記憶體 fd／奇怪型別：不誤擋
+    for root in roots:
+        try:
+            ar = Path(os.path.abspath(root))
+        except (TypeError, ValueError, OSError):
+            continue
+        if rp == ar or ar in rp.parents:
+            return ar
+    return None
+
+
+def _refuse(target, how: str) -> None:
+    root = _guarded(target)
+    if root is None:
+        return
+    raise LiveDataDirWriteError(
+        f"測試試圖寫入線上正式資料目錄（{how}）：{target}\n"
+        f"受保護的樹：{root}\n"
+        "⛔ 那裡放的是真錢部位帳／健康檔／影子資料（atk_positions_live.json、"
+        "atk_consumer_live_health.json、free_universe_shadow.jsonl…）。\n"
+        "請改用 tmp_path；若模組在 import 期就把路徑綁死（tools/atk_consumer/*、"
+        "watchdog.py），用 monkeypatch.setattr(模組, \"POS_STATE\"/\"HEALTH\"/… , "
+        "tmp_path / \"...\") 或 monkeypatch.setenv(\"TRADINGBOT_DATA_DIR\", ...) 改掉它。"
+    )
+
+
+_WRITE_MODE_CHARS = frozenset("wxa+")
+_orig_open = _builtins.open
+_orig_replace = os.replace
+_orig_rename = os.rename
+_orig_remove = os.remove
+_orig_unlink = os.unlink
+
+
+def _guarded_open(file, mode="r", *args, **kwargs):
+    if _WRITE_MODE_CHARS & set(str(mode)):
+        _refuse(file, f"open(mode={mode!r})")
+    return _orig_open(file, mode, *args, **kwargs)
+
+
+def _guarded_replace(src, dst, **kwargs):
+    _refuse(dst, "os.replace")
+    return _orig_replace(src, dst, **kwargs)
+
+
+def _guarded_rename(src, dst, **kwargs):
+    _refuse(dst, "os.rename")
+    return _orig_rename(src, dst, **kwargs)
+
+
+def _guarded_remove(path, **kwargs):
+    _refuse(path, "os.remove")
+    return _orig_remove(path, **kwargs)
+
+
+def _guarded_unlink(path, **kwargs):
+    _refuse(path, "os.unlink")
+    return _orig_unlink(path, **kwargs)
+
+
+# 兩個名字指向同一個函式物件，但屬性查找是分開的：`Path.open` 走 `io.open`，
+# 一般程式碼走 `builtins.open`——兩邊都要換，只換一邊會漏掉 Path.write_text。
+_builtins.open = _guarded_open
+_io.open = _guarded_open
+os.replace = _guarded_replace
+os.rename = _guarded_rename
+os.remove = _guarded_remove
+os.unlink = _guarded_unlink
