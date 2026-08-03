@@ -224,6 +224,12 @@ def _refuse(target, how: str) -> None:
     root = _guarded(target)
     if root is None:
         return
+    _dbg = os.getenv("LIVE_GUARD_TRACE", "").strip()
+    if _dbg:
+        import traceback as _tb
+        with _orig_open(_dbg, "a", encoding="utf-8") as _fh:
+            _fh.write(f"=== {how} -> {target}\n")
+            _tb.print_stack(file=_fh)
     raise LiveDataDirWriteError(
         f"測試試圖寫入線上正式資料目錄（{how}）：{target}\n"
         f"受保護的樹：{root}\n"
@@ -277,3 +283,50 @@ os.replace = _guarded_replace
 os.rename = _guarded_rename
 os.remove = _guarded_remove
 os.unlink = _guarded_unlink
+
+
+# ── 4. sqlite 那條路（r129 實測補上）─────────────────────────────────
+"""§3 攔的是 Python 層的寫入原語，`sqlite3.connect()` 在 C 層開檔，攔不到——
+這是 §3 的已知盲點。r128 那次量測找到的 11 個外洩檔裡有 6 個是 .db，所以這個
+盲點非補不可：`.db` 走 `botpaths`（§1 已改道）**且**走 C 層（§3 看不見），
+兩道閘都不補的話它就整條沒人守。
+
+⚠️ 誠實範圍（重要，別讓下一輪重跑一次）：本閘落地時**沒有抓到任何**現有測試
+連線到線上 .db——全庫跑一輪，`LIVE_GUARD_TRACE` 記到的 6 次攔截全是本閘自己的
+測試。它是**預防性**的 fail-closed 覆蓋，不是「抓到了什麼」。
+
+⚠️ 一段走過的冤枉路，寫下來免得重走：量測時發現線上 `trade_journal.db` 的 mtime
+兩次都恰好停在測試結束那一秒（09:11:17、09:14:49），中間 155 秒閒置沒動，看起來
+像是測試在碰它。**那個結論是錯的。** 決定性反證有兩條：(a) 開 `LIVE_GUARD_TRACE`
+全庫跑一輪，`sqlite3.connect` 一次都沒被攔到；(b) 在完全沒有 pytest 的時段，
+`trade_journal.db-wal` / `-shm` 仍在持續更新，主檔 mtime 每隔數分鐘往前跳一次
+——那是 daemon 的 **WAL checkpoint**，主檔 mtime 只在 checkpoint 時才動，
+於是它的節奏（約 3 分鐘）剛好與我那兩次跑測試的節奏對上了。
+⇒ 用 mtime 對齊來歸因，在 WAL 模式的 .db 上會給出假的因果；要看的是 `-wal`/`-shm`。
+
+⛔ 唯讀連線（`file:...?mode=ro` URI）是合法的——`platform/api/data_access.py`
+就是這樣看線上 .db 的，本閘放行；擋的是可寫連線（sqlite 會為了寫 header／WAL
+而碰到主檔）。`:memory:` 一律放行。
+
+`LIVE_GUARD_TRACE=<檔路徑>` 這個 env 是上面那段查證留下來的工具：設了之後每次
+攔截都會把呼叫堆疊附加進該檔。⛔ 預設關閉，不設就完全沒有額外成本。
+"""
+import sqlite3 as _sqlite3
+
+_orig_connect = _sqlite3.connect
+
+
+def _guarded_connect(database, *args, **kwargs):
+    target = database
+    if isinstance(target, str):
+        if target == ":memory:" or not target:
+            return _orig_connect(database, *args, **kwargs)
+        if kwargs.get("uri") and target.startswith("file:"):
+            if "mode=ro" in target or "mode=memory" in target:
+                return _orig_connect(database, *args, **kwargs)
+            target = target[len("file:"):].split("?", 1)[0]
+    _refuse(target, "sqlite3.connect（可寫連線）")
+    return _orig_connect(database, *args, **kwargs)
+
+
+_sqlite3.connect = _guarded_connect

@@ -120,6 +120,40 @@ def test_os_remove_is_refused(tmp_path):
     assert victim.exists()
 
 
+# ── sqlite 那條路（§4）：C 層開檔，攔不到 open() ─────────────────────
+def test_sqlite_connect_into_guarded_tree_is_refused(tmp_path):
+    """r128 量測找到的 11 個外洩檔裡有 6 個是 .db——sqlite 走 C 層，§3 看不見。"""
+    import sqlite3
+    with guard_extra_root(tmp_path):
+        with pytest.raises(LiveDataDirWriteError):
+            sqlite3.connect(tmp_path / "trade_journal.db")
+    assert not (tmp_path / "trade_journal.db").exists()
+
+
+def test_sqlite_memory_is_allowed(tmp_path):
+    import sqlite3
+    with guard_extra_root(tmp_path):
+        conn = sqlite3.connect(":memory:")
+        conn.close()
+
+
+def test_sqlite_readonly_uri_is_allowed(tmp_path):
+    """⛔ 唯讀連線必須放行：platform/api/data_access.py 就是這樣看線上 .db 的。"""
+    import sqlite3
+    db = tmp_path / "ro.db"
+    sqlite3.connect(db).close()                      # 先在未保護狀態下建好
+    with guard_extra_root(tmp_path):
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        conn.close()
+
+
+def test_sqlite_outside_guarded_tree_is_allowed(tmp_path):
+    import sqlite3
+    with guard_extra_root(tmp_path / "guarded"):
+        sqlite3.connect(tmp_path / "free.db").close()
+    assert (tmp_path / "free.db").exists()
+
+
 # ── 反向護欄：不可矯枉過正 ───────────────────────────────────────────
 def test_reads_are_allowed(tmp_path):
     """唯讀地看線上檔是合法的（例：test_live_copy_parity 逐字比對真錢副本）。"""
